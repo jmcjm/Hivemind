@@ -270,7 +270,7 @@ that is long, resumable, and observable by the user.
 | status `dead` / missing panel | drone killed or crashed | `hive revive <drone>` — conversation history survives |
 | `dead` drones piling up in `status` | directories outlive the sessions | `hive prune --dry-run`, then `hive prune` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
-| trust dialog on a new `--cwd` | folder untrusted in `~/.claude.json` | `hive spawn` handles it itself; if stubborn, `peek` + enter |
+| trust dialog on a new `--cwd` | folder untrusted in `~/.claude.json` | `hive spawn` pre-seeds trust in the config so it never shows; if it slips through, `hive unblock` answers it (its default button is "No, exit" — never blind-Enter it) |
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
 | swarm stands still, no mail at all | drone hook failed, or drone hung/died mid-turn | the sweep mails coord within ~5 min (`SWEEP: ...`); impatient? `hive sweep` by hand, then `hive peek` |
 

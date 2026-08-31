@@ -213,6 +213,43 @@ drone_remove() {
   rm -f "$HIVE_DIR/.wake-$1"
 }
 
+# ensure_trusted <cwd> — pre-seed folder trust so a fresh --cwd never raises Claude Code's
+# "Do you trust this folder?" dialog. That dialog appears despite --dangerously-skip-permissions
+# (it is a separate gate), and its default button is "No, exit", which QUITS Claude Code — so
+# answering it blind by keystroke kills the drone. Setting hasTrustDialogAccepted in the config
+# makes the dialog never appear. Best-effort: every failure path is non-fatal (an unparseable or
+# concurrently-written config is left untouched), and the keystroke bootstrap in cmd_spawn stays
+# as a fallback. Honors CLAUDE_CONFIG_DIR the same way Claude Code does.
+ensure_trusted() {
+  local cwd="$1" cfg
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then cfg="$CLAUDE_CONFIG_DIR/.claude.json"; else cfg="$HOME/.claude.json"; fi
+  python3 - "$cfg" "$cwd" <<'PY' 2>/dev/null || true
+import json,os,sys,tempfile
+cfg,cwd=sys.argv[1],sys.argv[2]
+try:
+    with open(cfg) as f: d=json.load(f)
+except FileNotFoundError:
+    d={}
+except Exception:
+    sys.exit(0)          # never clobber a config we could not parse
+if not isinstance(d,dict): sys.exit(0)
+proj=d.setdefault("projects",{})
+if not isinstance(proj,dict): sys.exit(0)
+ent=proj.setdefault(cwd,{})
+if not isinstance(ent,dict): sys.exit(0)
+if ent.get("hasTrustDialogAccepted") is True: sys.exit(0)   # already trusted, no write
+ent["hasTrustDialogAccepted"]=True
+dd=os.path.dirname(cfg) or "."
+fd,tmp=tempfile.mkstemp(dir=dd)
+try:
+    with os.fdopen(fd,"w") as f: json.dump(d,f,indent=2,ensure_ascii=False)
+    os.replace(tmp,cfg)                 # atomic swap; a racing writer loses at most this flag
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+PY
+}
+
 # --- commands -------------------------------------------------------------
 
 cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
@@ -230,6 +267,7 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
     esac
   done
   [ -d "$cwd" ] || die "cwd does not exist: $cwd"
+  ensure_trusted "$cwd"   # so a fresh cwd never stalls (or quits) on the trust dialog
 
   local dir; dir=$(drone_dir "$name"); mkdir -p "$dir"
   rm -f "$dir"/.sweep-* "$dir/.killed"   # a fresh life invalidates old sweep verdicts
@@ -317,6 +355,11 @@ PY
     [ "$ready" = 1 ] && break
     case "$(pane_dialog "$pane" 2>/dev/null)" in
       trust)
+        # The dialog's default button is "No, exit" (quits Claude Code), so a bare enter would
+        # kill the drone. Move down to "Yes, I trust this folder" first. This is only reached
+        # when ensure_trusted() could not pre-seed the config; normally the dialog never shows.
+        herdr agent send-keys "$name" down >/dev/null 2>&1
+        sleep 0.3
         herdr agent send-keys "$name" enter >/dev/null 2>&1
         sleep 2 ;;
       consent)
@@ -715,6 +758,11 @@ cmd_unblock() {  # unblock <name> — answers the dialog a drone is stuck on
       herdr agent send-keys "$name" enter >/dev/null 2>&1 \
         || die "unblock: could not send the key to $name" ;;
     trust)
+      # Default button is "No, exit" (quits Claude Code) — arrow down to "Yes, I trust this
+      # folder" before confirming, or unblock would kill the drone it means to rescue.
+      herdr agent send-keys "$name" down >/dev/null 2>&1 \
+        || die "unblock: could not send the key to $name"
+      sleep 0.3
       herdr agent send-keys "$name" enter >/dev/null 2>&1 \
         || die "unblock: could not send the key to $name" ;;
     consent)
