@@ -33,6 +33,15 @@ except Exception: print('')
 " "$payload" 2>/dev/null)
 
 if [ "$KIND_ARG" = decision ]; then
+  # Claude Code fires Notification for real dialogs (permission requests) AND for plain
+  # idleness ("Claude is waiting for your input", after ~60s at an empty prompt). The idle
+  # one is pure noise here: the Stop hook already reported the end of the turn, so forwarding
+  # it again as "needs a decision" cries wolf at the coordinator after every task. Suppress
+  # exactly that known message; anything else (unknown or permission-shaped) still goes
+  # through — fail-open, a real dialog must never be silenced.
+  case "$note" in
+    *"waiting for your input"*) exit 0 ;;
+  esac
   subject="needs a decision"
   herdr notification show "Drone $HIVE_DRONE awaits a decision" --sound request >/dev/null 2>&1
 else
