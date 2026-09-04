@@ -463,18 +463,25 @@ cmd_clear() {  # clear <name> — clears the drone's input field (ctrl+u)
   echo "clear: $name — clean"
 }
 
-cmd_say() {  # say <name> <text> — ad-hoc message to a drone
-  local name="${1:?usage: hive say <name> <text>}"; shift
+cmd_say() {  # say <name> <text>  |  say <name> - (text from stdin, like task)
+  local name="${1:?usage: hive say <name> <text|->}"; shift
   local pane; pane=$(pane_of "$name") || die "unknown drone: $name"
   local pending; pending=$(prompt_pending "$pane")
   [ -n "$pending" ] && die "drone $name has unsent text in its prompt: \"$pending\"
 Not sending — Enter would send THAT. Sort the prompt out (hive clear $name) and retry."
+  local text
+  if [ "${1:-}" = "-" ] && [ $# -eq 1 ]; then
+    text=$(cat)
+    [ -n "$text" ] || die "say: stdin was empty — nothing sent"
+  else
+    text="$*"
+  fi
   local out
-  out=$(herdr agent prompt "$name" "$*" 2>&1) || case "$out" in
+  out=$(herdr agent prompt "$name" "$text" 2>&1) || case "$out" in
     *agent_blocked*) die "drone $name is stuck at a dialog — check: hive peek $name" ;;
     *) die "failed to send to $name: $out" ;;
   esac
-  echo "say: $name <- $*"
+  echo "say: $name <- ${text:0:120}"
 }
 
 cmd_status() {  # status [name...] — never blocks
