@@ -275,7 +275,7 @@ except Exception:
 flat=lambda s: re.sub(r'[\x00-\x1f\x7f]+',' ',str(s or '')).strip()
 kind=json.loads(os.environ.get('MAIL_KIND_LABELS','{}')).get(e.get('kind'),'message')
 line=f"HIVE-MAIL {flat(e.get('from')) or '?'} [{kind}] {flat(e.get('subject'))}"
-print(line if len(line)<=120 else line[:119]+'…')
+print(line if len(line)<=120 else line[:117]+'...')
 PY
 }
 ```
