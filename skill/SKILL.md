@@ -32,6 +32,7 @@ hive kill   <name> [--purge]       kill a drone; an already dead one is archived
 hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives them, then removes
 hive rename <old> <new>            rename a drone and its workspace
 hive revive <name>                 resurrection with full conversation history (--resume)
+hive adopt  <name> <pane_id>       pull a Claude Code started outside hive into the swarm
 hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
 hive sweep                         reconciliation pass — retry lost wake-ups, surface silent drones
 ```
@@ -206,8 +207,9 @@ goes to the user's terminal, never into the context.
    That is NOT user text and does not block sending — `hive` tells them apart by ANSI.
    Do not try to read the prompt with plain `pane read` without `--format ansi`, you will not tell the difference.
 5. **Always confirm task delivery.** A freshly started drone loses its first input
-   (SessionStart hooks clear the prompt), and `herdr agent prompt` without `--wait` does not
-   confirm receipt. `hive task` verifies the jump to `working` and retries up to 3 times.
+   (SessionStart hooks clear the prompt), and `herdr agent prompt` confirms only that the text
+   was written, not that a turn started. `hive task` verifies the jump to `working` and retries
+   up to 3 times.
 6. **Report a synthesis to the user, not raw output.** Do not paste drone reports wholesale.
    They should get conclusions, conflicts between drones, and whatever needs their decision.
 7. **CLAUDE.md rules bind the drones.** Production requires the user's explicit consent —
@@ -260,10 +262,39 @@ never by force. Two drones on the same file is a conflict, not parallelism. For 
 research tasks with no long-lived process, consider the plain `Agent` tool — the swarm is for work
 that is long, resumable, and observable by the user.
 
+## Adopting an agent started outside hive
+
+When a Claude Code started by hand (not through `hive`) already runs in herdr, do not restart it
+blind — it sits on context that exists nowhere else. The order:
+
+```bash
+hive adopt <name> <pane_id>   # registers it in the swarm, records its session_id, renames the workspace
+hive revive <name>            # restart with --resume: history stays; hooks, env and mail protocol arrive
+```
+
+`adopt` alone is not full integration: the adopted agent has no hooks (it never reports in), does
+not know the mail protocol, and keeps its original permissions. Until `revive` it gets no mail
+wake-ups either — without `HIVE_DRONE` its `hive inbox` would read the coordinator's mailbox. `revive`
+adds all of that; it refuses to run when herdr reported no session id, because there would be no
+history to resume. Before
+`revive` check `hive peek` — if the agent asked a question and waits, answer it after the revival,
+otherwise it picks the topic up its own way. `revive` closes the drone's whole workspace; `adopt`
+warns when that workspace holds other panes too.
+
+**A long session resumes from a summary.** Reviving a session of several hours, Claude Code asks
+whether to resume from a summary or in full. `hive` takes the summary (cheaper) and warns loudly.
+Compaction can take ~2 minutes and **drops detail** — right after it, send one `hive say` with
+what binds: the state of the work on disk, the task scope, the boundaries, earlier decisions.
+Do not assume the drone remembers what was agreed before; check the disk yourself (`git status`
+in its worktree) — the disk is more reliable than a drone's memory after compaction. Note: `revive`
+switches it to `--dangerously-skip-permissions`, so the boundaries must be hard from the first message.
+
 ## Diagnostics
 
 | Symptom | Cause | Move |
 |---|---|---|
+| every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; the server restart ends every pane process — tell the user, do not do it on your own |
+| `revive` stalls, status never reaches `idle` | a long session asks "resume from summary or in full" | `hive` picks the summary and warns — **restate what binds to the drone**, compaction drops detail |
 | `hive task` says "not delivered" | drone stuck on a dialog or unresponsive | `hive peek <drone>` |
 | status `blocked` | dialog despite skip-permissions | `hive peek <drone>`, then `hive unblock <drone>` |
 | drone silent, panel shows "Resume from summary" | its context ran out; the session asks how to resume | `hive unblock <drone>` — the sweep names this one explicitly |
@@ -298,7 +329,7 @@ graveyard. A drone worth keeping should be revived, not pruned: `prune` cannot t
 from "crashed" — both are `dead`, and the `.killed` marker that silences the sweep says nothing
 about whether the work succeeded.
 
-## herdr technicalities (0.8.2)
+## herdr technicalities (0.8.2, 0.9.1)
 
 - Public IDs are short stable handles: workspace `w1`, tab `w1:t1`, pane `w1:p1`.
   IDs of closed panes are **never reused**. Always take them from JSON responses.
@@ -312,7 +343,10 @@ about whether the work succeeded.
   and returns immediately; an agent stuck at a dialog is rejected with `agent_blocked` —
   nothing gets sent. With `--wait` it waits for a settled state (`--timeout` works only with
   `--wait`; 5 s with no reaction at all → `agent_prompt_stalled`). The old `herdr agent send`
-  and top-level `herdr wait` **do not exist** (removed in 0.7.5).
+  and top-level `herdr wait` **do not exist** (removed in 0.7.5). Since 0.9 success means the
+  text and Enter were written — not that a turn started.
+- Agent arguments cannot span lines (`invalid_agent_argument`, still true in 0.9.1) — `hive spawn`
+  flattens the drones' system prompt to one line.
 - `pane read` and `agent read` return **raw text** (not JSON). Sources: `visible`
   (current screen), `recent`/`recent-unwrapped` (recent output; unwrapped joins soft
   wraps — for logs), `agent read` also has `detection`. `--format ansi` when colors matter
@@ -329,4 +363,8 @@ about whether the work succeeded.
   (CLI reads do **not** clear `done`). `unknown` proves nothing. The task completion signal
   is `report.md` anyway, not the status.
 - The official API cheat sheet for agents: `herdr --skill`. Check versions with `herdr --version`
-  and `herdr status server`.
+  and `herdr status server` — but read its output, not its exit code: since 0.9 it exits 0 even
+  when no server runs. `hive` itself probes reachability with a real API call.
+- A herdr update replaces only the client. Until the old server restarts, the new client refuses
+  it (`protocol_mismatch`) and every drone reads as `dead`; `hive prune` and `hive sweep` refuse to
+  judge drones while the server is unreachable.

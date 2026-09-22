@@ -24,6 +24,12 @@ except Exception: sys.exit(1)
 r=d.get('result',d)
 $1" 2>/dev/null; }
 
+# Is the herdr server up AND willing to talk to this client? A real API round trip, because the
+# cheap signals lie: herdr 0.9 'status server' exits 0 even when no server runs, and a server left
+# over from before a client update is "running" yet rejects every call with protocol_mismatch.
+# In both cases every pane lookup fails, so every drone would read as dead.
+herdr_reachable() { herdr workspace list >/dev/null 2>&1; }
+
 # Returns text sitting in the drone's input field (last '>' line in the frame), empty when clean.
 # CRITICAL: the prompt is shared with the human. If the user typed something and did not send it,
 # our 'enter' would send THEIR text, and our message would glue itself onto their sentence.
@@ -112,6 +118,9 @@ wake_recipient() {
   else
     pane=$(pane_of "$who" 2>/dev/null)
     [ -n "$pane" ] || return 0
+    # An adopted agent has no HIVE_DRONE until revive: woken now, its 'hive inbox' would read and
+    # archive the coordinator's mailbox. Its letters wait until revive gives it the swarm env.
+    [ "$(meta_get "$who" adopted)" = True ] && return 0
   fi
 
   exec 9>"$HIVE_DIR/.wake-lock"
@@ -348,11 +357,13 @@ json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":c
 PY
 
   # Startup dialog bootstrap: the trust dialog appears despite --dangerously-skip-permissions
-  # (for a new cwd), and the bypass consent on first skip-permissions use on a machine
-  # (option 2 = "Yes, I accept"). herdr reports both as 'blocked'.
-  local i
+  # (for a new cwd), the bypass consent on first skip-permissions use on a machine
+  # (option 2 = "Yes, I accept"), and the resume dialog when a long session is revived.
+  # herdr reports all of them as 'blocked'.
+  local i compacted=0
   for i in $(seq 1 12); do
-    [ "$ready" = 1 ] && break
+    # A ready agent can still sit on the resume dialog if herdr classifies it as idle.
+    [ "$ready" = 1 ] && [ "$(pane_dialog "$pane" 2>/dev/null)" != resume ] && break
     case "$(pane_dialog "$pane" 2>/dev/null)" in
       trust)
         # The dialog's default button is "No, exit" (quits Claude Code), so a bare enter would
@@ -367,11 +378,23 @@ PY
         sleep 1
         herdr agent send-keys "$name" enter >/dev/null 2>&1
         sleep 2 ;;
+      resume)
+        # A long session revived with --resume asks whether to resume from a summary or replay
+        # the whole session. The summary is preselected and far cheaper, so Enter takes it —
+        # but compaction drops detail, hence the loud warning below.
+        herdr agent send-keys "$name" enter >/dev/null 2>&1
+        compacted=1
+        sleep 3 ;;
     esac
     herdr agent wait "$name" --until idle --until done --timeout 5000 >/dev/null 2>&1 && ready=1
   done
   sleep 2   # let SessionStart hooks finish their thing and release the prompt
   [ "$ready" = 1 ] || echo "warning: $name did not confirm readiness — check: hive peek $name" >&2
+  [ "$compacted" = 1 ] && cat >&2 <<EOF
+warning: $name had a long session and resumed FROM A SUMMARY (compaction can take ~2 min).
+Compaction drops detail. Before tasking it: wait until its status is no longer 'working', then
+restate what binds in one 'hive say' — state on disk, scope, boundaries. Do not assume it remembers.
+EOF
 
   echo "spawn: $name  ws=$ws pane=$pane model=$MODEL cwd=$cwd"
   echo "sid=$sid"
@@ -405,7 +428,13 @@ Without a written report the task counts as not done.
 If you get stuck or need something: write a report with STATUS: BLOCKED and describe what you need.
 EOF
 
-  rm -f "$dir/report.md" "$dir"/.sweep-* "$dir/.killed"   # new task resets sweep verdicts
+  # The previous report is archived, not deleted: it is often the input to the next turn (the
+  # drone's own plan), and deleting it cut the drone off from its own conclusions.
+  if [ -f "$dir/report.md" ]; then
+    local prev; prev="$dir/report-$(date +%Y%m%d-%H%M%S).md"
+    mv "$dir/report.md" "$prev" && echo "task: previous report of $name archived as $prev"
+  fi
+  rm -f "$dir"/.sweep-* "$dir/.killed"   # new task resets sweep verdicts
 
   local msg="Read $dir/brief.md and carry out the task it describes."
   # 'done' = the previous turn finished. Remember the pre-send state so a stale 'done'
@@ -425,8 +454,10 @@ EOF
 Not sending — Enter would send THAT, not my task. Sort the prompt out (hive clear $name) and retry."
 
   # herdr 0.8: agent prompt appends Enter atomically, and rejects a drone stuck at a dialog
-  # (agent_blocked) without sending anything. Delivery is still CONFIRMED via status —
-  # a freshly started drone can still lose its first input (SessionStart hooks clear the prompt).
+  # (agent_blocked) without sending anything. herdr 0.9 reports success only once the text and
+  # Enter are written — which still does not prove the agent started a turn. Delivery is therefore
+  # CONFIRMED via status: a freshly started drone can lose its first input (SessionStart hooks
+  # clear the prompt).
   local attempt i st out
   for attempt in 1 2 3; do
     out=$(herdr agent prompt "$name" "$msg" 2>&1) || {
@@ -439,7 +470,7 @@ Not sending — Enter would send THAT, not my task. Sort the prompt out (hive cl
       sleep 2
       st=$(pane_status "$pane")
       [ "$st" = working ] && { echo "task: $name <- $dir/brief.md (attempt $attempt)"; return 0; }
-      # A fast drone finishes the whole job between polls: report.md (deleted before
+      # A fast drone finishes the whole job between polls: report.md (moved aside before
       # sending) is hard proof of delivery; 'done' only counts when fresh.
       [ -f "$dir/report.md" ] && { echo "task: $name <- $dir/brief.md (attempt $attempt, fast finish)"; return 0; }
       [ "$st" = done ] && [ "$pre" != done ] && { echo "task: $name <- $dir/brief.md (attempt $attempt)"; return 0; }
@@ -710,6 +741,8 @@ cmd_prune() {  # prune [--purge] [--dry-run] [name...] — clears out dead drone
     for d in "$DRONES_DIR"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
   fi
   [ ${#names[@]} -eq 0 ] && { echo "prune: no drones"; return; }
+  # An unreachable server makes every living drone read as dead — pruning then would sweep the swarm.
+  herdr_reachable || die "prune: herdr server unreachable (down, or older than this client) — every drone would read as dead; nothing pruned"
 
   # Living drones are never touched — not even a blocked one, which is stuck rather than gone.
   local dead=() n st
@@ -797,9 +830,78 @@ cmd_unblock() {  # unblock <name> — answers the dialog a drone is stuck on
   return 1
 }
 
+cmd_adopt() {  # adopt <name> <pane_id> — pulls a Claude Code started outside hive into the swarm
+  local name="${1:?usage: hive adopt <name> <pane_id>}"; local pane="${2:?missing pane_id}"
+  [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+    || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
+  [ -f "$(drone_meta "$name")" ] && die "drone $name already exists — pick another name"
+  local info; info=$(herdr pane get "$pane" 2>/dev/null) || die "no such pane: $pane"
+  local agent; agent=$(jqp "print(r['pane'].get('agent') or '')" <<<"$info")
+  [ "$agent" = claude ] || die "pane $pane does not host a claude agent (it hosts: ${agent:-nothing})"
+
+  local ws cwd sid
+  pane=$(jqp "print(r['pane']['pane_id'])" <<<"$info")
+  ws=$(jqp "print(r['pane']['workspace_id'])" <<<"$info")
+  # --resume looks the session up by the directory Claude Code runs in: the foreground cwd.
+  cwd=$(jqp "p=r['pane']; print(p.get('foreground_cwd') or p.get('cwd') or '')" <<<"$info")
+  # Reported by herdr's claude integration — without it 'revive' cannot restore the history.
+  sid=$(jqp "
+s=r['pane'].get('agent_session') or {}
+print(s.get('value','') if s.get('kind')=='id' else '')" <<<"$info")
+
+  # revive closes the drone's workspace — adopting the coordinator's own pane, or another drone's,
+  # would hand that workspace to the wrong owner.
+  [ "$pane" = "$(coord_pane)" ] && die "pane $pane is the coordinator's pane"
+  local m
+  for m in "$DRONES_DIR"/*/meta.json; do
+    [ -f "$m" ] || continue
+    [ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('pane_id',''))" "$m" 2>/dev/null)" = "$pane" ] \
+      && die "pane $pane already belongs to drone $(basename "$(dirname "$m")")"
+  done
+
+  # The name is claimed in herdr first: agent names are unique among live agents, and a drone
+  # registered under a name held by someone else would have its tasks delivered to that agent.
+  herdr agent rename "$pane" "$name" >/dev/null 2>&1 \
+    || die "herdr refused the name '$name' (taken by another live agent?) — nothing adopted"
+  herdr workspace rename "$ws" "$name" >/dev/null 2>&1
+
+  local dir; dir=$(drone_dir "$name"); mkdir -p "$dir"
+  rm -f "$dir"/.sweep-* "$dir/.killed"   # leftovers of a ghost directory must not judge the new drone
+  # 'adopted' marks a drone without the swarm env: until revive it has no HIVE_DRONE, so its
+  # 'hive inbox' would read the COORDINATOR's mailbox — wake_recipient leaves it alone.
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" <<'PY'
+import json,sys
+d,name,ws,pane,sid,cwd = sys.argv[1:7]
+json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd,"adopted":True},
+          open(f"{d}/meta.json","w"), indent=1)
+PY
+
+  echo "adopt: $name  ws=$ws pane=$pane cwd=$cwd"
+  local missing=""
+  [ -n "$sid" ] || missing="session_id"
+  [ -n "$cwd" ] || missing="${missing:+$missing and }cwd"
+  if [ -n "$missing" ]; then
+    echo "warning: herdr reported no $missing — 'hive revive' would lose the history and refuses to run for $name" >&2
+    return 0
+  fi
+  echo "sid=$sid"
+  # revive closes the drone's whole workspace — an adopted agent may share it with other panes.
+  local panes; panes=$(herdr workspace get "$ws" 2>/dev/null | jqp "print(r['workspace'].get('pane_count') or 0)")
+  [ "${panes:-0}" -gt 1 ] 2>/dev/null \
+    && echo "warning: workspace $ws holds $panes panes — 'hive revive' closes the whole workspace, not just this pane" >&2
+  cat <<EOF
+note: an adopted agent has no swarm hooks (it will not report in), no swarm env and no mail protocol.
+Full integration: hive revive $name   (restart with --resume; the conversation history survives)
+EOF
+}
+
 cmd_revive() {  # revive <name> — resurrects a drone with its conversation history intact
   local name="${1:?usage: hive revive <name>}"
   local cwd; cwd=$(meta_get "$name" cwd) || die "unknown drone: $name"
+  # Checked before the workspace is closed: without both, spawn would start a fresh session (or
+  # none at all) after the old one is already gone — the history would be lost, not revived.
+  local sid; sid=$(meta_get "$name" session_id)
+  [ -n "$sid" ] && [ -n "$cwd" ] || die "revive: $name has no recorded session id or cwd — it cannot be resumed; nothing closed"
   local ws; ws=$(meta_get "$name" workspace_id)
   herdr workspace close "$ws" >/dev/null 2>&1
   cmd_spawn "$name" --cwd "$cwd" --resume
@@ -827,9 +929,9 @@ sweep_alert() {  # sweep_alert <drone> <state> <subject> <body> — letter to co
 }
 
 cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet when all is well
-  # Without a live herdr server nothing can be woken or notified — a swarm without herdr
-  # is not asleep, it is off. Stay silent instead of mailing into the void.
-  herdr status server >/dev/null 2>&1 || return 0
+  # Without a reachable herdr server nothing can be woken or notified — a swarm without herdr
+  # is not asleep, it is off. Stay silent instead of mailing "drone is dead" about every drone.
+  herdr_reachable || return 0
 
   local now; now=$(date +%s)
   local remote; remote=$(coord_remote)
@@ -979,6 +1081,51 @@ gate_queue_print() {
   done < "$qf"
 }
 
+cmd_usage() {  # usage [--cwd DIR] [--timeout SEC] — measures the account limits with a throwaway Claude session (/usage)
+  # The coordinator cannot see the usage counter from inside its own session, and a fleet of drones burns
+  # the weekly limit in hours. This starts a fresh `claude` in a tmux session (in a TRUSTED directory —
+  # the trust dialog is not answered on purpose), types /usage, captures the panel and kills the session.
+  local cwd="$PWD" timeout=45
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) cwd="${2:?--cwd needs a path}"; shift 2 ;;
+      --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
+      *) echo "hive: usage: unknown argument $1" >&2; return 2 ;;
+    esac
+  done
+  command -v tmux >/dev/null || { echo "hive: usage: tmux not found" >&2; return 1; }
+  local ses="hive-usage-$$" out
+  tmux kill-session -t "$ses" 2>/dev/null
+  tmux new-session -d -s "$ses" -x 200 -y 60 -c "$cwd" \
+    "env -u CLAUDECODE -u HIVE_DRONE -u HERDR_HIVE_ROLE claude" || return 1
+  local i=0
+  while [ $i -lt "$timeout" ]; do
+    out=$(tmux capture-pane -t "$ses" -p 2>/dev/null)
+    case "$out" in
+      *"Yes, I trust this folder"*)
+        tmux kill-session -t "$ses" 2>/dev/null
+        echo "hive: usage: $cwd is not a trusted folder for Claude Code — run from a trusted project or pass --cwd" >&2
+        return 1 ;;
+      *"❯"*) break ;;
+    esac
+    sleep 1; i=$((i+1))
+  done
+  [ $i -lt "$timeout" ] || { tmux kill-session -t "$ses" 2>/dev/null; echo "hive: usage: claude did not start in ${timeout}s" >&2; return 1; }
+  sleep 2
+  tmux send-keys -t "$ses" '/usage'; sleep 1; tmux send-keys -t "$ses" Enter
+  i=0
+  while [ $i -lt "$timeout" ]; do
+    out=$(tmux capture-pane -t "$ses" -p 2>/dev/null)
+    case "$out" in *"% used"*) break ;; esac
+    sleep 1; i=$((i+1))
+  done
+  tmux kill-session -t "$ses" 2>/dev/null
+  [ $i -lt "$timeout" ] || { echo "hive: usage: no /usage panel in ${timeout}s" >&2; return 1; }
+  # Print the panel compactly: the section label, its percentage and its reset time; strip the bars.
+  printf '%s\n' "$out" | sed 's/[█▌▏▎▍▋▊▉ ]\{3,\}/ /g' | grep -E 'Current session|Current week|% used|Resets|promo' \
+    | sed 's/^ *//' | uniq
+}
+
 # The machine gate: one exclusive window for anything that eats the whole machine (full test gates,
 # browser proofs). History that shaped it, condensed: three drones entered within four minutes when
 # `enter` did not check the log; check-then-append without a lock left a race window; entries without
@@ -1115,9 +1262,11 @@ case "${1:-}" in
   prune)  shift; cmd_prune  "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   revive) shift; cmd_revive "$@" ;;
+  adopt)  shift; cmd_adopt  "$@" ;;
   unblock) shift; cmd_unblock "$@" ;;
   sweep)  shift; cmd_sweep  "$@" ;;
   gate)   shift; cmd_gate   "$@" ;;
+  usage)  shift; cmd_usage  "$@" ;;
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
 
@@ -1133,11 +1282,13 @@ hive — command a swarm of Claude Code agents in herdr
   hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300s)
   hive report <name>                 show a drone's report
   hive mute   <name> [--off]         silence automatic wake-ups (conversational drone)
+  hive usage  [--cwd DIR]            measure the account limits (/usage in a throwaway session)
   hive peek   <name> [lines]         view of the drone's terminal
   hive kill   <name> [--purge]       kill a drone (a dead one is archived and removed)
   hive prune  [--purge] [--dry-run] [names]  clear out dead drones (archived unless --purge)
   hive rename <old> <new>            rename a drone and its workspace
   hive revive <name>                 resurrect a drone with its history (--resume)
+  hive adopt  <name> <pane_id>       pull a Claude Code started outside hive into the swarm
   hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
   hive sweep                         reconciliation pass: retry lost wake-ups, surface silent drones
                                      (a systemd user timer runs it every 5 min — install.sh sets it up)
