@@ -131,6 +131,11 @@ if [ "${letters:-0}" -gt 0 ]; then
 else
   echo "Unread coordinator mail: none."
 fi
+if "$SKILL_DIR/hive" _watched 2>/dev/null; then
+  echo "Mail watcher: live."
+else
+  echo 'Mail watcher: NOT ARMED — you hear no drone until you arm it: Monitor(command: "hive watch", timeout_ms: 1800000).'
+fi
 if [ "${n_inflight:-0}" -gt 0 ]; then
   echo "Drones with a task in flight (brief, no report): $n_inflight"
   printf '%s' "$lines"

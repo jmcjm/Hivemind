@@ -202,6 +202,27 @@ t_coord_prints_arm_instruction() {
   [ "$(cat "$HIVE_DIR/coord.pane")" = "w1:p1" ] || fail "coord.pane not registered"
 }
 
+# --- coordinator hooks -------------------------------------------------------
+
+t_stop_hook_still_blocks_with_unread_mail() {
+  send_coord kafka done "finished"
+  echo '{"session_id":"S1"}' | FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-mail-check.sh" > "$T/mine"
+  assert_contains "$T/mine" '"decision": "block"'
+  echo '{"session_id":"S1"}' | FAKE_SESSION_ID=OTHER bash "$ROOT/skill/coord-mail-check.sh" > "$T/other"
+  [ -s "$T/other" ] && fail "hook spoke in a session that is not the coordinator"
+}
+
+t_board_reports_watcher_state() {
+  echo '{"session_id":"S1","source":"compact"}' \
+    | FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-creed-inject.sh" > "$T/off"
+  assert_contains "$T/off" "Mail watcher: NOT ARMED"
+  assert_contains "$T/off" "Keep the mail watcher armed"
+  touch "$HIVE_DIR/.watch-coord"
+  echo '{"session_id":"S1","source":"compact"}' \
+    | FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-creed-inject.sh" > "$T/on"
+  assert_contains "$T/on" "Mail watcher: live."
+}
+
 # --- main --------------------------------------------------------------------
 
 ORIG_PATH="$PATH"
