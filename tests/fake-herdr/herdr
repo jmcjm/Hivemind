@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Stand-in for herdr in the hive test suite. Records every call (one line, arguments joined by
+# spaces) to $FAKE_HERDR_LOG and answers the few read calls hive makes.
+#   FAKE_HERDR_DOWN=1     every call fails the way an unreachable server does
+#   FAKE_SESSION_ID=<id>  the agent session id 'pane get' reports (hook scoping)
+#   FAKE_AGENT_STATUS=<s> the agent status 'pane get' reports (default idle)
+printf '%s\n' "$*" >> "${FAKE_HERDR_LOG:?FAKE_HERDR_LOG must be set}"
+if [ "${FAKE_HERDR_DOWN:-0}" = 1 ]; then
+  echo '{"error":{"code":"server_not_running","message":"fake herdr is down"}}' >&2
+  exit 1
+fi
+case "$1 ${2:-}" in
+  "workspace list")    echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
+  "pane get")          printf '{"result":{"pane":{"pane_id":"%s","agent":"claude","agent_status":"%s","agent_session":{"kind":"id","value":"%s"}}}}\n' \
+                         "${3:-}" "${FAKE_AGENT_STATUS:-idle}" "${FAKE_SESSION_ID:-}" ;;
+  "pane current")      echo '{"result":{"pane":{"pane_id":"w1:p1"}}}' ;;
+  "pane read")         : ;;
+  "notification show") echo '{"result":{"type":"notification_show","shown":true}}' ;;
+  *)                   echo '{"result":{"type":"ok"}}' ;;
+esac

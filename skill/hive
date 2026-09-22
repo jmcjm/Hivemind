@@ -10,6 +10,8 @@ DRONES_DIR="$HIVE_DIR/drones"
 MAIL_DIR="$HIVE_DIR/mail"
 MODEL="${HIVE_MODEL:-opus}"
 mkdir -p "$DRONES_DIR" "$MAIL_DIR"
+# Labels for a letter's kind — shared by the watcher line and the inbox listing.
+export MAIL_KIND_LABELS='{"decision":"DECISION","done":"finished"}'
 
 die() { echo "hive: $*" >&2; exit 1; }
 command -v herdr >/dev/null || die "herdr not found in PATH"
@@ -57,6 +59,35 @@ for raw in sys.stdin.read().splitlines():
         last = bright_text(raw).strip().lstrip('❯').strip()
 print(last)
 " 2>/dev/null
+}
+
+# --- coordinator mail watcher -----------------------------------------------
+# The coordinator's prompt belongs to the human too, so coord mail is never typed into it. The
+# coordinator keeps 'hive watch' armed as a Claude Code Monitor instead: every stdout line becomes
+# a notification in its session, and the prompt stays free for the human.
+
+# Is a watcher listening? 'hive watch' touches its heartbeat every ~10 s, so 30 s of silence means
+# its monitor expired or its session is gone.
+coord_watched() {
+  local beat="$HIVE_DIR/.watch-coord"
+  [ -f "$beat" ] || return 1
+  [ $(( $(date +%s) - $(stat -c %Y "$beat" 2>/dev/null || echo 0) )) -lt 30 ]
+}
+
+# One event line for a coord letter: sender, kind, subject — never the body. Control characters
+# are flattened, because every stdout line of the watcher is a separate notification.
+watch_line() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json,os,re,sys
+try:
+    e=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)          # archived by 'hive inbox' between the listing and this read
+flat=lambda s: re.sub(r'[\x00-\x1f\x7f]+',' ',str(s or '')).strip()
+kind=json.loads(os.environ.get('MAIL_KIND_LABELS','{}')).get(e.get('kind'),'message')
+line=f"HIVE-MAIL {flat(e.get('from')) or '?'} [{kind}] {flat(e.get('subject'))}"
+print(line if len(line)<=120 else line[:117]+'...')
+PY
 }
 
 # --- swarm mail -----------------------------------------------------------
@@ -515,6 +546,38 @@ Not sending — Enter would send THAT. Sort the prompt out (hive clear $name) an
   echo "say: $name <- ${text:0:120}"
 }
 
+cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, one line per new letter
+  # A drone running this would take the watch over and leave the coordinator deaf.
+  [ -n "${HIVE_DRONE:-}" ] && die "watch is the coordinator's mail watcher — drones read their mail with hive inbox"
+  local box="$MAIL_DIR/coord" beat="$HIVE_DIR/.watch-coord" pidf="$HIVE_DIR/.watch-coord.pid"
+  mkdir -p "$box"
+  # Last armed wins: a second arm, or a new coordinator session taking over, retires this watcher.
+  echo "$$" > "$pidf"
+  touch "$beat"
+  local -A seen=()
+  local f n=0 last_beat=$SECONDS
+  for f in "$box"/*.json; do
+    [ -e "$f" ] || continue
+    seen[$f]=1; n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "HIVE-MAIL backlog: $n unread — run hive inbox"
+  while :; do
+    sleep 1
+    [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] \
+      || { echo "HIVE-WATCH: taken over by another watcher — stopping"; return 0; }
+    local -A now=()
+    for f in "$box"/*.json; do
+      [ -e "$f" ] || continue
+      now[$f]=1
+      [ -n "${seen[$f]:-}" ] || watch_line "$f"
+    done
+    # Forget letters 'hive inbox' archived, so the set never grows with the watcher's lifetime.
+    seen=()
+    for f in "${!now[@]}"; do seen[$f]=1; done
+    if [ $((SECONDS - last_beat)) -ge 10 ]; then touch "$beat"; last_beat=$SECONDS; fi
+  done
+}
+
 cmd_status() {  # status [name...] — never blocks
   # Passive reconciliation surface: status gets run often, so unread mail that lost its
   # wake-up (dead pane, human text in the prompt) resurfaces here instead of rotting.
@@ -646,11 +709,11 @@ cmd_inbox() {  # inbox [who] [--keep] — reads and consumes a mailbox (own by d
   fi
 
   python3 -c "
-import json,sys
+import json,os,sys
 for p in sys.argv[1:]:
     try: e=json.load(open(p))
     except Exception: continue
-    kind={'decision':'DECISION','done':'finished'}.get(e.get('kind'),'message')
+    kind=json.loads(os.environ.get('MAIL_KIND_LABELS','{}')).get(e.get('kind'),'message')
     print(f\"── {e.get('ts','?')}  from: {e.get('from','?')}  [{kind}]\")
     print(f\"   {e.get('subject','')}\")
     b=(e.get('body') or '').strip()
@@ -1234,6 +1297,7 @@ case "${1:-}" in
   clear)  shift; cmd_clear  "$@" ;;
   send)   shift; cmd_send   "$@" ;;
   inbox)  shift; cmd_inbox  "$@" ;;
+  watch)  shift; cmd_watch  "$@" ;;
   coord)  shift
           # Either branch is a coordinator handover: wake-up state aimed at the previous
           # coordinator dies with it, and the new one learns about backlog immediately —
@@ -1253,6 +1317,7 @@ case "${1:-}" in
             echo "coord: $backlog unread letter(s) waiting — run: hive inbox"
           fi ;;
   _pending) shift; prompt_pending "${1:?missing pane}" ;;   # internal, for drone-ping.sh
+  _watched) coord_watched ;;                                   # internal, for coord-creed-inject.sh
   status) shift; cmd_status "$@" ;;
   wait)   shift; cmd_wait   "$@" ;;
   report) shift; cmd_report "$@" ;;
@@ -1276,6 +1341,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
   hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + recipient wake-up
   hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
+  hive watch                         coordinator's mail watcher — arm it as a Monitor (one line per new letter)
   hive coord                         register the current pane as the coordinator pane
   hive coord --remote <ssh-host>     coordinator lives on another machine — forward coord mail over ssh
   hive status [name]                 swarm state table (never blocks)
