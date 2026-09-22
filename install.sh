@@ -21,10 +21,23 @@ ok "herdr $(herdr --version 2>/dev/null | awk '{print $2}')"
 ok "claude $(claude --version 2>/dev/null | awk '{print $1}')"
 HERDR_MAJOR_MINOR=$(herdr --version 2>/dev/null | awk '{print $2}' | cut -d. -f1,2)
 case "$HERDR_MAJOR_MINOR" in
-  0.8) : ;;
+  0.8|0.9) : ;;
   0.7) die "herdr 0.7.x will not work with this version (no agent prompt / agent start into an existing pane) — update herdr or use commit 604848c" ;;
-  *)   warn "tested on herdr 0.8.x — on another version check the 'herdr technicalities' section in SKILL.md" ;;
+  *)   warn "tested on herdr 0.8.x and 0.9.x — on another version check the 'herdr technicalities' section in SKILL.md" ;;
 esac
+# Updating the herdr client leaves the old server running, and a newer client refuses it
+# (protocol_mismatch) — until the server restarts, hive cannot reach a single pane.
+# Output captured first: with pipefail, 'grep -q' closing the pipe early could fail herdr's write.
+HERDR_SERVER_STATUS=$(herdr status server 2>/dev/null || true)
+if grep -q '^status: running' <<<"$HERDR_SERVER_STATUS"; then
+  if herdr workspace list >/dev/null 2>&1; then
+    ok "herdr server reachable"
+  else
+    warn "the running herdr server rejects this client (older than the client?) — hive will not work until it restarts: 'herdr server stop' (ends every pane process), then 'herdr'"
+  fi
+else
+  warn "herdr server not running — start it ('herdr') before the smoke test"
+fi
 
 echo "== 2/8 Skill files =="
 mkdir -p "$SKILL_DST"
@@ -53,7 +66,7 @@ echo "== 4/8 herdr ↔ Claude Code integration =="
 # The SessionStart hook reports session_id and transcript to herdr — without it `hive revive` does not work.
 [ -f "$HOME/.claude/settings.json" ] && cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.bak-$STAMP"
 herdr integration install claude >/dev/null 2>&1 || die "herdr integration install claude failed"
-herdr integration status 2>/dev/null | grep -q '^claude: current' \
+grep -q '^claude: current' <<<"$(herdr integration status 2>/dev/null || true)" \
   && ok "claude integration active (settings.json backup: settings.json.bak-$STAMP)" \
   || die "claude integration does not report as active"
 

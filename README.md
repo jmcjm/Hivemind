@@ -20,9 +20,15 @@ Idempotent. Every overwritten file lands as `*.bak-<timestamp>` first. It does s
 checks requirements, copies the skill, exposes `hive` in PATH, installs the herdr↔Claude Code
 integration, appends a section to `~/.claude/CLAUDE.md`, verifies syntax.
 
-**Requirements:** `herdr` **≥ 0.8** (tested on 0.8.2 — 0.7.5 removed `agent send` and the top-level
-`wait` that the old version rode on; for herdr 0.7.x use commit `604848c`), `claude`
+**Requirements:** `herdr` **≥ 0.8** (tested on 0.8.2 and 0.9.1 — 0.7.5 removed `agent send` and the
+top-level `wait` that the old version rode on; for herdr 0.7.x use commit `604848c`), `claude`
 (Claude Code CLI), `python3`, `flock`. The herdr server must be running — check `herdr status`.
+
+**After updating herdr, restart its server.** The update replaces only the client; the old server
+keeps running, and a newer client refuses it (`protocol_mismatch`) — until the restart every drone
+reads as `dead`. `herdr status` shows `restart_needed: yes`. `herdr server stop` ends every pane
+process, so do it when no drone is working, then start `herdr` again. Re-run `./install.sh` too:
+it refreshes the herdr↔Claude Code integration, which herdr versions along with itself.
 
 ## Verifying the 1:1 reproduction
 
@@ -118,7 +124,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 9. **One wake-up per batch** (the `.wake-<who>` marker) + `flock`. Without it, five drones finishing
    at once all type into one prompt simultaneously and the result is mush.
 
-## herdr 0.8.x technicalities
+## herdr 0.8.x / 0.9.x technicalities
 
 - Public IDs are short stable handles (`w1`, `w1:t1`, `w1:p1`); IDs of closed panes are never
   reused. Always take them from JSON responses.
@@ -129,6 +135,15 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 - `herdr agent prompt` appends Enter atomically and returns immediately; an agent at a dialog →
   `agent_blocked`, nothing gets sent. `--timeout` works only with `--wait`.
   The old `agent send` and top-level `wait` are gone since 0.7.5.
+  0.9: success is reported only once the text and Enter are written — still no proof that the
+  agent started a turn, so `hive task` keeps confirming delivery through the status.
+- Agent arguments still cannot span lines (`invalid_agent_argument`, checked on 0.9.1) — hence the
+  single-line system prompt.
+- 0.9: `herdr status server` exits 0 even when no server runs. `hive sweep` and `hive prune` probe
+  reachability with a real API call instead and refuse to judge drones while the server is
+  unreachable; `hive status` still shows every drone as `dead` then.
+- 0.9: `herdr --machine <label>` forwards CLI commands to a saved SSH machine. `hive coord --remote`
+  keeps using plain ssh, which works without a saved profile on either side.
 - `pane read` and `agent read` return raw text. A fresh pane can have an empty
   `--source recent` — for diagnosis use `visible`.
 - `herdr pane current --current` gives the **caller's** pane (hence `hive coord`).
@@ -145,6 +160,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 
 | Symptom | Cause | Move |
 |---|---|---|
+| every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; stop the old server when no drone works, start `herdr` |
 | `HIVE-MAIL` never arrives | `coord.pane` points at a previous session's panel | `hive coord`, then `hive inbox` |
 | `HIVE-MAIL` never arrives, coord OK | human has text in the prompt — wake-up withheld | the letter waits in the mailbox: `hive inbox` |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
