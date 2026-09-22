@@ -7,10 +7,11 @@ default toast delivery is "off", so out of the box the alert never shows. instal
     herdr-toasts.py <config.toml> <backup-suffix>
 
 Prints one status line:
-    enabled         [ui.toast] delivery was unset; it is now DELIVERY (original kept as <config><suffix>)
-    kept <value>    the config already chooses a delivery; nothing changed
-    off-by-choice   the config sets delivery = "off" explicitly; respected, nothing changed
-    error <reason>  nothing changed
+    enabled <backup>  [ui.toast] delivery was unset and is now DELIVERY; <backup> is the copy of
+                      the original, or "-" when there was no config file yet
+    kept <value>      the config already chooses a delivery; nothing changed
+    off-by-choice     the config sets delivery = "off" explicitly; respected, nothing changed
+    error <reason>    nothing changed
 """
 import os
 import re
@@ -21,7 +22,9 @@ import tempfile
 # The OS notification service: the alert fires when the coordinator is not listening, which is
 # usually when the human is looking at something other than herdr.
 DELIVERY = "system"
-SETTING = f'delivery = "{DELIVERY}"'
+# herdr rejects the WHOLE config for any other value ("unknown variant ..., using defaults").
+VALID = ("off", "herdr", "terminal", "system")
+HEADER = re.compile(r"^[ \t]*\[[ \t]*ui[ \t]*\.[ \t]*toast[ \t]*\][ \t]*(#[^\r\n]*)?\r?$", re.M)
 
 
 def toast_delivery(cfg):
@@ -31,25 +34,35 @@ def toast_delivery(cfg):
 
 
 def with_setting(text):
-    """The config text with the setting placed under [ui.toast], added at the end when absent."""
-    header = re.search(r"^[ \t]*\[[ \t]*ui[ \t]*\.[ \t]*toast[ \t]*\][ \t]*(#.*)?$", text, re.M)
+    """The config text with the setting placed under [ui.toast], added at the end when absent.
+    New lines use the file's own line ending."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    setting = f'delivery = "{DELIVERY}"'
+    header = HEADER.search(text)
     if header:
-        return text[:header.end()] + "\n" + SETTING + text[header.end():]
+        end = header.end() - (1 if text[:header.end()].endswith("\r") else 0)
+        return text[:end] + nl + setting + text[end:]
     if text and not text.endswith("\n"):
-        text += "\n"
-    return text + ("\n" if text else "") + "[ui.toast]\n" + SETTING + "\n"
+        text += nl
+    return text + (nl if text else "") + "[ui.toast]" + nl + setting + nl
 
 
-def write_atomically(path, text):
-    """Replaces the file in one step, keeping its mode. A symlinked config stays a symlink."""
-    target = os.path.realpath(path)
+def write_atomically(target, text):
+    """Replaces the file in one step, keeping its mode (a new file gets the umask default)."""
     directory = os.path.dirname(target) or "."
     os.makedirs(directory, exist_ok=True)
-    mode = os.stat(target).st_mode & 0o7777 if os.path.exists(target) else 0o644
+    if os.path.exists(target):
+        mode = os.stat(target).st_mode & 0o7777
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".herdr-toasts-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, target)
     except BaseException:
@@ -64,8 +77,14 @@ def main(path, suffix):
     except ImportError:
         return "error python3 >= 3.11 is needed to read TOML"
 
+    # A symlinked config is edited at its target, so it stays a link. A dangling one points at
+    # something not there yet (a dotfiles checkout still to come) — creating it would get in the way.
+    if os.path.islink(path) and not os.path.exists(path):
+        return f"error {path} is a dangling symlink"
+    target = os.path.realpath(path)
+
     try:
-        with open(path, "rb") as f:
+        with open(target, "rb") as f:
             raw = f.read()
     except FileNotFoundError:
         raw = None
@@ -81,24 +100,31 @@ def main(path, suffix):
     if current == "off":
         return "off-by-choice"
     if current is not None:
+        if current not in VALID:
+            return f"error [ui.toast] delivery = {current!r} is not one of {', '.join(VALID)} — herdr ignores the whole config"
         return f"kept {current}"
+
+    # A read-only config is somebody saying "do not touch"; os.replace would ignore that.
+    if raw is not None and not os.access(target, os.W_OK):
+        return f"error {path} is read-only"
 
     new = with_setting(text)
     try:
         placed = toast_delivery(tomllib.loads(new)) == DELIVERY
     except tomllib.TOMLDecodeError:
         placed = False
-    if not placed:                          # e.g. an inline toast table that a header would clash with
+    if not placed:                          # e.g. an inline or dotted toast table a header would clash with
         return "error the toast table is defined in a form this installer does not edit"
 
+    backup = "-"
     try:
         if raw is not None:
-            target = os.path.realpath(path)
-            shutil.copy2(target, target + suffix)
-        write_atomically(path, new)
+            backup = target + suffix
+            shutil.copy2(target, backup)
+        write_atomically(target, new)
     except OSError as e:
         return f"error cannot write {path}: {e.strerror}"
-    return "enabled"
+    return f"enabled {backup}"
 
 
 if __name__ == "__main__":

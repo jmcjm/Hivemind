@@ -75,11 +75,14 @@ grep -q '^claude: current' <<<"$(herdr integration status 2>/dev/null || true)" 
 echo "== 5/9 herdr toasts =="
 # The alert for coord mail nobody is watching is a herdr notification, and herdr's default toast
 # delivery is "off". An unset delivery is switched on; an explicit choice, "off" included, stays.
-HERDR_CONFIG="$HOME/.config/herdr/config.toml"
+# The same lookup herdr does: HERDR_CONFIG_PATH, else the XDG config directory.
+HERDR_CONFIG="${HERDR_CONFIG_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml}"
 TOAST=$(python3 "$SRC/lib/herdr-toasts.py" "$HERDR_CONFIG" ".bak-$STAMP" 2>/dev/null) || TOAST="error python3 failed"
 case "$TOAST" in
-  enabled)
-    ok "herdr toasts on: [ui.toast] delivery = \"system\" (backup: config.toml.bak-$STAMP)"
+  enabled\ *)
+    TOAST_BACKUP="${TOAST#enabled }"
+    [ "$TOAST_BACKUP" = - ] && TOAST_BACKUP="none, the file is new"
+    ok "herdr toasts on: [ui.toast] delivery = \"system\" in $HERDR_CONFIG (backup: $TOAST_BACKUP)"
     if [ "$HERDR_REACHABLE" = 1 ]; then
       herdr server reload-config >/dev/null 2>&1 && ok "running herdr server reloaded its config" \
         || warn "could not reload the running herdr server — the setting applies from its next start"

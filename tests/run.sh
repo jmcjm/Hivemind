@@ -277,30 +277,57 @@ t_board_reports_watcher_state() {
 
 toasts() { python3 "$ROOT/lib/herdr-toasts.py" "$1" .bak-test; }
 toast_delivery() {
-  python3 -c "import sys,tomllib; print(tomllib.load(open(sys.argv[1],'rb'))['ui']['toast']['delivery'])" "$1"
+  python3 -c "import sys,tomllib; print(tomllib.load(open(sys.argv[1],'rb'))['ui']['toast']['delivery'])" "$1" 2>/dev/null
+}
+expect_enabled() {  # expect_enabled <config> <expected backup path or ->
+  local out; out=$(toasts "$1")
+  [ "$out" = "enabled $2" ] || fail "expected 'enabled $2', got '$out'"
+  [ "$(toast_delivery "$(readlink -f "$1")")" = system ] || fail "delivery is not system"
+}
+expect_left_alone() {  # expect_left_alone <config> — an error, and the file byte-identical
+  local before; before=$(cat "$1" 2>/dev/null; echo x)
+  toasts "$1" | grep -q '^error ' || fail "expected an error"
+  [ "$(cat "$1" 2>/dev/null; echo x)" = "$before" ] || fail "config changed"
+  [ -e "$1.bak-test" ] && fail "backup written without a change"
 }
 
 t_toasts_enabled_when_unset() {
   printf 'onboarding = false\n\n[ui.sound]\nenabled = false\n' > "$T/config.toml"
-  [ "$(toasts "$T/config.toml")" = enabled ] || fail "expected 'enabled'"
-  [ "$(toast_delivery "$T/config.toml")" = system ] || fail "delivery is not system"
+  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
   assert_contains "$T/config.toml" "enabled = false"
   cmp -s "$T/config.toml.bak-test" <(printf 'onboarding = false\n\n[ui.sound]\nenabled = false\n') \
     || fail "backup is not the original"
 }
 
 t_toasts_enabled_when_config_missing() {
-  [ "$(toasts "$T/config.toml")" = enabled ] || fail "expected 'enabled'"
-  [ "$(toast_delivery "$T/config.toml")" = system ] || fail "delivery is not system"
+  expect_enabled "$T/config.toml" -
   [ -e "$T/config.toml.bak-test" ] && fail "backup written for a file that did not exist"
 }
 
 t_toasts_inserted_into_existing_table() {
   printf '[ui.toast]\nposition = "top-right"\n\n[theme]\nname = "nord"\n' > "$T/config.toml"
-  [ "$(toasts "$T/config.toml")" = enabled ] || fail "expected 'enabled'"
-  [ "$(toast_delivery "$T/config.toml")" = system ] || fail "delivery is not system"
+  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
   assert_contains "$T/config.toml" 'position = "top-right"'
-  assert_count "$T/config.toml" "[ui.toast]" 1
+  assert_count "$T/config.toml" "ui.toast" 1
+}
+
+t_toasts_header_with_spaces_and_comment() {
+  printf '[ ui . toast ]  # popups\nposition = "top-right"\n' > "$T/config.toml"
+  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
+  assert_count "$T/config.toml" "toast ]" 1
+}
+
+t_toasts_crlf_file_keeps_crlf() {
+  printf '[ui.toast]\r\nposition = "top-right"\r\n' > "$T/config.toml"
+  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
+  [ "$(grep -c $'\r$' "$T/config.toml")" = "$(wc -l < "$T/config.toml")" ] || fail "mixed line endings"
+}
+
+t_toasts_mode_preserved() {
+  printf '[theme]\nname = "nord"\n' > "$T/config.toml"
+  chmod 640 "$T/config.toml"
+  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
+  [ "$(stat -c %a "$T/config.toml")" = 640 ] || fail "mode is $(stat -c %a "$T/config.toml"), expected 640"
 }
 
 t_toasts_explicit_choice_kept() {
@@ -316,28 +343,46 @@ t_toasts_explicit_off_respected() {
   [ "$(toast_delivery "$T/config.toml")" = off ] || fail "explicit off overwritten"
 }
 
-t_toasts_unplaceable_left_alone() {
-  # A toast table defined inline cannot take a [ui.toast] header next to it.
+t_toasts_invalid_value_reported() {
+  # herdr ignores the whole config on an unknown delivery — reporting it as kept would be a lie.
+  printf '[ui.toast]\ndelivery = "System"\n' > "$T/config.toml"
+  expect_left_alone "$T/config.toml"
+}
+
+t_toasts_inline_table_left_alone() {
   printf '[ui]\ntoast = { position = "top-right" }\n' > "$T/config.toml"
-  cp "$T/config.toml" "$T/orig"
-  toasts "$T/config.toml" | grep -q '^error ' || fail "expected an error"
-  cmp -s "$T/config.toml" "$T/orig" || fail "config changed"
+  expect_left_alone "$T/config.toml"
+}
+
+t_toasts_dotted_keys_left_alone() {
+  printf '[ui]\ntoast.position = "top-right"\n' > "$T/config.toml"
+  expect_left_alone "$T/config.toml"
 }
 
 t_toasts_broken_config_left_alone() {
   printf '[ui.toast\ndelivery = \n' > "$T/config.toml"
-  cp "$T/config.toml" "$T/orig"
-  toasts "$T/config.toml" | grep -q '^error ' || fail "expected an error"
-  cmp -s "$T/config.toml" "$T/orig" || fail "config changed"
+  expect_left_alone "$T/config.toml"
+}
+
+t_toasts_read_only_config_left_alone() {
+  printf '[theme]\nname = "nord"\n' > "$T/config.toml"
+  chmod 444 "$T/config.toml"
+  expect_left_alone "$T/config.toml"
 }
 
 t_toasts_symlinked_config_stays_a_link() {
   mkdir -p "$T/dotfiles"
   printf '[theme]\nname = "nord"\n' > "$T/dotfiles/herdr.toml"
   ln -s "$T/dotfiles/herdr.toml" "$T/config.toml"
-  [ "$(toasts "$T/config.toml")" = enabled ] || fail "expected 'enabled'"
+  expect_enabled "$T/config.toml" "$T/dotfiles/herdr.toml.bak-test"
   [ -L "$T/config.toml" ] || fail "symlink replaced by a regular file"
-  [ "$(toast_delivery "$T/dotfiles/herdr.toml")" = system ] || fail "link target not updated"
+  [ -f "$T/dotfiles/herdr.toml.bak-test" ] || fail "backup not next to the link target"
+}
+
+t_toasts_dangling_symlink_left_alone() {
+  ln -s "$T/dotfiles/herdr.toml" "$T/config.toml"
+  expect_left_alone "$T/config.toml"
+  [ -e "$T/dotfiles" ] && fail "created the link target's directory"
 }
 
 # --- main --------------------------------------------------------------------
