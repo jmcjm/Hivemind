@@ -12,7 +12,7 @@ ok()   { echo "  ✓ $*"; }
 warn() { echo "  ! $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
-echo "== 1/8 Requirements =="
+echo "== 1/9 Requirements =="
 command -v herdr  >/dev/null || die "herdr missing — install from https://herdr.dev and rerun"
 command -v claude >/dev/null || die "claude missing (Claude Code CLI)"
 command -v python3 >/dev/null || die "python3 missing"
@@ -29,8 +29,10 @@ esac
 # (protocol_mismatch) — until the server restarts, hive cannot reach a single pane.
 # Output captured first: with pipefail, 'grep -q' closing the pipe early could fail herdr's write.
 HERDR_SERVER_STATUS=$(herdr status server 2>/dev/null || true)
+HERDR_REACHABLE=0
 if grep -q '^status: running' <<<"$HERDR_SERVER_STATUS"; then
   if herdr workspace list >/dev/null 2>&1; then
+    HERDR_REACHABLE=1
     ok "herdr server reachable"
   else
     warn "the running herdr server rejects this client (older than the client?) — hive will not work until it restarts: 'herdr server stop' (ends every pane process), then 'herdr'"
@@ -38,31 +40,8 @@ if grep -q '^status: running' <<<"$HERDR_SERVER_STATUS"; then
 else
   warn "herdr server not running — start it ('herdr') before the smoke test"
 fi
-# The fallback for coord mail nobody is watching is a herdr notification; with toasts off
-# (the herdr default) it never shows.
-TOAST=$(python3 - "$HOME/.config/herdr/config.toml" <<'PY' 2>/dev/null
-import sys
-try:
-    import tomllib                      # Python 3.11+
-except ImportError:
-    print("old-python")
-    sys.exit(0)
-try:
-    with open(sys.argv[1], "rb") as f:
-        cfg = tomllib.load(f)
-except FileNotFoundError:
-    cfg = {}
-print(((cfg.get("ui") or {}).get("toast") or {}).get("delivery", "off"))
-PY
-) || TOAST=unknown
-case "$TOAST" in
-  off)        warn "herdr toasts are off — the unwatched-mail alert will not show; set [ui.toast] delivery = \"system\" (or \"herdr\") in ~/.config/herdr/config.toml" ;;
-  old-python) warn "python3 < 3.11 cannot read TOML — check [ui.toast] delivery in ~/.config/herdr/config.toml yourself" ;;
-  unknown)    warn "could not read the herdr toast setting — make sure [ui.toast] delivery is not \"off\"" ;;
-  *)          ok "herdr toasts: $TOAST" ;;
-esac
 
-echo "== 2/8 Skill files =="
+echo "== 2/9 Skill files =="
 mkdir -p "$SKILL_DST"
 for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-inject.sh \
          coord-compact-brief.sh coord-creed.md drone-settings.json SKILL.md; do
@@ -76,7 +55,7 @@ chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-che
          "$SKILL_DST/coord-creed-inject.sh" "$SKILL_DST/coord-compact-brief.sh"
 ok "skill in $SKILL_DST"
 
-echo "== 3/8 hive in PATH =="
+echo "== 3/9 hive in PATH =="
 mkdir -p "$BIN_DST"
 ln -sf "$SKILL_DST/hive" "$BIN_DST/hive"
 ok "symlink $BIN_DST/hive"
@@ -85,7 +64,7 @@ case ":$PATH:" in
   *) warn "$BIN_DST is NOT in PATH — add to ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-echo "== 4/8 herdr ↔ Claude Code integration =="
+echo "== 4/9 herdr ↔ Claude Code integration =="
 # The SessionStart hook reports session_id and transcript to herdr — without it `hive revive` does not work.
 [ -f "$HOME/.claude/settings.json" ] && cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.bak-$STAMP"
 herdr integration install claude >/dev/null 2>&1 || die "herdr integration install claude failed"
@@ -93,7 +72,27 @@ grep -q '^claude: current' <<<"$(herdr integration status 2>/dev/null || true)" 
   && ok "claude integration active (settings.json backup: settings.json.bak-$STAMP)" \
   || die "claude integration does not report as active"
 
-echo "== 5/8 Coordinator hooks =="
+echo "== 5/9 herdr toasts =="
+# The alert for coord mail nobody is watching is a herdr notification, and herdr's default toast
+# delivery is "off". An unset delivery is switched on; an explicit choice, "off" included, stays.
+HERDR_CONFIG="$HOME/.config/herdr/config.toml"
+TOAST=$(python3 "$SRC/lib/herdr-toasts.py" "$HERDR_CONFIG" ".bak-$STAMP" 2>/dev/null) || TOAST="error python3 failed"
+case "$TOAST" in
+  enabled)
+    ok "herdr toasts on: [ui.toast] delivery = \"system\" (backup: config.toml.bak-$STAMP)"
+    if [ "$HERDR_REACHABLE" = 1 ]; then
+      herdr server reload-config >/dev/null 2>&1 && ok "running herdr server reloaded its config" \
+        || warn "could not reload the running herdr server — the setting applies from its next start"
+    fi ;;
+  kept\ *)
+    ok "herdr toasts: ${TOAST#kept } (set in $HERDR_CONFIG, kept)" ;;
+  off-by-choice)
+    warn "$HERDR_CONFIG turns herdr toasts off explicitly — kept, but the unwatched-mail alert will not show" ;;
+  *)
+    warn "could not turn herdr toasts on (${TOAST#error }) — set [ui.toast] delivery = \"system\" in $HERDR_CONFIG yourself" ;;
+esac
+
+echo "== 6/9 Coordinator hooks =="
 # Three hooks, all self-scoping to the registered coordinator session (drones and unrelated
 # sessions exit instantly), so they are safe to install into the user's global settings:
 #   Stop         - cannot end a turn while unread mail sits in mail/coord
@@ -140,7 +139,7 @@ HOOKPY
 ) || die "failed to update $SETTINGS (backup: $SETTINGS.bak-hook-$STAMP)"
 ok "coordinator hooks - $HOOK_RESULT (backup: settings.json.bak-hook-$STAMP)"
 
-echo "== 6/8 Reconciliation sweep timer =="
+echo "== 7/9 Reconciliation sweep timer =="
 # The wake-up path is event-driven and every event can be lost; `hive sweep` is the
 # level-triggered floor (retries lost wake-ups, reminds about overdue mail, surfaces
 # silent drones). A systemd user timer runs it every 5 minutes.
@@ -157,7 +156,7 @@ else
   warn "no systemd user session — schedule '$SKILL_DST/hive sweep' yourself (cron: */5 * * * *)"
 fi
 
-echo "== 7/8 CLAUDE.md entry =="
+echo "== 8/9 CLAUDE.md entry =="
 CMD_FILE="$HOME/.claude/CLAUDE.md"
 MARKER="## Hivemind — commanding a swarm of agents in herdr"
 MARKER_PL="## Hivemind — dowodzenie rojem agentów w herdr"   # pre-translation installs
@@ -173,7 +172,7 @@ else
   ok "Hivemind section appended to $CMD_FILE"
 fi
 
-echo "== 8/8 Verification =="
+echo "== 9/9 Verification =="
 bash -n "$SKILL_DST/hive"                || die "hive: syntax error"
 bash -n "$SKILL_DST/drone-ping.sh"       || die "drone-ping.sh: syntax error"
 bash -n "$SKILL_DST/coord-mail-check.sh"    || die "coord-mail-check.sh: syntax error"

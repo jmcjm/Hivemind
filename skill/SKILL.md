@@ -106,7 +106,8 @@ reliability net behind the happy path:
   It self-scopes by session id, so drones and unrelated sessions never see it.
 - **Unwatched-mail alert** — coord mail with no live watcher (no heartbeat in the last 30 s)
   triggers a herdr notification (rate-limited). It only shows with herdr toasts on
-  (`[ui.toast] delivery` in `~/.config/herdr/config.toml`; `install.sh` warns when it is off).
+  (`[ui.toast] delivery` in `~/.config/herdr/config.toml`; `install.sh` sets `"system"` when the
+  config leaves it unset, and keeps any explicit choice, `"off"` included).
 - **`hive coord` and `hive status`** report the backlog and whether the watcher is live.
 - **Reconciliation sweep** — a systemd user timer (installed by `install.sh`) runs `hive sweep`
   every 5 minutes: it raises the unwatched-mail alert, retries lost drone wake-ups and failed ssh

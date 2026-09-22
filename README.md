@@ -75,6 +75,7 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.herdr-hive/drones/<name>/` | `meta.json`, `brief.md`, `report.md` |
 | `~/.herdr-hive/mail/<recipient>/` | mailboxes (file = message) |
 | `~/.herdr-hive/.watch-coord`, `.watch-coord.pid` | the mail watcher's heartbeat and owner |
+| `~/.config/herdr/config.toml` | `[ui.toast] delivery = "system"` when unset (backup first; `lib/herdr-toasts.py`) — the unwatched-mail alert is a herdr toast |
 
 The global `~/.claude/settings.json` receives **only** the herdr integration hook. Swarm hooks
 ride on the drones' `--settings`, so the human's session is untouched.
@@ -172,7 +173,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 |---|---|---|
 | every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; stop the old server when no drone works, start `herdr` |
 | no `HIVE-MAIL` notifications | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
-| unwatched-mail alert never shows | herdr toasts off | `[ui.toast] delivery = "system"` in `~/.config/herdr/config.toml` |
+| unwatched-mail alert never shows | herdr toasts off — `install.sh` keeps an explicit `delivery = "off"` | `[ui.toast] delivery = "system"` in `~/.config/herdr/config.toml` |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | status `dead` | drone killed or crashed | `hive revive <drone>` — conversation history survives |

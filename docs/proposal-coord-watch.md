@@ -84,8 +84,9 @@ into the drone's prompt, because nobody else types there and a drone has no moni
 - `hive coord` prints the instruction to arm the watcher.
 - `SKILL.md` (swarm mail section), `README.md` (architecture, smoke test, diagnostics) and
   `CLAUDE-md-snippet.md` describe the watcher instead of the prompt injection.
-- `install.sh` warns when herdr toasts are off (`[ui.toast] delivery` defaults to `"off"`), because
-  the fallback notification is then invisible, and names the setting to change.
+- `install.sh` turns herdr toasts on (`[ui.toast] delivery = "system"`) when the config leaves them
+  unset — the default is `"off"`, which makes the fallback notification invisible. An explicit
+  choice, `"off"` included, is kept and only warned about.
 
 ### 3.5 Rejected
 
