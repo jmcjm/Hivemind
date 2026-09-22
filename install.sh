@@ -38,6 +38,23 @@ if grep -q '^status: running' <<<"$HERDR_SERVER_STATUS"; then
 else
   warn "herdr server not running — start it ('herdr') before the smoke test"
 fi
+# The fallback for coord mail nobody is watching is a herdr notification; with toasts off
+# (the herdr default) it never shows.
+TOAST=$(python3 - "$HOME/.config/herdr/config.toml" <<'PY' 2>/dev/null
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except FileNotFoundError:
+    cfg = {}
+print(((cfg.get("ui") or {}).get("toast") or {}).get("delivery", "off"))
+PY
+) || TOAST=unknown
+case "$TOAST" in
+  off)     warn "herdr toasts are off — the unwatched-mail alert will not show; set [ui.toast] delivery = \"system\" (or \"herdr\") in ~/.config/herdr/config.toml" ;;
+  unknown) warn "could not read the herdr toast setting — make sure [ui.toast] delivery is not \"off\"" ;;
+  *)       ok "herdr toasts: $TOAST" ;;
+esac
 
 echo "== 2/8 Skill files =="
 mkdir -p "$SKILL_DST"
@@ -139,7 +156,11 @@ CMD_FILE="$HOME/.claude/CLAUDE.md"
 MARKER="## Hivemind — commanding a swarm of agents in herdr"
 MARKER_PL="## Hivemind — dowodzenie rojem agentów w herdr"   # pre-translation installs
 if [ -f "$CMD_FILE" ] && { grep -qF "$MARKER" "$CMD_FILE" || grep -qF "$MARKER_PL" "$CMD_FILE"; }; then
-  ok "Hivemind section already present — skipping"
+  if grep -qF "hive watch" "$CMD_FILE"; then
+    ok "Hivemind section already present — skipping"
+  else
+    warn "the Hivemind section in $CMD_FILE predates the mail watcher — update it from CLAUDE-md-snippet.md (install.sh never rewrites it)"
+  fi
 else
   [ -f "$CMD_FILE" ] && cp "$CMD_FILE" "$CMD_FILE.bak-$STAMP"
   { [ -f "$CMD_FILE" ] && echo; cat "$SRC/CLAUDE-md-snippet.md"; } >> "$CMD_FILE"
