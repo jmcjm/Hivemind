@@ -3,10 +3,10 @@
 # global Claude Code settings by install.sh).
 #
 # Blocks ending a turn while unread swarm mail sits in the coordinator's mailbox, so the
-# coordinator answers waiting drones before going silent. Wake-up prompts injected by
-# `hive send` cover the happy path; this is the level-triggered backstop for every way a
-# wake-up gets lost: Esc on a queued prompt, a coordinator busy with a long inline task,
-# human text sitting in the prompt, mail read without `hive inbox`.
+# coordinator answers waiting drones before going silent. The mail watcher's notifications
+# (`hive watch` in a Monitor) cover the happy path; this is the level-triggered backstop for
+# every way they get missed: an expired or unarmed watcher, a coordinator busy with a long
+# inline task, mail read without `hive inbox`.
 #
 # Scoping: fires ONLY in the session whose pane is registered in coord.pane (herdr's
 # claude integration reports the session id per pane). Drones ($HIVE_DRONE) and unrelated

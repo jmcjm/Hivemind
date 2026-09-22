@@ -9,7 +9,7 @@ When the user says "run the hivemind", "manage the swarm", "delegate this to the
 The tool: `~/.claude/skills/hivemind/hive` (a wrapper around `herdr`, it is in PATH) — `spawn`, `task`, `say`, `clear`,
 `send`, `inbox`, `watch`, `coord`, `status`, `wait`, `report`, `peek`, `kill`, `rename`, `revive`.
 Swarm data: `~/.herdr-hive/` (`drones/<name>/`, `mail/<recipient>/`).
-**When taking over a swarm I run `hive coord` and arm `Monitor(command: "hive watch", timeout_ms: 1800000)`** —
+**When taking over a swarm I run `hive coord` and arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`** —
 the watcher is how I hear drones, and I re-arm it every time it expires.
 
 A session with `HIVE_DRONE` set (or `HERDR_HIVE_ROLE=drone`) is a **drone**, not a coordinator: it executes the brief,

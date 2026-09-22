@@ -191,12 +191,13 @@ cat <<EOF
 Installed. Smoke test (requires a running herdr server):
 
   hive coord
+  # in the coordinator's Claude Code session arm: Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)
   hive spawn testdrone
   hive task testdrone - <<'BRIEF'
   # Brief: testdrone
   Count the files in the home directory and report the number. Boundaries: read-only.
   BRIEF
-  # do not poll — wait until the drone sends HIVE-MAIL on its own, then:
+  # do not poll — wait for the watcher's HIVE-MAIL notification, then:
   hive inbox && hive report testdrone && hive kill testdrone --purge
 
 Full manual and traps: $SKILL_DST/SKILL.md

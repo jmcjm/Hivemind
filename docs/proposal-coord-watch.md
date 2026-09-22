@@ -1,6 +1,6 @@
 # Proposal: coordinator mail through a watched mailbox, not the prompt
 
-Status: **approved design, not implemented.** Replaces the coordinator's prompt wake-up.
+Status: **implemented.** Replaces the coordinator's prompt wake-up.
 
 ## 1. The problem
 
@@ -33,7 +33,8 @@ Constraints that shape the design:
 
 ### 3.1 `hive watch` — the event source
 
-A long-running loop the coordinator arms as `Monitor(command: "hive watch", timeout_ms: 1800000)`.
+A long-running loop the coordinator arms as
+`Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`.
 
 - Every second it lists `mail/coord/*.json` and prints one line per letter it has not seen yet:
   `HIVE-MAIL <from> [<kind>] <subject>`, truncated to ~120 characters. Bodies are never printed:

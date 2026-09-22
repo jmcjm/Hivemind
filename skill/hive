@@ -97,8 +97,8 @@ PY
 }
 
 # --- swarm mail -----------------------------------------------------------
-# Mailbox = a directory of message files. No daemon, no MTA: writes are atomic (mv),
-# and the recipient never polls the mailbox anyway — wake_recipient wakes them.
+# Mailbox = a directory of message files. No daemon, no MTA: writes are atomic (mv).
+# A drone is woken by wake_recipient; the coordinator hears its mail through the watcher above.
 
 coord_pane() { cat "$HIVE_DIR/coord.pane" 2>/dev/null; }
 
@@ -325,14 +325,15 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
     resume=0
   fi
 
-  # Coordinator pane = the one hive was called from. Saved because mail to 'coord' lands there.
+  # Coordinator pane = the one hive was called from. Saved because the coordinator hooks (Stop
+  # backstop, SessionStart board) find the coordinator session through it.
   # (herdr 0.8.2: --current resolves the CALLING pane, not the pane focused in another client)
   local coord; coord=$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
   # Spawning from a local pane makes THIS pane the coordinator — a stale remote marker
   # would silently divert the fleet's mail to another machine. Over ssh there is no
   # calling pane, so a remote coordinator's registration survives untouched.
-  # The wake-up marker aimed at the PREVIOUS coordinator pane dies with the takeover,
-  # otherwise it would gag the new pane's first wake-up until the TTL expired.
+  # The rm also clears a wake-up marker left by pre-watcher versions and resets the
+  # unwatched-mail alert's rate limit for the new coordinator.
   [ -n "$coord" ] && { echo "$coord" > "$HIVE_DIR/coord.pane"
                        rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"; }
 
@@ -597,8 +598,9 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
 }
 
 cmd_status() {  # status [name...] — never blocks
-  # Passive reconciliation surface: status gets run often, so unread mail that lost its
-  # wake-up (dead pane, human text in the prompt) resurfaces here instead of rotting.
+  # Passive reconciliation surface: status gets run often, so unread mail nobody acted on
+  # (no watcher armed, a notification missed) resurfaces here, with the watcher state,
+  # instead of rotting.
   local me="${HIVE_DRONE:-coord}" nmail
   nmail=$(find "$MAIL_DIR/$me" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
   [ "$nmail" -gt 0 ] && echo "mail ($me): $nmail unread letter(s) — run: hive inbox"
@@ -687,7 +689,7 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
   remote=$(coord_remote); lhost=$(hostname -s)
   for t in "${targets[@]}"; do
     # Remote coordinator (hive coord --remote): coord mail travels over ssh and lands in the
-    # coordinator machine's mailbox, waking their pane THERE. The sender arrives as
+    # coordinator machine's mailbox, where the watcher THERE reports it. The sender arrives as
     # '<name>@<this host>' so the coordinator knows which machine's fleet is talking.
     # When ssh fails, the letter stays in the local mailbox — undelivered but not lost;
     # the coordinator can still collect it with 'ssh <host> hive inbox'.
@@ -993,10 +995,11 @@ cmd_revive() {  # revive <name> — resurrects a drone with its conversation his
 }
 
 # --- reconciliation sweep -------------------------------------------------
-# The wake-up path is event-driven, and every event can be lost: a dead pane, Esc on a
-# queued prompt, a failed ssh forward, a hook that never fired because the drone crashed
-# mid-turn. The sweep is the level-triggered floor under all of it — run periodically
-# (systemd user timer, installed by install.sh), it retries lost wake-ups, reminds the
+# Mail delivery is event-driven, and every event can be lost: an expired or unarmed
+# coordinator watcher, a dead drone pane, Esc on a queued drone prompt, a failed ssh forward,
+# a hook that never fired because the drone crashed mid-turn. The sweep is the level-triggered
+# floor under all of it — run periodically (systemd user timer, installed by install.sh), it
+# pings the human about coord mail nobody watches, retries lost drone wake-ups, reminds the
 # human about overdue mail, and surfaces drones that went silent with a task in flight.
 # Every alert is rate-limited: a sweep that nags every five minutes trains everyone
 # to ignore it, and then it protects nothing.
@@ -1050,8 +1053,8 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
       wake_recipient coord
     fi
   fi
-  # Overdue reminder: mail nobody read for HIVE_MAIL_OVERDUE means the wake-ups are not
-  # landing — tell the human on the desktop, re-nag at most every HIVE_SWEEP_RENOTIFY.
+  # Overdue reminder: mail nobody read for HIVE_MAIL_OVERDUE means the coordinator is not
+  # hearing it — tell the human on the desktop, re-nag at most every HIVE_SWEEP_RENOTIFY.
   if [ ${#letters[@]} -gt 0 ]; then
     local oldest age mark="$HIVE_DIR/.overdue-notice" skip=0 mage
     oldest=$(stat -c %Y "${letters[0]}" 2>/dev/null || echo "$now")
@@ -1071,7 +1074,8 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
     fi
   fi
 
-  # 2. Drone mailboxes: retry lost drone-to-drone wake-ups (same safeguards as coord).
+  # 2. Drone mailboxes: retry lost drone wake-ups (wake_recipient's safeguards — drones only,
+  #    the coordinator has its watcher).
   local box name
   for box in "$MAIL_DIR"/*/; do
     [ -d "$box" ] || continue
@@ -1321,8 +1325,8 @@ case "${1:-}" in
   inbox)  shift; cmd_inbox  "$@" ;;
   watch)  shift; cmd_watch  "$@" ;;
   coord)  shift
-          # Either branch is a coordinator handover: wake-up state aimed at the previous
-          # coordinator dies with it, and the new one learns about backlog immediately —
+          # Either branch is a coordinator handover: it clears a wake-up marker left by
+          # pre-watcher versions, and the new coordinator learns about backlog immediately —
           # letters stranded by a dead predecessor surface here, not at the next send.
           if [ "${1:-}" = --remote ]; then
             [ -n "${2:-}" ] || die "usage: hive coord --remote <ssh-host>"
@@ -1364,7 +1368,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive task   <name> <file|->        send a brief (file or stdin) + report protocol
   hive say    <name> <text>          ad-hoc message to a drone
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
-  hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + recipient wake-up
+  hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + drone wake-up / watcher notice (coord)
   hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
   hive watch                         coordinator's mail watcher — arm it as a Monitor (one line per new letter)
   hive coord                         register the current pane as the coordinator pane

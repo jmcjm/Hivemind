@@ -36,7 +36,7 @@ After installation run the smoke test. It should pass **without a single manual 
 
 ```bash
 hive coord                      # -> coord: wN:pM
-# in the coordinator session arm: Monitor(command: "hive watch", timeout_ms: 1800000)
+# in the coordinator's Claude Code session arm: Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)
 hive spawn testdrone            # -> spawn: testdrone  ws=.. pane=.. model=opus
 hive task testdrone - <<'BRIEF'
 # Brief: testdrone
@@ -171,7 +171,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 | Symptom | Cause | Move |
 |---|---|---|
 | every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; stop the old server when no drone works, start `herdr` |
-| no `HIVE-MAIL` notifications | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", timeout_ms: 1800000)`, then `hive inbox` |
+| no `HIVE-MAIL` notifications | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
 | unwatched-mail alert never shows | herdr toasts off | `[ui.toast] delivery = "system"` in `~/.config/herdr/config.toml` |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
