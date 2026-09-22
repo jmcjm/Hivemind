@@ -36,6 +36,7 @@ After installation run the smoke test. It should pass **without a single manual 
 
 ```bash
 hive coord                      # -> coord: wN:pM
+# in the coordinator's Claude Code session arm: Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)
 hive spawn testdrone            # -> spawn: testdrone  ws=.. pane=.. model=opus
 hive task testdrone - <<'BRIEF'
 # Brief: testdrone
@@ -44,8 +45,8 @@ BRIEF
                                 # -> task: testdrone <- ... (attempt 1)   <= MUST say "attempt 1"
 ```
 
-Now **do not poll**. Within ~30 s the message `HIVE-MAIL: new mail. Run: hive inbox` should appear
-in the coordinator's prompt on its own. Then:
+Now **do not poll**. Within ~30 s the watcher should bring a notification
+`HIVE-MAIL testdrone [finished] finished a turn (report: DONE)` on its own — the prompt stays untouched. Then:
 
 ```bash
 hive inbox                      # -> a [finished] entry from drone "testdrone"
@@ -54,7 +55,7 @@ hive kill testdrone --purge      # or: hive prune, which sweeps every dead drone
 ```
 
 If `task` showed "attempt 2/3" — the drone was losing input, but the retry mechanism worked (OK).
-If `HIVE-MAIL` never arrived — see "Diagnostics" below.
+If no notification arrived — see "Diagnostics" below.
 
 ## What lands where
 
@@ -63,7 +64,7 @@ If `HIVE-MAIL` never arrived — see "Diagnostics" below.
 | `~/.claude/skills/hivemind/SKILL.md` | doctrine for the coordinator, loaded automatically |
 | `~/.claude/skills/hivemind/hive` | swarm CLI (a wrapper around `herdr`) |
 | `~/.claude/skills/hivemind/drone-ping.sh` | drone hook: reports end of turn / needed decision |
-| `~/.claude/skills/hivemind/coord-creed.md` | the eight coordinator rules — single source of truth |
+| `~/.claude/skills/hivemind/coord-creed.md` | the nine coordinator rules — single source of truth |
 | `~/.claude/skills/hivemind/coord-creed-inject.sh` | `SessionStart` hook: after a compaction, re-injects the creed + the live board |
 | `~/.claude/skills/hivemind/coord-compact-brief.sh` | `PreCompact` hook: tells the summarizer which coordination state must survive |
 | `~/.claude/skills/hivemind/coord-scope.sh` | shared scoping helper — the coordinator hooks fire in one session only |
@@ -73,6 +74,8 @@ If `HIVE-MAIL` never arrived — see "Diagnostics" below.
 | `~/.claude/hooks/herdr-agent-state.sh` | installed by `herdr integration install claude` |
 | `~/.herdr-hive/drones/<name>/` | `meta.json`, `brief.md`, `report.md` |
 | `~/.herdr-hive/mail/<recipient>/` | mailboxes (file = message) |
+| `~/.herdr-hive/.watch-coord`, `.watch-coord.pid` | the mail watcher's heartbeat and owner |
+| herdr config (`$HERDR_CONFIG_PATH`, default `~/.config/herdr/config.toml`) | `[ui.toast] delivery = "system"` when unset (backup first; `lib/herdr-toasts.py`) — the unwatched-mail alert is a herdr toast |
 
 The global `~/.claude/settings.json` receives **only** the herdr integration hook. Swarm hooks
 ride on the drones' `--settings`, so the human's session is untouched.
@@ -86,14 +89,16 @@ the drone's name, so the human sees the swarm in the sidebar and can take over a
 The TUI is read (`hive peek`) strictly for diagnosis.
 
 **Drones call the coordinator, not the other way around.** The `Stop` and `Notification` hooks mail
-the `coord` mailbox and inject a `HIVE-MAIL` wake-up straight into the coordinator's prompt. The
-coordinator yields the turn and comes back only when there is a reason to — zero polling.
+the `coord` mailbox. The coordinator keeps `hive watch` armed as a Claude Code `Monitor`, which turns
+every new letter into a one-line `HIVE-MAIL` notification in its session. Nothing is typed into the
+coordinator's prompt, so the human can keep talking to it while drones report in — and zero polling
+on the coordinator's side.
 
 **Mail is a directory of files**, no daemon and no MTA. Atomic writes (`mktemp` + `mv`).
 Recipients: `coord`, a drone name, `all`. Drones talk to each other over the same channel.
 
 **The fleet can span machines.** `hive coord --remote <ssh-host>` on a drone machine forwards its
-coord mail over ssh to the coordinator's machine, waking the coordinator's pane there — the
+coord mail over ssh to the coordinator's machine, where the coordinator's watcher reports it — the
 event-driven flow survives across hosts. The coordinator drives the remote fleet with plain
 `ssh <host> hive spawn/task/report ...`; senders arrive tagged `<drone>@<host>`. Requirements on
 the drone machine: hivemind installed, a headless herdr server (`herdr server`), non-interactive ssh.
@@ -115,14 +120,20 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
    prompt` without `--wait` does not confirm receipt. `hive task` confirms delivery (the status must
    jump to `working`) and retries up to 3 times.
 6. **The prompt is shared with the human.** Sending Enter would send the text the human is typing
-   right now. `hive task`/`say`/`wake_recipient` check for this and refuse.
+   right now. `hive task`/`say` and drone wake-ups check for this and refuse — and the coordinator's prompt is never typed into at all (point 10).
 7. **But ghost text is not human text.** Claude Code suggests ready-made prompts as dimmed text
    (SGR `2`). A naive detector takes them for input and **blocks every idle drone**.
    `prompt_pending` reads `--format ansi` and counts only characters outside dim fragments.
 8. **The swarm protocol sits in `--append-system-prompt`, not in the brief.** When it lived in the
    brief, drones improvised and used `hive say` instead of `hive send`, bypassing the mailbox and the safeguards.
-9. **One wake-up per batch** (the `.wake-<who>` marker) + `flock`. Without it, five drones finishing
+9. **One drone wake-up per batch** (the `.wake-<who>` marker) + `flock`. Without it, five drones finishing
    at once all type into one prompt simultaneously and the result is mush.
+10. **The coordinator hears mail through a Monitor, not its prompt.** Typing `HIVE-MAIL` into the
+    coordinator's prompt fought the human for it: while drones reported in, the human could not talk
+    to the coordinator. `hive watch` prints a pointer line per letter (never the body, to save context)
+    and consumes nothing — `hive inbox` still reads and archives, so a lost notification never loses a
+    letter. Monitors expire after 30 minutes, so re-arming is part of the coordinator's creed, and the
+    Stop hook plus the unwatched-mail alert catch a coordinator that forgot.
 
 ## herdr 0.8.x / 0.9.x technicalities
 
@@ -161,8 +172,8 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 | Symptom | Cause | Move |
 |---|---|---|
 | every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; stop the old server when no drone works, start `herdr` |
-| `HIVE-MAIL` never arrives | `coord.pane` points at a previous session's panel | `hive coord`, then `hive inbox` |
-| `HIVE-MAIL` never arrives, coord OK | human has text in the prompt — wake-up withheld | the letter waits in the mailbox: `hive inbox` |
+| no `HIVE-MAIL` notifications | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
+| unwatched-mail alert never shows | herdr toasts off — `install.sh` keeps an explicit `delivery = "off"` and warns when it cannot place the setting; toasts also need an attached herdr window | `[ui.toast] delivery = "system"` in `~/.config/herdr/config.toml` |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | status `dead` | drone killed or crashed | `hive revive <drone>` — conversation history survives |
@@ -177,3 +188,4 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 - Swarm directory: `HIVE_DIR=/other/path` (consistently for all invocations).
 - Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
   `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.
+- Tests: `tests/run.sh` — hermetic tests of the coordinator mail path against a fake herdr.

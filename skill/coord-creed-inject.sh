@@ -131,6 +131,14 @@ if [ "${letters:-0}" -gt 0 ]; then
 else
   echo "Unread coordinator mail: none."
 fi
+# A live heartbeat is information, not permission: it proves some watcher runs, not that this
+# rebuilt session still has its monitor.
+arm='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
+if "$SKILL_DIR/hive" _watched 2>/dev/null; then
+  echo "Mail watcher: a watcher is live — if this session has no hive watch monitor, arm one: $arm."
+else
+  echo "Mail watcher: NOT ARMED — you hear no drone until you arm it: $arm."
+fi
 if [ "${n_inflight:-0}" -gt 0 ]; then
   echo "Drones with a task in flight (brief, no report): $n_inflight"
   printf '%s' "$lines"

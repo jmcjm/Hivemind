@@ -19,8 +19,9 @@ hive spawn  <name> [--cwd PATH]    new drone (opus, --dangerously-skip-permissio
 hive task   <name> <file|->        brief from file/stdin + appended reporting protocol
 hive say    <name> <text>          ad-hoc message
 hive clear  <name>                 clear the drone's input field
-hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + recipient wake-up
+hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + drone wake-up / watcher notice (coord)
 hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
+hive watch                         the mail watcher — arm it as a Monitor; one line per new letter
 hive coord                         register the current pane as the coordinator pane
 hive coord --remote <ssh-host>     the coordinator lives on another machine — forward coord mail over ssh
 hive status [names]                swarm state table — NEVER blocks
@@ -59,10 +60,22 @@ means only "not generating tokens right now" — a drone idling on a dialog is `
 
 **Do not poll the swarm in a loop.** Drones report in on their own. Each has `Stop` and
 `Notification` hooks (`drone-settings.json` → `drone-ping.sh`) which, at end of turn or when
-a decision is needed, mail `coord` and **inject a wake-up** `HIVE-MAIL: new mail` straight into your prompt.
+a decision is needed, mail `coord`.
 
-When you get `HIVE-MAIL` — triage in this order, always to the end:
-1. `hive inbox` — the whole mailbox, one wake-up covers several letters.
+You hear that mail through **the mail watcher**. Right after `hive coord`, arm it:
+
+```
+Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)
+```
+
+Every new letter becomes one notification: `HIVE-MAIL <from> [<kind>] <subject>` — a pointer, never
+the body. **Nothing is ever typed into your prompt**: it belongs to the user, who keeps talking to you
+while drones report in. A monitor lives at most 30 minutes; when its expiry notice arrives, re-arm it
+at once. The last armed watcher wins — a second arm, or a new coordinator session, retires the old one
+(`HIVE-WATCH: taken over`).
+
+When a `HIVE-MAIL` notification arrives — triage in this order, always to the end:
+1. `hive inbox` — the whole mailbox; one notification can cover several letters.
 2. **Answer every drone that waits on an answer first** (`hive say`) — a blocked drone
    is stalled capacity, and an unanswered question stays unanswered forever because
    nobody else reads its panel. Only then handle the rest of the mail.
@@ -77,30 +90,31 @@ The mailbox is a directory of message files (`~/.herdr-hive/mail/<recipient>/`),
 Recipients: `coord` (you), a drone name, `all` (broadcast). Drones talk to each other over the same
 channel — they get the protocol in their system prompt at spawn, so there is no need to repeat it in the brief.
 
-Four wake-up safeguards, all in `wake_recipient`:
-- **empty prompt** — inject only when the recipient's prompt is empty, otherwise Enter would send someone else's text
-- **flock** — two drones never type into one prompt at the same time
+Drones have no watcher, so mail to a drone still wakes it with a `HIVE-MAIL: new mail` prompt.
+Four safeguards guard that, all in `wake_recipient`:
+- **empty prompt** — inject only when the drone's prompt is empty, otherwise Enter would send someone else's text
+- **flock** — two senders never type into one prompt at the same time
 - **`.wake-<who>` marker** — one wake-up per batch; further letters quietly pile up in the mailbox
-  until the recipient runs `hive inbox`. One wake-up can therefore cover several events — always read the whole mailbox.
-- **marker TTL** (`HIVE_WAKE_TTL`, default 900 s) — a delivered wake-up is not a handled one
-  (Esc on a queued prompt, a restarted session). A marker older than the TTL counts as a lost
-  wake-up and the next letter retries it, so one lost prompt cannot silence the mailbox forever.
+  until the drone runs `hive inbox`
+- **marker TTL** (`HIVE_WAKE_TTL`, default 900 s) — a marker older than the TTL counts as a lost
+  wake-up and the next letter retries it
 
-A wake-up can still miss (coordinator pane dead, human text sitting in the prompt, a dialog).
-The reliability net behind the happy path:
+The watcher can be gone — the monitor expired and was not re-armed, the session restarted. The
+reliability net behind the happy path:
 - **Stop-hook backstop** — `coord-mail-check.sh` (installed globally by `install.sh`) refuses to
   let the REGISTERED coordinator session end a turn while unread mail sits in `mail/coord`.
   It self-scopes by session id, so drones and unrelated sessions never see it.
-- **Stranded-mail alert** — coord mail with no live coordinator pane triggers a desktop
-  notification (rate-limited), because that is the one failure the swarm cannot heal itself.
-- **`hive coord` reports backlog** — taking over a swarm surfaces letters stranded by a dead
-  predecessor immediately; `hive status` prints an unread-mail line for the same reason.
+- **Unwatched-mail alert** — coord mail with no live watcher (no heartbeat in the last 30 s)
+  triggers a herdr notification (rate-limited). It only shows with herdr toasts on
+  (`[ui.toast] delivery` in the herdr config, by default `~/.config/herdr/config.toml`; `install.sh` sets `"system"` when the
+  config leaves it unset, and keeps any explicit choice, `"off"` included).
+- **`hive coord` and `hive status`** report the backlog and whether the watcher is live.
 - **Reconciliation sweep** — a systemd user timer (installed by `install.sh`) runs `hive sweep`
-  every 5 minutes: it retries lost wake-ups (including failed ssh forwards to a remote
-  coordinator), raises a desktop reminder when coord mail sits unread past `HIVE_MAIL_OVERDUE`
-  (default 30 min), and mails coord about drones silent with a task in flight — dead, blocked,
-  idle without a report, or working past `HIVE_WORKING_WARN` (default 60 min). Alerts re-fire
-  at most every `HIVE_SWEEP_RENOTIFY` (default 30 min); `hive kill` marks the drone concluded
+  every 5 minutes: it raises the unwatched-mail alert, retries lost drone wake-ups and failed ssh
+  forwards to a remote coordinator, raises a desktop reminder when coord mail sits unread past
+  `HIVE_MAIL_OVERDUE` (default 30 min), and mails coord about drones silent with a task in flight —
+  dead, blocked, idle without a report, or working past `HIVE_WORKING_WARN` (default 60 min). Alerts
+  re-fire at most every `HIVE_SWEEP_RENOTIFY` (default 30 min); `hive kill` marks the drone concluded
   so its corpse stops alarming, and a new spawn/task resets the verdicts.
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
@@ -129,7 +143,7 @@ EOF
 
 How the mail flows back: `hive coord --remote <host>` drops a `coord.remote` marker on the drone
 machine. Drone hooks fire `hive send coord` as usual; with the marker present the letter travels
-over ssh into the coordinator machine's mailbox and wakes the coordinator's pane **there** —
+over ssh into the coordinator machine's mailbox, where the watcher **there** reports it —
 the event-driven doctrine survives across machines, no polling. The sender arrives as
 `<drone>@<host>`, so you know which fleet is talking; read its report with `ssh <host> hive report <drone>`.
 If the forward fails (link down), the letter stays in the drone machine's mailbox — collect it
@@ -175,8 +189,8 @@ self-scoped to the registered coordinator session:
 
 | File | Hook | What it does |
 |---|---|---|
-| `coord-creed.md` | — | the eight rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
-| `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, drones with a task in flight and their live pane state, how crowded the swarm directory is |
+| `coord-creed.md` | — | the nine rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
+| `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, whether the mail watcher is live, drones with a task in flight and their live pane state, how crowded the swarm directory is |
 | `coord-compact-brief.sh` | `PreCompact` | tells the summarizer what must survive — who is spawned and what they were told, unanswered drone questions, decisions pending for the user |
 
 Two different things are lost at compaction, the **rules** and the **state**, and restoring only the
@@ -194,8 +208,8 @@ goes to the user's terminal, never into the context.
    a drone can die or get stuck, and then you hang with it and the user loses the coordinator.
    `hive wait` has a hard timeout and also ends on `blocked`/`dead`.
 2. **The coordinator coordinates — it does not do the drones' work.** Not a purity rule but an
-   availability one: wake-ups queued while you grind through a long inline task wait until YOUR
-   turn ends, so every minute of inline work is a minute of drones starving for answers. Anything
+   availability one: drone mail that arrives while you grind through a long inline task waits until
+   YOUR turn ends, so every minute of inline work is a minute of drones starving for answers. Anything
    beyond a quick read, a one-liner, or coordination itself goes to a drone; if no drone fits,
    spawn one instead of absorbing the task.
 3. **Drones run with `--dangerously-skip-permissions`.** Without it they hang on the first
@@ -228,16 +242,16 @@ The brief is a contract. The drone knows nothing of your conversation with the u
 
 ## Typical flow
 
-**At session start run `hive coord`.** It registers your pane as the `coord` address so drone mail
-reaches you instead of the previous session's panel. `hive spawn` does it as a side effect,
-but when you take over a swarm from a previous session (drones alive, nothing to spawn) — do it manually,
-otherwise wake-ups go to a dead panel and letters silently wait in the mailbox.
-`hive coord` also prints the backlog stranded by a dead predecessor — when it reports unread
-letters, `hive inbox` is your first move of the shift.
+**At session start run `hive coord`, then arm the mail watcher.** `hive coord` registers your pane
+as the `coord` address (the Stop-hook backstop scopes itself by it); `hive spawn` does it as a side
+effect. The watcher (`Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`)
+is how drone mail reaches you at all. `hive coord` also prints the backlog stranded by a dead
+predecessor — when it reports unread letters, `hive inbox` is your first move of the shift.
 
 ```bash
 H=~/.claude/skills/hivemind/hive
 $H coord                      # I am the coordinator of this shift
+# arm: Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)
 $H spawn kafka --cwd ~/repos/service-a
 $H spawn sql   --cwd ~/repos/service-b
 
@@ -247,7 +261,7 @@ Analyze the configuration in this repo against the rules in <path to the rules d
 Boundaries: read-only analysis. Zero file changes, zero deploys.
 EOF
 
-# Do not hover over them — they come back on their own with HIVE-MAIL. When it arrives:
+# Do not hover over them — the watcher brings HIVE-MAIL notifications. When one arrives:
 $H inbox
 $H report kafka; $H report sql
 $H kill kafka; $H kill sql
@@ -304,6 +318,8 @@ switches it to `--dangerously-skip-permissions`, so the boundaries must be hard 
 | trust dialog on a new `--cwd` | folder untrusted in `~/.claude.json` | `hive spawn` pre-seeds trust in the config so it never shows; if it slips through, `hive unblock` answers it (its default button is "No, exit" — never blind-Enter it) |
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
 | swarm stands still, no mail at all | drone hook failed, or drone hung/died mid-turn | the sweep mails coord within ~5 min (`SWEEP: ...`); impatient? `hive sweep` by hand, then `hive peek` |
+| no `HIVE-MAIL` notifications at all | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
+| `HIVE-WATCH: taken over by another watcher` | armed twice, or another session took the watch | nothing to do if that was you; otherwise `hive coord` + re-arm in the session that should coordinate |
 
 ## Corpses and cleanup
 
