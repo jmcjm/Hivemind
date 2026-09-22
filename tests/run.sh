@@ -125,6 +125,83 @@ t_watch_refused_for_drone() {
   [ -f "$HIVE_DIR/.watch-coord.pid" ] && fail "drone attempt wrote the owner file"
 }
 
+# --- delivery to coord -------------------------------------------------------
+
+t_send_watched_touches_nothing() {
+  start_watch "$T/out"
+  send_coord kafka done "finished"
+  assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+  [ "$(letters)" = 1 ] || fail "expected 1 letter, found $(letters)"
+}
+
+t_send_unwatched_notifies_once_never_prompts() {
+  send_coord kafka done "first"
+  send_coord sql decision "second"
+  assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_contains "$FAKE_HERDR_LOG" "arm Monitor(hive watch)"
+  [ "$(letters)" = 2 ] || fail "expected 2 letters, found $(letters)"
+}
+
+t_send_unwatched_herdr_down() {
+  export FAKE_HERDR_DOWN=1
+  send_coord kafka done "finished" || fail "send exited non-zero"
+  [ "$(letters)" = 1 ] || fail "letter not delivered"
+}
+
+t_drone_wakeup_unchanged() {
+  mkdir -p "$HIVE_DIR/drones/kafka"
+  echo '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1"}' > "$HIVE_DIR/drones/kafka/meta.json"
+  "$HIVE" send kafka "hello" --body "x" >/dev/null
+  assert_contains "$FAKE_HERDR_LOG" "agent prompt w2:p1 HIVE-MAIL: new mail. Run: hive inbox"
+}
+
+t_adopted_drone_not_woken() {
+  mkdir -p "$HIVE_DIR/drones/kafka"
+  echo '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1","adopted":true}' > "$HIVE_DIR/drones/kafka/meta.json"
+  "$HIVE" send kafka "hello" --body "x" >/dev/null
+  assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+}
+
+t_sweep_notifies_when_unwatched() {
+  send_coord kafka done "finished"
+  rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
+  touch -d '-2 minutes' "$HIVE_DIR/.watch-coord"
+  "$HIVE" sweep >/dev/null
+  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+}
+
+t_sweep_quiet_when_watched() {
+  send_coord kafka done "finished"
+  rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
+  touch "$HIVE_DIR/.watch-coord"
+  "$HIVE" sweep >/dev/null
+  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+  assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+}
+
+t_status_shows_watcher() {
+  "$HIVE" status > "$T/off"
+  assert_contains "$T/off" "watch: NOT ARMED"
+  start_watch "$T/out"
+  "$HIVE" status > "$T/on"
+  assert_contains "$T/on" "watch: live"
+}
+
+t_status_quiet_for_remote_coord() {
+  echo "coordhost" > "$HIVE_DIR/coord.remote"
+  "$HIVE" status > "$T/out"
+  assert_not_contains "$T/out" "watch:"
+}
+
+t_coord_prints_arm_instruction() {
+  "$HIVE" coord > "$T/out"
+  assert_contains "$T/out" 'Monitor(command: "hive watch", timeout_ms: 1800000)'
+  [ "$(cat "$HIVE_DIR/coord.pane")" = "w1:p1" ] || fail "coord.pane not registered"
+}
+
 # --- main --------------------------------------------------------------------
 
 ORIG_PATH="$PATH"
