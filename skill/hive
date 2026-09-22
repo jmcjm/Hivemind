@@ -65,17 +65,23 @@ print(last)
 # The coordinator's prompt belongs to the human too, so coord mail is never typed into it. The
 # coordinator keeps 'hive watch' armed as a Claude Code Monitor instead: every stdout line becomes
 # a notification in its session, and the prompt stays free for the human.
+# Globals, not locals: cmd_watch's EXIT trap reads them after the function has returned.
+WATCH_BEAT="$HIVE_DIR/.watch-coord"        # heartbeat, touched every ~10 s by the live watcher
+WATCH_OWNER="$HIVE_DIR/.watch-coord.pid"   # PID of the watcher armed last
+# The copy-paste arm instruction. The Monitor tool refuses a call without a description.
+WATCH_ARM='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
 
 # Is a watcher listening? 'hive watch' touches its heartbeat every ~10 s, so 30 s of silence means
-# its monitor expired or its session is gone.
+# its monitor expired or its session is gone. A fresh heartbeat proves that SOME watcher lives, not
+# that the session asking has one.
 coord_watched() {
-  local beat="$HIVE_DIR/.watch-coord"
-  [ -f "$beat" ] || return 1
-  [ $(( $(date +%s) - $(stat -c %Y "$beat" 2>/dev/null || echo 0) )) -lt 30 ]
+  [ -f "$WATCH_BEAT" ] || return 1
+  [ $(( $(date +%s) - $(stat -c %Y "$WATCH_BEAT" 2>/dev/null || echo 0) )) -lt 30 ]
 }
 
-# One event line for a coord letter: sender, kind, subject — never the body. Control characters
-# are flattened, because every stdout line of the watcher is a separate notification.
+# Computes the event line for a coord letter: sender, kind, subject — never the body. Control
+# characters are flattened, because every stdout line of the watcher is a separate notification.
+# The caller prints the line, so that a failed write can stop the watcher.
 watch_line() {
   python3 - "$1" <<'PY' 2>/dev/null
 import json,os,re,sys
@@ -549,32 +555,44 @@ Not sending — Enter would send THAT. Sort the prompt out (hive clear $name) an
 cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, one line per new letter
   # A drone running this would take the watch over and leave the coordinator deaf.
   [ -n "${HIVE_DRONE:-}" ] && die "watch is the coordinator's mail watcher — drones read their mail with hive inbox"
-  local box="$MAIL_DIR/coord" beat="$HIVE_DIR/.watch-coord" pidf="$HIVE_DIR/.watch-coord.pid"
+  local box="$MAIL_DIR/coord"
   mkdir -p "$box"
   # Last armed wins: a second arm, or a new coordinator session taking over, retires this watcher.
-  echo "$$" > "$pidf"
-  touch "$beat"
+  echo "$$" > "$WATCH_OWNER"
+  touch "$WATCH_BEAT"
+  # The heartbeat dies with its owner, and only with its owner: after a takeover it belongs to the
+  # new watcher. bash runs the EXIT trap on fatal signals too, so a watcher killed by SIGPIPE
+  # (reader gone) cleans up as well; a Monitor stop (TaskStop, expiry) is a plain exit 0.
+  trap '[ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_BEAT"' EXIT
+  trap 'exit 0' TERM INT HUP
   local -A seen=()
-  local f n=0 last_beat=$SECONDS
+  local f line n=0 last_beat=$SECONDS
   for f in "$box"/*.json; do
     [ -e "$f" ] || continue
     seen[$f]=1; n=$((n+1))
   done
-  [ "$n" -gt 0 ] && echo "HIVE-MAIL backlog: $n unread — run hive inbox"
+  # Every line is written from here and every write is checked: a watcher nobody reads any more
+  # must stop, not keep a fresh heartbeat while its lines go nowhere.
+  if [ "$n" -gt 0 ]; then printf '%s\n' "HIVE-MAIL backlog: $n unread — run hive inbox" || exit 0; fi
   while :; do
     sleep 1
-    [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] \
+    # Orphaned: the process that started us (the Monitor's session) is gone. $PPID is fixed at
+    # start, so this holds even after the orphan was reparented.
+    kill -0 "$PPID" 2>/dev/null || exit 0
+    [ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] \
       || { echo "HIVE-WATCH: taken over by another watcher — stopping"; return 0; }
     local -A now=()
     for f in "$box"/*.json; do
       [ -e "$f" ] || continue
       now[$f]=1
-      [ -n "${seen[$f]:-}" ] || watch_line "$f"
+      [ -n "${seen[$f]:-}" ] && continue
+      line=$(watch_line "$f"); [ -z "$line" ] || printf '%s\n' "$line" || exit 0
     done
     # Forget letters 'hive inbox' archived, so the set never grows with the watcher's lifetime.
+    # The guarded expansion keeps an empty mailbox legal under set -u on bash < 4.4.
     seen=()
-    for f in "${!now[@]}"; do seen[$f]=1; done
-    if [ $((SECONDS - last_beat)) -ge 10 ]; then touch "$beat"; last_beat=$SECONDS; fi
+    for f in ${now[@]+"${!now[@]}"}; do seen[$f]=1; done
+    if [ $((SECONDS - last_beat)) -ge 10 ]; then touch "$WATCH_BEAT"; last_beat=$SECONDS; fi
   done
 }
 
@@ -585,8 +603,8 @@ cmd_status() {  # status [name...] — never blocks
   nmail=$(find "$MAIL_DIR/$me" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
   [ "$nmail" -gt 0 ] && echo "mail ($me): $nmail unread letter(s) — run: hive inbox"
   if [ "$me" = coord ] && [ -z "$(coord_remote)" ]; then
-    if coord_watched; then echo "watch: live"
-    else echo 'watch: NOT ARMED — arm Monitor(command: "hive watch", timeout_ms: 1800000)'; fi
+    if coord_watched; then echo "watch: a watcher is live — if this session has no hive watch monitor, arm one: $WATCH_ARM"
+    else echo "watch: NOT ARMED — arm $WATCH_ARM"; fi
   fi
   local names=()
   if [ $# -gt 0 ]; then names=("$@"); else
@@ -1315,8 +1333,9 @@ case "${1:-}" in
             rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"
             herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
             echo "coord: $(coord_pane)"
-            if coord_watched; then echo "coord: mail watcher live"
-            else echo 'coord: arm the mail watcher — Monitor(command: "hive watch", timeout_ms: 1800000); re-arm it every time it expires'; fi
+            # Always, even with a fresh heartbeat: that proves some watcher lives, not that this
+            # session has one — and re-arming is harmless, the last armed watcher wins.
+            echo "coord: arm the mail watcher — $WATCH_ARM; re-arm it every time it expires"
           fi
           backlog=$(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
           if [ "$backlog" -gt 0 ]; then

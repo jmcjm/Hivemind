@@ -41,7 +41,12 @@ fi
 # The fallback for coord mail nobody is watching is a herdr notification; with toasts off
 # (the herdr default) it never shows.
 TOAST=$(python3 - "$HOME/.config/herdr/config.toml" <<'PY' 2>/dev/null
-import sys, tomllib
+import sys
+try:
+    import tomllib                      # Python 3.11+
+except ImportError:
+    print("old-python")
+    sys.exit(0)
 try:
     with open(sys.argv[1], "rb") as f:
         cfg = tomllib.load(f)
@@ -51,9 +56,10 @@ print(((cfg.get("ui") or {}).get("toast") or {}).get("delivery", "off"))
 PY
 ) || TOAST=unknown
 case "$TOAST" in
-  off)     warn "herdr toasts are off — the unwatched-mail alert will not show; set [ui.toast] delivery = \"system\" (or \"herdr\") in ~/.config/herdr/config.toml" ;;
-  unknown) warn "could not read the herdr toast setting — make sure [ui.toast] delivery is not \"off\"" ;;
-  *)       ok "herdr toasts: $TOAST" ;;
+  off)        warn "herdr toasts are off — the unwatched-mail alert will not show; set [ui.toast] delivery = \"system\" (or \"herdr\") in ~/.config/herdr/config.toml" ;;
+  old-python) warn "python3 < 3.11 cannot read TOML — check [ui.toast] delivery in ~/.config/herdr/config.toml yourself" ;;
+  unknown)    warn "could not read the herdr toast setting — make sure [ui.toast] delivery is not \"off\"" ;;
+  *)          ok "herdr toasts: $TOAST" ;;
 esac
 
 echo "== 2/8 Skill files =="

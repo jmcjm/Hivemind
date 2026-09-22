@@ -22,5 +22,6 @@ The nine rules that must survive a compacted context. This file is the single so
 8. **Boundaries go into the brief.** Drones run with bypass permissions and will ask about nothing,
    so what they must not touch has to be written down before they start.
 9. **Keep the mail watcher armed.** After `hive coord`, arm
-   `Monitor(command: "hive watch", timeout_ms: 1800000)`, and re-arm it the moment its expiry notice
-   arrives. Nothing is typed into your prompt any more — without the watcher you hear no drone.
+   `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, and re-arm it
+   the moment its expiry notice arrives. Nothing is typed into your prompt any more — without the
+   watcher you hear no drone.
