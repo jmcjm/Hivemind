@@ -251,6 +251,116 @@ t_coord_prints_arm_instruction() {
   assert_contains "$T/live" "coord: arm the mail watcher — $ARM"
 }
 
+# --- Claude Code accounts ----------------------------------------------------
+# hive runs against a throwaway HOME: account dirs (~/.claude-<name>) and ~/.claude.json live there.
+
+hive_home() { HOME="$T/home" "$HIVE" "$@"; }
+
+make_account() {  # make_account <name> [--no-onboarding] — a logged-in account under the test HOME
+  local d="$T/home/.claude-$1"
+  mkdir -p "$d"
+  touch "$d/.credentials.json"
+  if [ "${2:-}" = --no-onboarding ]; then echo '{}' > "$d/.claude.json"
+  else echo '{"hasCompletedOnboarding": true}' > "$d/.claude.json"; fi
+}
+
+drone_meta_field() {  # drone_meta_field <drone> <key> — empty when the key is absent
+  python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or '')" \
+    "$HIVE_DIR/drones/$1/meta.json" "$2" 2>/dev/null
+}
+
+trusted() {  # trusted <config.json> <dir> — True when the dir is pre-trusted in that config
+  python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('projects',{}).get(sys.argv[2],{}).get('hasTrustDialogAccepted'))" \
+    "$1" "$2" 2>/dev/null
+}
+
+t_spawn_default_account_sets_no_config_dir() {
+  mkdir -p "$T/home/work"
+  # The caller's CLAUDE_CONFIG_DIR (a coordinator on another account) must not leak into the drone.
+  CLAUDE_CONFIG_DIR="$T/elsewhere" hive_home spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 \
+    || fail "spawn failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "workspace create --label kafka"
+  assert_not_contains "$FAKE_HERDR_LOG" "CLAUDE_CONFIG_DIR"
+  assert_contains "$T/out" "account=default"
+  [ -z "$(drone_meta_field kafka account)" ] || fail "meta account: $(drone_meta_field kafka account)"
+  [ "$(trusted "$T/home/.claude.json" "$T/home/work")" = True ] || fail "cwd not trusted in ~/.claude.json"
+  [ ! -e "$T/elsewhere" ] || fail "the caller's CLAUDE_CONFIG_DIR was written to"
+}
+
+t_spawn_named_account() {
+  mkdir -p "$T/home/work"; make_account alt
+  hive_home spawn kafka --cwd "$T/home/work" --account alt > "$T/out" 2>&1 \
+    || fail "spawn failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CONFIG_DIR=$T/home/.claude-alt"
+  assert_contains "$T/out" "account=alt"
+  [ "$(drone_meta_field kafka account)" = alt ] || fail "meta account: $(drone_meta_field kafka account)"
+  [ "$(trusted "$T/home/.claude-alt/.claude.json" "$T/home/work")" = True ] || fail "cwd not trusted in the account's config"
+  [ ! -e "$T/home/.claude.json" ] || fail "the default account's config was written to"
+}
+
+t_spawn_hive_account_is_the_default() {
+  mkdir -p "$T/home/work"; make_account alt
+  HIVE_ACCOUNT=alt hive_home spawn kafka --cwd "$T/home/work" >/dev/null 2>&1 || fail "spawn kafka failed"
+  HIVE_ACCOUNT=alt hive_home spawn sql --cwd "$T/home/work" --account "" >/dev/null 2>&1 || fail "spawn sql failed"
+  [ "$(drone_meta_field kafka account)" = alt ] || fail "HIVE_ACCOUNT ignored"
+  [ -z "$(drone_meta_field sql account)" ] || fail "--account \"\" did not override HIVE_ACCOUNT"
+}
+
+t_spawn_refuses_unready_account() {
+  mkdir -p "$T/home/work" "$T/home/.claude-nologin"; make_account fresh --no-onboarding
+  hive_home spawn kafka --cwd "$T/home/work" --account nologin > "$T/a" 2>&1 && fail "spawned on a logged-out account"
+  hive_home spawn kafka --cwd "$T/home/work" --account fresh > "$T/b" 2>&1 && fail "spawned on an account without onboarding"
+  hive_home spawn kafka --cwd "$T/home/work" --account missing > "$T/c" 2>&1 && fail "spawned on a missing account"
+  assert_contains "$T/a" "is not logged in"
+  assert_contains "$T/b" "never finished onboarding"
+  assert_contains "$T/c" "no config dir"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace create"
+  [ ! -e "$HIVE_DIR/drones/kafka" ] || fail "a drone directory was created"
+}
+
+t_revive_keeps_account() {
+  mkdir -p "$T/home/work" "$HIVE_DIR/drones/kafka"; make_account alt; make_account other
+  printf '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1","session_id":"s-1","cwd":"%s","account":"alt"}\n' \
+    "$T/home/work" > "$HIVE_DIR/drones/kafka/meta.json"
+  # HIVE_ACCOUNT picks the account of NEW drones; a revived one stays where its session lives.
+  HIVE_ACCOUNT=other hive_home revive kafka > "$T/out" 2>&1 || fail "revive failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "workspace close w2"
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CONFIG_DIR=$T/home/.claude-alt"
+  assert_contains "$FAKE_HERDR_LOG" "--resume s-1"
+  [ "$(drone_meta_field kafka account)" = alt ] || fail "meta account: $(drone_meta_field kafka account)"
+}
+
+t_revive_move_needs_visible_session() {
+  mkdir -p "$T/home/work" "$HIVE_DIR/drones/kafka"; make_account alt
+  printf '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1","session_id":"s-1","cwd":"%s"}\n' \
+    "$T/home/work" > "$HIVE_DIR/drones/kafka/meta.json"
+  hive_home revive kafka --account alt > "$T/out" 2>&1 && fail "moved a drone whose session the account cannot see"
+  assert_contains "$T/out" "does not see session s-1"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
+  mkdir -p "$T/home/.claude-alt/projects/-work"; touch "$T/home/.claude-alt/projects/-work/s-1.jsonl"
+  hive_home revive kafka --account alt > "$T/out2" 2>&1 || fail "move refused with the session visible: $(cat "$T/out2")"
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CONFIG_DIR=$T/home/.claude-alt"
+  [ "$(drone_meta_field kafka account)" = alt ] || fail "meta account: $(drone_meta_field kafka account)"
+}
+
+t_adopt_records_account() {
+  make_account alt
+  FAKE_SESSION_ID=s-9 hive_home adopt kafka w5:p1 --account alt > "$T/out" 2>&1 || fail "adopt failed: $(cat "$T/out")"
+  [ "$(drone_meta_field kafka account)" = alt ] || fail "meta account: $(drone_meta_field kafka account)"
+  hive_home adopt sql w6:p1 --account missing > "$T/out2" 2>&1 && fail "adopted onto a missing account"
+  assert_not_contains "$FAKE_HERDR_LOG" "agent rename w6:p1"
+  [ ! -e "$HIVE_DIR/drones/sql" ] || fail "a drone directory was created"
+}
+
+t_status_shows_account() {
+  mkdir -p "$HIVE_DIR/drones/kafka" "$HIVE_DIR/drones/sql"
+  echo '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1","account":"alt"}' > "$HIVE_DIR/drones/kafka/meta.json"
+  echo '{"name":"sql","workspace_id":"w3","pane_id":"w3:p1"}' > "$HIVE_DIR/drones/sql/meta.json"   # pre-accounts meta
+  "$HIVE" status > "$T/out"
+  grep -qE '^kafka +w2:p1 +alt +' "$T/out" || fail "no account column for kafka: $(cat "$T/out")"
+  grep -qE '^sql +w3:p1 +default +' "$T/out" || fail "old meta not shown as default: $(cat "$T/out")"
+}
+
 # --- coordinator hooks -------------------------------------------------------
 
 t_stop_hook_still_blocks_with_unread_mail() {
