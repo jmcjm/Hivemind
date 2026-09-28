@@ -185,7 +185,9 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 ## Customization
 
 - Drone model: `HIVE_MODEL=sonnet hive spawn <name>` (default `opus`).
+- Claude Code account: `hive spawn <name> --account alt` runs the drone with `CLAUDE_CONFIG_DIR=~/.claude-alt`
+  (`HIVE_ACCOUNT=alt` for every new drone). Setup and traps: "Several Claude Code accounts" in `skill/SKILL.md`.
 - Swarm directory: `HIVE_DIR=/other/path` (consistently for all invocations).
 - Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
   `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.
-- Tests: `tests/run.sh` — hermetic tests of the coordinator mail path against a fake herdr.
+- Tests: `tests/run.sh` — hermetic tests of the coordinator mail path and of account handling against a fake herdr.

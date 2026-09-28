@@ -15,7 +15,7 @@ on them, collect the results, and give the user **one condensed answer**.
 it handles every trap described below. Add it to PATH or call it by full path.
 
 ```
-hive spawn  <name> [--cwd PATH]    new drone (opus, --dangerously-skip-permissions, own workspace)
+hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, --dangerously-skip-permissions, own workspace)
 hive task   <name> <file|->        brief from file/stdin + appended reporting protocol
 hive say    <name> <text>          ad-hoc message
 hive clear  <name>                 clear the drone's input field
@@ -32,8 +32,8 @@ hive kill   <name> [--purge]       kill a drone; an already dead one is archived
                                    (--purge deletes without an archive)
 hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives them, then removes
 hive rename <old> <new>            rename a drone and its workspace
-hive revive <name>                 resurrection with full conversation history (--resume)
-hive adopt  <name> <pane_id>       pull a Claude Code started outside hive into the swarm
+hive revive <name> [--account NAME]  resurrection with full conversation history (--resume); --account moves it
+hive adopt  <name> <pane_id> [--account NAME]  pull a Claude Code started outside hive into the swarm
 hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
 hive sweep                         reconciliation pass — retry lost wake-ups, surface silent drones
 ```
@@ -158,6 +158,41 @@ Traps:
 - **`hive wait` does not span machines** — use `ssh <host> hive wait ...` (it has its own hard timeout).
 - The remote fleet's data lives on the remote machine (`~/.herdr-hive` there). Briefs, reports,
   gate windows — all per-machine; a gate on one machine does not protect the other.
+
+## Several Claude Code accounts — spreading the swarm over subscriptions
+
+A fleet of drones burns an account's limits in hours. `--account NAME` runs a drone on a second
+Claude Code login: a separate config dir `~/.claude-NAME`, which the drone gets as `CLAUDE_CONFIG_DIR`.
+That dir holds the account's own login (`.credentials.json`) and its own `.claude.json` (onboarding,
+folder trust, MCP servers). Everything else should be a symlink into `~/.claude`, so both accounts run
+the same instructions, hooks, skills and plugins, and share the session transcripts:
+
+```bash
+mkdir -m 700 ~/.claude-alt
+for f in CLAUDE.md settings.json skills plugins projects; do ln -s ~/.claude/$f ~/.claude-alt/$f; done
+CLAUDE_CONFIG_DIR=~/.claude-alt claude      # once, interactively: onboarding + /login
+```
+
+- `hive spawn <name> --account alt` — a drone on that account. `HIVE_ACCOUNT=alt` makes it the default
+  for new drones and for `hive usage`; `--account ""` (or `default`) is the `~/.claude` account.
+- The account is recorded in `meta.json`: `hive revive` resumes the drone where it ran, whatever
+  `HIVE_ACCOUNT` says. `hive revive <name> --account other` moves a drone, history included, off an
+  account that hit its limit — possible only because `projects/` is shared. When the target account
+  cannot see the transcript, revive refuses before closing anything.
+- `hive usage --account alt` measures that account's limits; `hive status` shows each drone's account.
+- `hive adopt <name> <pane> --account alt` for an agent started on that account by hand. Adopt cannot
+  tell the account on its own — without the flag the agent is recorded on the default one.
+
+Traps:
+- **`spawn` refuses an account that is not logged in or never finished onboarding** — the drone would
+  sit on the login or onboarding screen, which the startup bootstrap does not answer.
+- **The default account gets no `CLAUDE_CONFIG_DIR` at all.** An empty value is not "the default" to
+  Claude Code but a config dir named `""` (logged out), and `CLAUDE_CONFIG_DIR=~/.claude` would look for
+  `~/.claude/.claude.json` instead of `~/.claude.json`. So a default drone inherits whatever the herdr
+  **server** process carries: a server started from a shell that exports `CLAUDE_CONFIG_DIR` puts every
+  "default" drone on that account while `hive status` still says `default`.
+- **Folder trust is pre-seeded in the drone's account**, never in the caller's `CLAUDE_CONFIG_DIR` — a
+  coordinator running on another account exports it into every command it runs.
 
 ## The machine gate — one window for anything that eats the whole machine
 

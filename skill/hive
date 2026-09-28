@@ -259,16 +259,42 @@ drone_remove() {
   rm -f "$HIVE_DIR/.wake-$1"
 }
 
-# ensure_trusted <cwd> — pre-seed folder trust so a fresh --cwd never raises Claude Code's
+# Claude Code accounts. A drone runs on the default account (~/.claude with ~/.claude.json) or on a
+# named one: its own CLAUDE_CONFIG_DIR at ~/.claude-<name>, holding its own login and its own
+# .claude.json (trust, onboarding, MCP servers). HIVE_ACCOUNT sets the account 'spawn' uses when no
+# --account is given; "" or "default" is the default account.
+# account_dir <name> — prints the account's config dir, nothing for the default account. Refuses an
+# account that is not logged in or never finished onboarding: the drone would hang on the login or
+# onboarding screen, which the startup bootstrap does not answer.
+account_dir() {
+  local acc="$1" d
+  case "$acc" in ""|default) return 0 ;; esac
+  [[ "$acc" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || die "account '$acc' rejected: [a-z0-9][a-z0-9_-]{0,31}"
+  d="$HOME/.claude-$acc"
+  [ -d "$d" ] || die "account '$acc': no config dir $d"
+  [ -f "$d/.credentials.json" ] \
+    || die "account '$acc' is not logged in — run: CLAUDE_CONFIG_DIR=$d claude   (then /login)"
+  python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('hasCompletedOnboarding') is True else 1)" \
+      "$d/.claude.json" 2>/dev/null \
+    || die "account '$acc' never finished onboarding — run once interactively: CLAUDE_CONFIG_DIR=$d claude"
+  echo "$d"
+}
+
+# account_label <name> — the account as shown to the human
+account_label() { case "${1:-}" in ""|default) echo default ;; *) echo "$1" ;; esac; }
+
+# ensure_trusted <cwd> [config_dir] — pre-seed folder trust so a fresh --cwd never raises Claude Code's
 # "Do you trust this folder?" dialog. That dialog appears despite --dangerously-skip-permissions
 # (it is a separate gate), and its default button is "No, exit", which QUITS Claude Code — so
 # answering it blind by keystroke kills the drone. Setting hasTrustDialogAccepted in the config
 # makes the dialog never appear. Best-effort: every failure path is non-fatal (an unparseable or
 # concurrently-written config is left untouched), and the keystroke bootstrap in cmd_spawn stays
-# as a fallback. Honors CLAUDE_CONFIG_DIR the same way Claude Code does.
+# as a fallback. The config is the drone's account, never the caller's CLAUDE_CONFIG_DIR: the drone
+# shell is spawned by the herdr server and does not inherit the caller's environment (a coordinator
+# running on a second account exports CLAUDE_CONFIG_DIR into every command it runs).
 ensure_trusted() {
   local cwd="$1" cfg
-  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then cfg="$CLAUDE_CONFIG_DIR/.claude.json"; else cfg="$HOME/.claude.json"; fi
+  if [ -n "${2:-}" ]; then cfg="$2/.claude.json"; else cfg="$HOME/.claude.json"; fi
   python3 - "$cfg" "$cwd" <<'PY' 2>/dev/null || true
 import json,os,sys,tempfile
 cfg,cwd=sys.argv[1],sys.argv[2]
@@ -298,22 +324,29 @@ PY
 
 # --- commands -------------------------------------------------------------
 
-cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
-  local name="${1:?usage: hive spawn <name> [--cwd PATH]}"; shift
+cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
+  local name="${1:?usage: hive spawn <name> [--cwd PATH] [--account NAME]}"; shift
   # herdr 0.8: the drone name doubles as the herdr agent name — [a-z][a-z0-9_-]{0,31} applies,
   # unique among live agents.
   [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
     || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
-  local cwd="$HOME" resume=0
+  local cwd="$HOME" resume=0 account="${HIVE_ACCOUNT:-}" account_given=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --cwd) cwd="$2"; shift 2 ;;
+      --account) account="${2?--account needs a name}"; account_given=1; shift 2 ;;
       --resume) resume=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
+  # A resumed session stays on the account it ran on unless moved explicitly — HIVE_ACCOUNT is the
+  # default for NEW drones and must not quietly carry an existing one elsewhere.
+  [ "$resume" = 1 ] && [ "$account_given" = 0 ] && [ -f "$(drone_meta "$name")" ] \
+    && account=$(meta_get "$name" account)
   [ -d "$cwd" ] || die "cwd does not exist: $cwd"
-  ensure_trusted "$cwd"   # so a fresh cwd never stalls (or quits) on the trust dialog
+  local acc_dir; acc_dir=$(account_dir "$account") || exit 1
+  [ "$account" = default ] && account=""
+  ensure_trusted "$cwd" "$acc_dir"   # so a fresh cwd never stalls (or quits) on the trust dialog
 
   local dir; dir=$(drone_dir "$name"); mkdir -p "$dir"
   rm -f "$dir"/.sweep-* "$dir/.killed"   # a fresh life invalidates old sweep verdicts
@@ -341,6 +374,9 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--resume]
   # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
   local -a envs=(--env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" --env "HERDR_HIVE_ROLE=drone")
   [ -n "$coord" ] && envs+=(--env "HIVE_COORD_PANE=$coord")
+  # The default account gets no CLAUDE_CONFIG_DIR at all: an empty value is not "the default" to
+  # Claude Code, it is a config dir named "" (logged out, measured on 2.1.283).
+  [ -n "$acc_dir" ] && envs+=(--env "CLAUDE_CONFIG_DIR=$acc_dir")
   local ws_json ws pane
   ws_json=$(herdr workspace create --label "$name" --cwd "$cwd" --no-focus "${envs[@]}" 2>/dev/null) \
     || die "failed to create workspace"
@@ -387,10 +423,12 @@ Report questions and blockers via 'hive send coord' — do not wait idly, nobody
     esac
   fi
 
-  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" <<'PY'
+  # The account is recorded because 'revive' must resume on it: --resume looks the session up in
+  # the account's projects/ directory.
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" <<'PY'
 import json,sys
-d,name,ws,pane,sid,cwd = sys.argv[1:7]
-json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd},
+d,name,ws,pane,sid,cwd,account = sys.argv[1:8]
+json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account},
           open(f"{d}/meta.json","w"), indent=1)
 PY
 
@@ -434,7 +472,7 @@ Compaction drops detail. Before tasking it: wait until its status is no longer '
 restate what binds in one 'hive say' — state on disk, scope, boundaries. Do not assume it remembers.
 EOF
 
-  echo "spawn: $name  ws=$ws pane=$pane model=$MODEL cwd=$cwd"
+  echo "spawn: $name  ws=$ws pane=$pane model=$MODEL account=$(account_label "$account") cwd=$cwd"
   echo "sid=$sid"
 }
 
@@ -613,16 +651,17 @@ cmd_status() {  # status [name...] — never blocks
     for d in "$DRONES_DIR"/*/; do [ -d "$d" ] && names+=("$(basename "$d")"); done
   fi
   [ ${#names[@]} -eq 0 ] && { echo "no drones"; return; }
-  printf '%-16s %-8s %-10s %-9s %s\n' DRONE PANE STATUS REPORT TASK
-  local n pane st rep brief
+  printf '%-16s %-8s %-10s %-9s %-9s %s\n' DRONE PANE ACCOUNT STATUS REPORT TASK
+  local n pane st rep brief acc
   for n in "${names[@]}"; do
     pane=$(pane_of "$n" 2>/dev/null) || pane="-"
     st=$(pane_status "$pane")
+    acc=$(account_label "$(meta_get "$n" account 2>/dev/null)")
     if [ -f "$(drone_dir "$n")/report.md" ]; then
       rep=$(grep -m1 -oE 'DONE|BLOCKED|FAILED' "$(drone_dir "$n")/report.md" 2>/dev/null || echo "present")
     else rep="-"; fi
     brief=$(head -1 "$(drone_dir "$n")/brief.md" 2>/dev/null | cut -c1-40)
-    printf '%-16s %-8s %-10s %-9s %s\n' "$n" "$pane" "$st" "$rep" "${brief:--}"
+    printf '%-16s %-8s %-10s %-9s %-9s %s\n' "$n" "$pane" "$acc" "$st" "$rep" "${brief:--}"
   done
 }
 
@@ -917,8 +956,19 @@ cmd_unblock() {  # unblock <name> — answers the dialog a drone is stuck on
   return 1
 }
 
-cmd_adopt() {  # adopt <name> <pane_id> — pulls a Claude Code started outside hive into the swarm
-  local name="${1:?usage: hive adopt <name> <pane_id>}"; local pane="${2:?missing pane_id}"
+cmd_adopt() {  # adopt <name> <pane_id> [--account NAME] — pulls a Claude Code started outside hive into the swarm
+  local name="${1:?usage: hive adopt <name> <pane_id> [--account NAME]}"; local pane="${2:?missing pane_id}"
+  shift 2
+  # The account the agent runs on (e.g. one started with claude2) — 'revive' resumes it there.
+  local account=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account="${2?--account needs a name}"; shift 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  account_dir "$account" >/dev/null || exit 1
+  [ "$account" = default ] && account=""
   [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
     || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   [ -f "$(drone_meta "$name")" ] && die "drone $name already exists — pick another name"
@@ -956,14 +1006,15 @@ print(s.get('value','') if s.get('kind')=='id' else '')" <<<"$info")
   rm -f "$dir"/.sweep-* "$dir/.killed"   # leftovers of a ghost directory must not judge the new drone
   # 'adopted' marks a drone without the swarm env: until revive it has no HIVE_DRONE, so its
   # 'hive inbox' would read the COORDINATOR's mailbox — wake_recipient leaves it alone.
-  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" <<'PY'
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" <<'PY'
 import json,sys
-d,name,ws,pane,sid,cwd = sys.argv[1:7]
-json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd,"adopted":True},
+d,name,ws,pane,sid,cwd,account = sys.argv[1:8]
+json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account,
+           "adopted":True},
           open(f"{d}/meta.json","w"), indent=1)
 PY
 
-  echo "adopt: $name  ws=$ws pane=$pane cwd=$cwd"
+  echo "adopt: $name  ws=$ws pane=$pane account=$(account_label "$account") cwd=$cwd"
   local missing=""
   [ -n "$sid" ] || missing="session_id"
   [ -n "$cwd" ] || missing="${missing:+$missing and }cwd"
@@ -982,16 +1033,32 @@ Full integration: hive revive $name   (restart with --resume; the conversation h
 EOF
 }
 
-cmd_revive() {  # revive <name> — resurrects a drone with its conversation history intact
-  local name="${1:?usage: hive revive <name>}"
+cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its conversation history intact
+  local name="${1:?usage: hive revive <name> [--account NAME]}"; shift
   local cwd; cwd=$(meta_get "$name" cwd) || die "unknown drone: $name"
+  # A drone comes back on the account it ran on; --account moves it (e.g. off an account that hit
+  # its limit).
+  local account; account=$(meta_get "$name" account)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --account) account="${2?--account needs a name}"; shift 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
   # Checked before the workspace is closed: without both, spawn would start a fresh session (or
   # none at all) after the old one is already gone — the history would be lost, not revived.
   local sid; sid=$(meta_get "$name" session_id)
   [ -n "$sid" ] && [ -n "$cwd" ] || die "revive: $name has no recorded session id or cwd — it cannot be resumed; nothing closed"
+  local acc_dir; acc_dir=$(account_dir "$account") || exit 1
+  # A move between accounts resumes only when the target account sees the transcript, i.e. both
+  # share projects/ (the ~/.claude-<name>/projects symlink). Checked here, while the drone lives.
+  if [ "$(account_label "$account")" != "$(account_label "$(meta_get "$name" account)")" ]; then
+    compgen -G "${acc_dir:-$HOME/.claude}/projects/*/$sid.jsonl" >/dev/null \
+      || die "revive: account '$(account_label "$account")' does not see session $sid (projects/ not shared with the drone's account?) — nothing closed"
+  fi
   local ws; ws=$(meta_get "$name" workspace_id)
   herdr workspace close "$ws" >/dev/null 2>&1
-  cmd_spawn "$name" --cwd "$cwd" --resume
+  cmd_spawn "$name" --cwd "$cwd" --account "$account" --resume
 }
 
 # --- reconciliation sweep -------------------------------------------------
@@ -1174,19 +1241,29 @@ cmd_usage() {  # usage [--cwd DIR] [--timeout SEC] — measures the account limi
   # The coordinator cannot see the usage counter from inside its own session, and a fleet of drones burns
   # the weekly limit in hours. This starts a fresh `claude` in a tmux session (in a TRUSTED directory —
   # the trust dialog is not answered on purpose), types /usage, captures the panel and kills the session.
-  local cwd="$PWD" timeout=45
+  local cwd="$PWD" timeout=45 account="${HIVE_ACCOUNT:-}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --cwd) cwd="${2:?--cwd needs a path}"; shift 2 ;;
       --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
+      --account) account="${2?--account needs a name}"; shift 2 ;;
       *) echo "hive: usage: unknown argument $1" >&2; return 2 ;;
     esac
   done
   command -v tmux >/dev/null || { echo "hive: usage: tmux not found" >&2; return 1; }
+  local abs; abs=$(cd "$cwd" 2>/dev/null && pwd) || { echo "hive: usage: no such directory: $cwd" >&2; return 1; }
+  cwd="$abs"   # absolute, because the trust key in .claude.json is the absolute path
+  local acc_dir; acc_dir=$(account_dir "$account") || return 1
+  # The measured account is set explicitly both ways: the caller's CLAUDE_CONFIG_DIR (a coordinator
+  # on a second account exports it) must not decide which account's limits get printed. A named
+  # account gets its cwd pre-trusted like a drone's — a fresh account trusts no folder at all.
+  local acc_env="-u CLAUDE_CONFIG_DIR"
+  if [ -n "$acc_dir" ]; then acc_env="CLAUDE_CONFIG_DIR=$(printf '%q' "$acc_dir")"; ensure_trusted "$cwd" "$acc_dir"; fi
+  echo "account: $(account_label "$account")"
   local ses="hive-usage-$$" out
   tmux kill-session -t "$ses" 2>/dev/null
   tmux new-session -d -s "$ses" -x 200 -y 60 -c "$cwd" \
-    "env -u CLAUDECODE -u HIVE_DRONE -u HERDR_HIVE_ROLE claude" || return 1
+    "env -u CLAUDECODE -u HIVE_DRONE -u HERDR_HIVE_ROLE $acc_env claude" || return 1
   local i=0
   while [ $i -lt "$timeout" ]; do
     out=$(tmux capture-pane -t "$ses" -p 2>/dev/null)
@@ -1364,7 +1441,7 @@ case "${1:-}" in
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
 
-  hive spawn  <name> [--cwd PATH]    new drone (opus, skip-permissions, own workspace)
+  hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, skip-permissions, own workspace)
   hive task   <name> <file|->        send a brief (file or stdin) + report protocol
   hive say    <name> <text>          ad-hoc message to a drone
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
@@ -1377,19 +1454,21 @@ hive — command a swarm of Claude Code agents in herdr
   hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300s)
   hive report <name>                 show a drone's report
   hive mute   <name> [--off]         silence automatic wake-ups (conversational drone)
-  hive usage  [--cwd DIR]            measure the account limits (/usage in a throwaway session)
+  hive usage  [--cwd DIR] [--account NAME]  measure the account limits (/usage in a throwaway session)
   hive peek   <name> [lines]         view of the drone's terminal
   hive kill   <name> [--purge]       kill a drone (a dead one is archived and removed)
   hive prune  [--purge] [--dry-run] [names]  clear out dead drones (archived unless --purge)
   hive rename <old> <new>            rename a drone and its workspace
-  hive revive <name>                 resurrect a drone with its history (--resume)
-  hive adopt  <name> <pane_id>       pull a Claude Code started outside hive into the swarm
+  hive revive <name> [--account NAME]  resurrect a drone with its history (--resume); --account moves it
+  hive adopt  <name> <pane_id> [--account NAME]  pull a Claude Code started outside hive into the swarm
   hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
   hive sweep                         reconciliation pass: retry lost wake-ups, surface silent drones
                                      (a systemd user timer runs it every 5 min — install.sh sets it up)
   hive gate   <enter|release|status|queue> [desc]  one exclusive machine window for full gates (flock-backed)
 
 Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/
+Accounts: --account NAME runs on CLAUDE_CONFIG_DIR=~/.claude-NAME (logged in, onboarded);
+          HIVE_ACCOUNT sets the default for spawn and usage; none/"default" = ~/.claude.
 EOF
   ;;
 esac

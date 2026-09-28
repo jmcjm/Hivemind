@@ -11,6 +11,7 @@ if [ "${FAKE_HERDR_DOWN:-0}" = 1 ]; then
 fi
 case "$1 ${2:-}" in
   "workspace list")    echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
+  "workspace create")  echo '{"result":{"workspace":{"workspace_id":"w9"},"root_pane":{"pane_id":"w9:p1"}}}' ;;
   "pane get")          printf '{"result":{"pane":{"pane_id":"%s","agent":"claude","agent_status":"%s","agent_session":{"kind":"id","value":"%s"}}}}\n' \
                          "${3:-}" "${FAKE_AGENT_STATUS:-idle}" "${FAKE_SESSION_ID:-}" ;;
   "pane current")      echo '{"result":{"pane":{"pane_id":"w1:p1"}}}' ;;
