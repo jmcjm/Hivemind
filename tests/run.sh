@@ -16,7 +16,7 @@ setup() {
   T=$(mktemp -d)
   export HIVE_DIR="$T/hive" FAKE_HERDR_LOG="$T/herdr.log"
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
-  unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN \
+  unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
         HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE HIVE_MAIL_OVERDUE_BUSY \
         HIVE_SWEEP_RENOTIFY
   mkdir -p "$HIVE_DIR"
@@ -244,7 +244,7 @@ t_watch_arming_ends_the_unwatched_incident() {
   kill "${WATCH_PIDS[0]}"; wait "${WATCH_PIDS[0]}" 2>/dev/null
   touch -d '-10 minutes' "$HIVE_DIR/.watch-coord.last"
   send_coord sql done "second"
-  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail: no coordinator is listening" 2
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 2
 }
 
 t_watch_refused_for_drone() {
@@ -259,7 +259,7 @@ t_send_watched_touches_nothing() {
   start_watch "$T/out"
   send_coord kafka done "finished"
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
-  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted while a watcher listens"
   [ "$(letters)" = 1 ] || fail "expected 1 letter, found $(letters)"
 }
 
@@ -268,9 +268,9 @@ t_send_unwatched_notifies_once_never_prompts() {
   send_coord kafka done "first"
   send_coord sql decision "second"
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
-  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
   assert_contains "$FAKE_HERDR_LOG" "arm Monitor(hive watch)"
-  assert_not_contains "$FAKE_HERDR_LOG" "notify-send"     # herdr showed it — no second ping
+  [ "$(alerts)" = 1 ] || fail "$(alerts) pings for one alert"
   [ "$(letters)" = 2 ] || fail "expected 2 letters, found $(letters)"
 }
 
@@ -297,30 +297,52 @@ t_send_grace_is_configurable() {
   send_coord kafka done "first"
   [ "$(alerts)" = 0 ] || fail "alerted 2 min into the default 5 min grace"
   HIVE_UNWATCHED_GRACE=60 send_coord sql done "second"
-  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send" 1
 }
 
-t_alert_falls_back_to_desktop_when_toasts_off() {
+t_alert_goes_to_the_desktop_whatever_herdr_says() {
+  # herdr answers "shown" once a client has the notification, whether or not that client displays
+  # it — so while a desktop notifier exists, herdr is not asked at all.
   coord_gone
-  FAKE_TOAST_SHOWN=0 send_coord kafka done "finished"
-  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  send_coord kafka done "finished"                        # the fake herdr would answer "shown"
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
+  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+}
+
+t_alert_desktop_failure_is_not_covered_by_herdr() {
+  # notify-send is there and fails (no session bus): the alert did not go out, and herdr's
+  # "shown" does not pass for it.
+  coord_gone
+  FAKE_NOTIFY_FAIL=1 send_coord kafka done "first"
+  [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "a failed alert left its rate-limit marker"
+  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+  send_coord sql done "second"                            # the notifier works again: no rate limit in the way
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 2
+  [ -e "$HIVE_DIR/.stranded-notice" ] || fail "a delivered alert left no rate-limit marker"
 }
 
 t_alert_uses_osascript_without_notify_send() {
   coord_gone
-  PATH="$(path_without notify-send)" FAKE_TOAST_SHOWN=0 send_coord kafka done "finished"
+  PATH="$(path_without notify-send)" send_coord kafka done "finished"
   assert_count "$FAKE_HERDR_LOG" "osascript -e on run argv -e display notification (item 2 of argv) with title (item 1 of argv) -e end run Swarm mail: no coordinator is listening 1 letter(s) waiting." 1
-  assert_not_contains "$FAKE_HERDR_LOG" "notify-send"
+  [ "$(alerts)" = 1 ] || fail "$(alerts) pings for one alert"
+}
+
+t_alert_uses_herdr_without_a_desktop_notifier() {
+  # No notify-send and no osascript: a herdr toast is all there is, and its "shown" has to do.
+  coord_gone
+  PATH="$(path_without notify-send osascript)" send_coord kafka done "finished"
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail: no coordinator is listening" 1
+  [ -e "$HIVE_DIR/.stranded-notice" ] || fail "herdr took the alert, yet no rate-limit marker"
 }
 
 t_alert_nobody_saw_leaves_no_marker() {
-  # Toasts off and no desktop notifier: nothing reached the human, so nothing may hold the next
-  # attempt back.
+  # No desktop notifier and herdr shows nothing (no client attached): nothing reached the human,
+  # so nothing may hold the next attempt back.
   coord_gone
   PATH="$(path_without notify-send osascript)" FAKE_TOAST_SHOWN=0 send_coord kafka done "first"
   [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "an alert nobody saw left its rate-limit marker"
-  FAKE_TOAST_SHOWN=0 send_coord sql done "second"
+  send_coord sql done "second"
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
   [ -e "$HIVE_DIR/.stranded-notice" ] || fail "a delivered alert left no rate-limit marker"
 }
@@ -329,7 +351,7 @@ t_send_bad_grace_falls_back_to_default() {
   # "5m" is not a number of seconds: left as typed it fails the comparison and the alert never fires.
   coord_gone
   HIVE_UNWATCHED_GRACE=5m send_coord kafka done "finished" 2> "$T/err"
-  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail: no coordinator is listening" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
   assert_contains "$T/err" "HIVE_UNWATCHED_GRACE='5m' is not a whole number of seconds — using 300"
 }
 
@@ -359,17 +381,18 @@ t_sweep_notifies_when_unwatched() {
   touch -d '-1 hour' "$HIVE_DIR/coord.pane"
   touch -d '-10 minutes' "$HIVE_DIR/.watch-coord"         # a watcher killed before its trap ran
   "$HIVE" sweep > "$T/out"
-  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send" 1
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
   assert_contains "$T/out" "sweep: unwatched-mail alert (1 letters)"
 }
 
 t_sweep_reports_alert_nobody_saw() {
-  # No channel took the alert: the journal says so, and no marker holds the next sweep back.
+  # The notifier fails, as in a unit with no session bus: the journal says so, and no marker
+  # holds the next sweep back.
   coord_gone
   mail_aged '-10 minutes'
   rm -f "$HIVE_DIR/.stranded-notice"
-  PATH="$(path_without notify-send osascript)" FAKE_TOAST_SHOWN=0 "$HIVE" sweep > "$T/out"
+  FAKE_NOTIFY_FAIL=1 "$HIVE" sweep > "$T/out"
   assert_contains "$T/out" "sweep: unwatched-mail alert NOT delivered (1 letters)"
   [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "an alert nobody saw left its rate-limit marker"
 }
@@ -399,7 +422,7 @@ t_sweep_overdue_alerts_when_coordinator_works_too_long() {
   touch "$HIVE_DIR/.watch-coord"
   : > "$FAKE_HERDR_LOG"
   FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
-  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 180 min" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread for 180 min" 1
 }
 
 t_sweep_overdue_busy_limit_is_configurable() {
@@ -409,7 +432,7 @@ t_sweep_overdue_busy_limit_is_configurable() {
   HIVE_MAIL_OVERDUE_BUSY=3600 FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
   [ "$(alerts)" = 0 ] || fail "alerted 40 min into a 60 min limit"
   HIVE_MAIL_OVERDUE_BUSY=1800 FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
-  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 40 min" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread for 40 min" 1
 }
 
 t_sweep_overdue_alerts_when_coordinator_stuck() {
@@ -418,7 +441,7 @@ t_sweep_overdue_alerts_when_coordinator_stuck() {
   touch "$HIVE_DIR/.watch-coord"
   : > "$FAKE_HERDR_LOG"
   FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/out"
-  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 40 min" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread for 40 min" 1
   assert_contains "$T/out" "sweep: overdue mail reminder (1 letters, 40 min old)"
 }
 
@@ -433,8 +456,7 @@ t_sweep_overdue_waits_for_threshold() {
 t_sweep_overdue_reminder_nobody_saw() {
   mail_aged '-40 minutes'
   touch "$HIVE_DIR/.watch-coord"
-  PATH="$(path_without notify-send osascript)" FAKE_TOAST_SHOWN=0 FAKE_AGENT_STATUS=blocked \
-    "$HIVE" sweep > "$T/out"
+  FAKE_NOTIFY_FAIL=1 FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/out"
   assert_contains "$T/out" "sweep: overdue mail reminder NOT delivered (1 letters, 40 min old)"
   [ ! -e "$HIVE_DIR/.overdue-notice" ] || fail "a reminder nobody saw started the re-nag interval"
 }
@@ -444,7 +466,7 @@ t_sweep_bad_overdue_falls_back_to_default() {
   touch "$HIVE_DIR/.watch-coord"
   : > "$FAKE_HERDR_LOG"
   HIVE_MAIL_OVERDUE=30m FAKE_AGENT_STATUS=blocked "$HIVE" sweep >/dev/null 2>&1
-  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 40 min" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread for 40 min" 1
 }
 
 t_sweep_overdue_left_to_the_unwatched_alert() {
@@ -464,7 +486,7 @@ t_sweep_unheard_mail_alerts_once() {
   mail_aged '-40 minutes'
   rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
   "$HIVE" sweep >/dev/null
-  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  [ "$(alerts)" = 1 ] || fail "$(alerts) alerts for one event"
   assert_contains "$FAKE_HERDR_LOG" "no coordinator is listening"
 }
 
@@ -474,7 +496,7 @@ t_sweep_quiet_when_watched() {
   touch "$HIVE_DIR/.watch-coord"
   "$HIVE" sweep >/dev/null
   assert_contains "$FAKE_HERDR_LOG" "workspace list"      # the sweep ran, it did not bail out early
-  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted while a watcher listens"
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
 }
 

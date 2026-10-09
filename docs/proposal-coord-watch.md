@@ -4,8 +4,8 @@ Status: **implemented.** Replaces the coordinator's prompt wake-up.
 
 Out of date in one respect since PR #5: the fallback for mail nobody watches (sections 3.2, 3.4
 and 5). It is no longer a herdr notification that `install.sh` makes visible by turning herdr
-toasts on. hive waits out a grace period, then alerts through a herdr toast only when herdr shows
-one and through the desktop notifier otherwise; `install.sh` only reads the herdr config and warns.
+toasts on. hive waits out a grace period, then alerts through the desktop notifier, and through a
+herdr toast only on a machine without one; `install.sh` only reads the herdr config and warns.
 The current behaviour is described in `skill/SKILL.md`, section "Swarm mail".
 
 ## 1. The problem

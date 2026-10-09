@@ -120,9 +120,10 @@ reliability net behind the happy path:
   the same 300 s) and a letter that arrives meanwhile pings the user although you are alive. A
   longer grace closes that gap at the price of noticing a coordinator that is really gone that
   much later. Arming a watcher ends the incident: the next one is alerted without waiting out
-  the old rate limit. The ping is a herdr toast when herdr shows toasts, the desktop
-  notifier (`notify-send`, `osascript`) otherwise. hive never turns herdr toasts on — herdr
-  cannot exempt drone panes, so its toasts would announce every turn every drone ends.
+  the old rate limit. The ping goes through the desktop notifier (`notify-send`, `osascript`);
+  only a machine without one gets a herdr toast instead, which herdr may not display (see
+  "herdr technicalities"). hive never turns herdr toasts on — herdr cannot exempt drone panes,
+  so its toasts would announce every turn every drone ends.
 - **Unread-mail reminder** — the watcher itself reminds you, in your session, of letters nobody took
   with `hive inbox` for `HIVE_MAIL_REMIND` (default 600 s): `HIVE-MAIL reminder: N unread, oldest
   M min`. Answer it with `hive inbox`, like any `HIVE-MAIL` line.
@@ -139,8 +140,9 @@ reliability net behind the happy path:
   `HIVE_MAIL_OVERDUE_BUSY` old (default 7200 s): a pane that reports `working` for two hours over
   waiting mail is stuck — a hung tool call, a retry loop — and nothing else would tell the user.
   Every alert the sweep raises for the user leaves a line in its output
-  (`journalctl --user -u hive-sweep`), marked `NOT delivered` when neither herdr nor a desktop
-  notifier took it; such an alert is not rate-limited and the next sweep tries again. These
+  (`journalctl --user -u hive-sweep`), marked `NOT delivered` when the desktop notifier failed
+  (or there is none and herdr showed nothing); such an alert is not rate-limited and the next
+  sweep tries again. These
   settings are whole seconds; anything else falls back to the default with a line on stderr.
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
@@ -478,7 +480,7 @@ switches it to `--dangerously-skip-permissions`, so the boundaries must be hard 
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
 | swarm stands still, no mail at all | drone hook failed, or drone hung/died mid-turn | the sweep mails coord within ~5 min (`SWEEP: ...`); impatient? `hive sweep` by hand, then `hive peek` |
 | no `HIVE-MAIL` notifications at all | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
-| the user gets a desktop ping for every drone turn | herdr's own toasts or sounds for background agents (`[ui.toast] delivery` on, `[ui.sound]` on) — herdr cannot limit them to your pane | tell the user: `delivery = "off"` and `[ui.sound] enabled = false` in the herdr config silence them, after `herdr server reload-config` when the server is running; hive's own alerts fall back to the desktop notifier |
+| the user gets a desktop ping for every drone turn | herdr's own toasts or sounds for background agents (`[ui.toast] delivery` on, `[ui.sound]` on) — herdr cannot limit them to your pane | tell the user: `delivery = "off"` and `[ui.sound] enabled = false` in the herdr config silence them, after `herdr server reload-config` when the server is running; hive's own alerts use the desktop notifier and do not need them |
 | `HIVE-WATCH: taken over by another watcher` | armed twice, or another session took the watch | nothing to do if that was you; otherwise `hive coord` + re-arm in the session that should coordinate |
 
 ## Corpses and cleanup
@@ -533,8 +535,13 @@ about whether the work succeeded.
   delivery` (default `"off"`) and plays a sound through `[ui.sound]` (default on). Neither can be
   limited per pane — 0.9.x has only the global toast delivery and per-agent-kind sound overrides
   (`[ui.sound.agents] claude`, which mutes the coordinator too). With a swarm, either one fires
-  for every turn every drone ends. `herdr notification show` answers `"shown": false` when toasts
-  are off; hive's alerts then use the desktop notifier.
+  for every turn every drone ends.
+- `herdr notification show` answering `"shown": true` does not mean anybody saw it. The server
+  says so once it has handed the notification to an attached client; the client then follows its
+  own `[ui.toast] delivery` — `"off"` drops it, `"herdr"` draws it inside the terminal, only
+  `"terminal"` and `"system"` leave herdr. `"shown": false` comes with no client attached or
+  under the API's rate limit. That is why hive's alerts use the desktop notifier and ask herdr
+  only where there is none.
 - The `herdr integration install claude` integration (a `SessionStart` hook) reports the
   `session_id` and transcript path to herdr — that is what makes `revive` possible. Check:
   `herdr integration status`. A drone's session id is also visible in `herdr agent get <drone>`

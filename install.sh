@@ -74,8 +74,8 @@ grep -q '^claude: current' <<<"$(herdr integration status 2>/dev/null || true)" 
   || die "claude integration does not report as active"
 
 echo "== 5/9 Alerts for the human =="
-# hive alerts the human only when nobody hears coord mail. The alert is a herdr toast when herdr
-# shows one, the desktop notifier otherwise. hive never turns herdr toasts on: herdr has no
+# hive alerts the human only when nobody hears coord mail, through the desktop notifier; a herdr
+# toast stands in only where there is none. hive never turns herdr toasts on: herdr has no
 # per-pane switch, so they would announce every turn every drone ends. Read-only — the config is
 # yours. The same lookup herdr does: HERDR_CONFIG_PATH, else the XDG config directory.
 HERDR_CONFIG="${HERDR_CONFIG_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml}"
@@ -97,7 +97,7 @@ esac
 if NOTIFIER=$(command -v notify-send || command -v osascript); then
   ok "desktop notifier for hive's alerts: $NOTIFIER"
 else
-  warn "no desktop notifier (notify-send or osascript) — the alert for mail nobody hears shows only as a herdr toast, when herdr shows toasts"
+  warn "no desktop notifier (notify-send or osascript) — the alert for mail nobody hears can only be a herdr toast, which herdr shows inside the terminal at best and drops when [ui.toast] delivery is \"off\". Install libnotify (notify-send)"
 fi
 
 echo "== 6/9 Coordinator hooks =="

@@ -109,8 +109,10 @@ coordinator is not working. Before that the watcher reminds the coordinator itse
 until that mail is `HIVE_MAIL_OVERDUE_BUSY` old (default 2 h): a pane "working" that long over
 waiting mail is stuck. The grace is a trade-off — it ignores what the coordinator is doing, so a
 blocking call that outlasts it after the monitor expired can still ping you, and a longer grace
-notices a dead coordinator later. All four are set in whole seconds. The alert is a herdr
-toast when herdr shows toasts, the desktop notifier (`notify-send`, `osascript`) otherwise.
+notices a dead coordinator later. All four are set in whole seconds. The alert goes through the
+desktop notifier (`notify-send`, `osascript`). Only a machine without one gets a herdr toast
+instead, and herdr reports that as shown once a client has it, even when `[ui.toast] delivery`
+makes the client drop it or draw it inside the terminal.
 
 herdr's own notifications cannot be limited to the coordinator's pane: with `[ui.toast] delivery`
 on or `[ui.sound]` on (herdr's default), herdr announces every turn every drone ends. Keep both off
@@ -245,7 +247,7 @@ drone lands on" in `skill/SKILL.md`.
 |---|---|---|
 | every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; stop the old server when no drone works, start `herdr` |
 | no `HIVE-MAIL` notifications | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
-| unwatched-mail alert never shows | herdr toasts off and no desktop notifier (`notify-send` / `osascript`) | install `libnotify` (`notify-send`); the alert also waits `HIVE_UNWATCHED_GRACE` (5 min) before it fires. `journalctl --user -u hive-sweep` shows each alert the sweep raised, `NOT delivered` when no channel took it |
+| unwatched-mail alert never shows | no desktop notifier (`notify-send` / `osascript`), so the alert is a herdr toast that herdr drops or keeps inside the terminal; or the notifier cannot reach a desktop session | install `libnotify` (`notify-send`); the alert also waits `HIVE_UNWATCHED_GRACE` (5 min) before it fires. `journalctl --user -u hive-sweep` shows each alert the sweep raised, `NOT delivered` when the notifier failed |
 | a desktop ping for every drone turn | herdr's own toasts or sounds for background agents | `[ui.toast] delivery = "off"` and `[ui.sound] enabled = false` in `~/.config/herdr/config.toml`, then `herdr server reload-config` — a running server keeps the config it started with |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |

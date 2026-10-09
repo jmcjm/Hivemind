@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 # Stand-in for notify-send: records the call to $FAKE_HERDR_LOG, so no test ever reaches a real desktop.
+#   FAKE_NOTIFY_FAIL=1    fails after recording, like notify-send with no session bus to talk to
 printf '%s\n' "notify-send $*" >> "${FAKE_HERDR_LOG:?FAKE_HERDR_LOG must be set}"
+[ "${FAKE_NOTIFY_FAIL:-0}" != 1 ]

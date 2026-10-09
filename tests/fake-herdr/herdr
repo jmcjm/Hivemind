@@ -4,7 +4,9 @@
 #   FAKE_HERDR_DOWN=1     every call fails the way an unreachable server does
 #   FAKE_SESSION_ID=<id>  the agent session id 'pane get' reports (hook scoping)
 #   FAKE_AGENT_STATUS=<s> the agent status 'pane get' reports (default idle)
-#   FAKE_TOAST_SHOWN=0    'notification show' answers like herdr with toasts off (not shown)
+#   FAKE_TOAST_SHOWN=0    'notification show' answers like herdr with no client attached (not
+#                         shown); by default it answers "shown", as herdr does once it has handed
+#                         the notification to a client — whether or not that client displays it
 printf '%s\n' "$*" >> "${FAKE_HERDR_LOG:?FAKE_HERDR_LOG must be set}"
 if [ "${FAKE_HERDR_DOWN:-0}" = 1 ]; then
   echo '{"error":{"code":"server_not_running","message":"fake herdr is down"}}' >&2

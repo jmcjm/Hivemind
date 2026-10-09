@@ -107,23 +107,26 @@ coord_unheard() {
   [ $(( $(date +%s) - since )) -ge "$(secs HIVE_UNWATCHED_GRACE 300)" ]
 }
 
-# Tells the human what only the human can fix. A herdr toast when herdr shows one; when it does
-# not (toasts off, herdr's default, or no client attached) the desktop notifier instead. hive never
-# turns herdr toasts on for this: herdr has no per-pane switch, so its toasts would also announce
-# every turn every drone ends, with the coordinator listening the whole time.
-# Fails when no channel took the alert, so the caller neither rate-limits nor reports a ping
-# nobody saw.
+# Tells the human what only the human can fix, through the desktop notifier: notify-send, or
+# osascript on macOS. herdr's answer cannot stand in for that. 'notification show' says
+# "shown": true as soon as the server has handed the notification to an attached client, and the
+# client then decides by its own [ui.toast] delivery: "off" (herdr's default) drops it, "herdr"
+# draws it inside the terminal, where only somebody looking at herdr sees it. So herdr is asked
+# only on a machine without a desktop notifier, where its "shown" is the best evidence there is.
+# hive never turns herdr toasts on for this: herdr has no per-pane switch, so its toasts would
+# also announce every turn every drone ends, with the coordinator listening the whole time.
+# Fails when the channel did not take the alert, so the caller neither rate-limits nor reports
+# a ping nobody saw.
 human_alert() {  # human_alert <title> <body>
-  local out
-  out=$(herdr notification show "$1" --body "$2" --sound request 2>/dev/null)
-  [ "$(jqp "print(r.get('shown') is True)" <<<"$out")" = True ] && return 0
   if command -v notify-send >/dev/null; then
     notify-send -a hive "$1" "$2" >/dev/null 2>&1
   elif command -v osascript >/dev/null; then
     osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
       -e 'end run' "$1" "$2" >/dev/null 2>&1
   else
-    return 1
+    local out
+    out=$(herdr notification show "$1" --body "$2" --sound request 2>/dev/null)
+    [ "$(jqp "print(r.get('shown') is True)" <<<"$out")" = True ]
   fi
 }
 
@@ -1833,7 +1836,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
       coord_stranded_notice
       case $? in
         0) echo "sweep: unwatched-mail alert (${#letters[@]} letters)" ;;
-        2) echo "sweep: unwatched-mail alert NOT delivered (${#letters[@]} letters) — herdr showed no toast and no desktop notifier took it" ;;
+        2) echo "sweep: unwatched-mail alert NOT delivered (${#letters[@]} letters) — the desktop notifier failed, or there is none and herdr showed nothing" ;;
       esac
     fi
   fi
@@ -1863,7 +1866,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
       : > "$mark"        # only an alert that went out starts the re-nag interval
       echo "sweep: overdue mail reminder (${#letters[@]} letters, $((age/60)) min old)"
     else
-      echo "sweep: overdue mail reminder NOT delivered (${#letters[@]} letters, $((age/60)) min old) — herdr showed no toast and no desktop notifier took it"
+      echo "sweep: overdue mail reminder NOT delivered (${#letters[@]} letters, $((age/60)) min old) — the desktop notifier failed, or there is none and herdr showed nothing"
     fi
   fi
 
