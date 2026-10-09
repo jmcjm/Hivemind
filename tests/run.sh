@@ -17,7 +17,8 @@ setup() {
   export HIVE_DIR="$T/hive" FAKE_HERDR_LOG="$T/herdr.log"
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
   unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN \
-        HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE
+        HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE HIVE_MAIL_OVERDUE_BUSY \
+        HIVE_SWEEP_RENOTIFY
   mkdir -p "$HIVE_DIR"
   : > "$FAKE_HERDR_LOG"
   echo "w1:p1" > "$HIVE_DIR/coord.pane"
@@ -56,6 +57,21 @@ coord_gone() {
 mail_aged() {  # mail_aged <touch -d offset> — one unread coord letter of that age
   send_coord kafka done "finished"
   touch -d "$1" "$HIVE_DIR"/mail/coord/*.json
+}
+
+# A PATH on which the named tools do not exist, the stand-ins included: every directory of the
+# test PATH mirrored as symlinks, minus those names. For a machine without notify-send.
+path_without() {  # path_without <tool>...
+  local -a skip=()
+  local tool d mirror out=""
+  for tool in "$@"; do skip+=(! -name "$tool"); done
+  while IFS= read -r -d : d; do
+    [ -d "$d" ] || continue
+    mirror=$(mktemp -d "$T/path.XXXXXX")
+    find "$d/" -mindepth 1 -maxdepth 1 "${skip[@]}" -exec ln -s -t "$mirror" {} +
+    out="$out${out:+:}$mirror"
+  done <<<"$PATH:"
+  printf '%s\n' "$out"
 }
 
 fail()                { echo "    FAIL: $*"; TEST_OK=0; }
@@ -192,6 +208,45 @@ t_watch_reminds_coordinator_of_unread_mail() {
   [ "$(alerts)" = 0 ] || fail "the human was alerted"
 }
 
+t_watch_no_reminder_for_fresh_mail() {
+  # The reminder is for mail left unread, not for a letter that has just arrived.
+  HIVE_MAIL_REMIND=8 start_watch "$T/out"
+  sleep 5
+  send_coord kafka done "finished"
+  sleep 6.5                                             # past the first heartbeat (~10 s)
+  assert_contains "$T/out" "HIVE-MAIL kafka [finished] finished"
+  assert_not_contains "$T/out" "HIVE-MAIL reminder"
+}
+
+t_watch_reminds_once_per_period() {
+  # Unread mail comes up once per HIVE_MAIL_REMIND, not at every heartbeat (~10, ~20, ~30 s).
+  mail_aged '-20 minutes'
+  HIVE_MAIL_REMIND=15 start_watch "$T/out"
+  sleep 12
+  assert_count "$T/out" "HIVE-MAIL reminder" 0          # first heartbeat: the period has not passed
+  sleep 11.5
+  assert_count "$T/out" "HIVE-MAIL reminder" 1          # second heartbeat
+  sleep 10
+  assert_count "$T/out" "HIVE-MAIL reminder" 1          # third: 10 s into the next period
+}
+
+t_watch_bad_remind_falls_back_to_default() {
+  HIVE_MAIL_REMIND=10m start_watch "$T/out"
+  assert_contains "$T/out" "HIVE_MAIL_REMIND='10m' is not a whole number of seconds — using 600"
+}
+
+t_watch_arming_ends_the_unwatched_incident() {
+  # A watcher armed after an alert ends that incident: the next time nobody listens, the alert
+  # does not wait out the old rate limit.
+  coord_gone
+  send_coord kafka done "first"                         # alerts and leaves the rate-limit marker
+  start_watch "$T/out"
+  kill "${WATCH_PIDS[0]}"; wait "${WATCH_PIDS[0]}" 2>/dev/null
+  touch -d '-10 minutes' "$HIVE_DIR/.watch-coord.last"
+  send_coord sql done "second"
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail: no coordinator is listening" 2
+}
+
 t_watch_refused_for_drone() {
   HIVE_DRONE=kafka timeout 5 "$HIVE" watch > "$T/out" 2>&1 && fail "drone was allowed to run hive watch"
   assert_contains "$T/out" "coordinator's mail watcher"
@@ -252,6 +307,32 @@ t_alert_falls_back_to_desktop_when_toasts_off() {
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
 }
 
+t_alert_uses_osascript_without_notify_send() {
+  coord_gone
+  PATH="$(path_without notify-send)" FAKE_TOAST_SHOWN=0 send_coord kafka done "finished"
+  assert_count "$FAKE_HERDR_LOG" "osascript -e on run argv -e display notification (item 2 of argv) with title (item 1 of argv) -e end run Swarm mail: no coordinator is listening 1 letter(s) waiting." 1
+  assert_not_contains "$FAKE_HERDR_LOG" "notify-send"
+}
+
+t_alert_nobody_saw_leaves_no_marker() {
+  # Toasts off and no desktop notifier: nothing reached the human, so nothing may hold the next
+  # attempt back.
+  coord_gone
+  PATH="$(path_without notify-send osascript)" FAKE_TOAST_SHOWN=0 send_coord kafka done "first"
+  [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "an alert nobody saw left its rate-limit marker"
+  FAKE_TOAST_SHOWN=0 send_coord sql done "second"
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
+  [ -e "$HIVE_DIR/.stranded-notice" ] || fail "a delivered alert left no rate-limit marker"
+}
+
+t_send_bad_grace_falls_back_to_default() {
+  # "5m" is not a number of seconds: left as typed it fails the comparison and the alert never fires.
+  coord_gone
+  HIVE_UNWATCHED_GRACE=5m send_coord kafka done "finished" 2> "$T/err"
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail: no coordinator is listening" 1
+  assert_contains "$T/err" "HIVE_UNWATCHED_GRACE='5m' is not a whole number of seconds — using 300"
+}
+
 t_send_unwatched_herdr_down() {
   export FAKE_HERDR_DOWN=1
   send_coord kafka done "finished" || fail "send exited non-zero"
@@ -277,9 +358,20 @@ t_sweep_notifies_when_unwatched() {
   rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
   touch -d '-1 hour' "$HIVE_DIR/coord.pane"
   touch -d '-10 minutes' "$HIVE_DIR/.watch-coord"         # a watcher killed before its trap ran
-  "$HIVE" sweep >/dev/null
+  "$HIVE" sweep > "$T/out"
   assert_count "$FAKE_HERDR_LOG" "notification show" 1
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+  assert_contains "$T/out" "sweep: unwatched-mail alert (1 letters)"
+}
+
+t_sweep_reports_alert_nobody_saw() {
+  # No channel took the alert: the journal says so, and no marker holds the next sweep back.
+  coord_gone
+  mail_aged '-10 minutes'
+  rm -f "$HIVE_DIR/.stranded-notice"
+  PATH="$(path_without notify-send osascript)" FAKE_TOAST_SHOWN=0 "$HIVE" sweep > "$T/out"
+  assert_contains "$T/out" "sweep: unwatched-mail alert NOT delivered (1 letters)"
+  [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "an alert nobody saw left its rate-limit marker"
 }
 
 t_sweep_quiet_within_grace() {
@@ -301,6 +393,25 @@ t_sweep_overdue_quiet_while_coordinator_works() {
   [ "$(alerts)" = 0 ] || fail "the human was alerted about a coordinator mid-turn"
 }
 
+t_sweep_overdue_alerts_when_coordinator_works_too_long() {
+  # 'working' for hours over waiting mail is a stuck pane, not a turn in progress.
+  mail_aged '-3 hours'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 180 min" 1
+}
+
+t_sweep_overdue_busy_limit_is_configurable() {
+  mail_aged '-40 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  HIVE_MAIL_OVERDUE_BUSY=3600 FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
+  [ "$(alerts)" = 0 ] || fail "alerted 40 min into a 60 min limit"
+  HIVE_MAIL_OVERDUE_BUSY=1800 FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 40 min" 1
+}
+
 t_sweep_overdue_alerts_when_coordinator_stuck() {
   # A watcher printed the letters, yet the coordinator sits on a dialog: only the human can help.
   mail_aged '-40 minutes'
@@ -317,6 +428,34 @@ t_sweep_overdue_waits_for_threshold() {
   : > "$FAKE_HERDR_LOG"
   FAKE_AGENT_STATUS=idle "$HIVE" sweep >/dev/null
   [ "$(alerts)" = 0 ] || fail "alerted about 20 min old mail (threshold 30 min)"
+}
+
+t_sweep_overdue_reminder_nobody_saw() {
+  mail_aged '-40 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  PATH="$(path_without notify-send osascript)" FAKE_TOAST_SHOWN=0 FAKE_AGENT_STATUS=blocked \
+    "$HIVE" sweep > "$T/out"
+  assert_contains "$T/out" "sweep: overdue mail reminder NOT delivered (1 letters, 40 min old)"
+  [ ! -e "$HIVE_DIR/.overdue-notice" ] || fail "a reminder nobody saw started the re-nag interval"
+}
+
+t_sweep_bad_overdue_falls_back_to_default() {
+  mail_aged '-40 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  HIVE_MAIL_OVERDUE=30m FAKE_AGENT_STATUS=blocked "$HIVE" sweep >/dev/null 2>&1
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 40 min" 1
+}
+
+t_sweep_overdue_left_to_the_unwatched_alert() {
+  # The watcher stopped two minutes ago and the mail is overdue. Once its grace has passed the
+  # unwatched-mail alert takes these letters; an overdue ping now would make it two for one event.
+  mail_aged '-40 minutes'
+  touch -d '-1 hour' "$HIVE_DIR/coord.pane"
+  touch -d '-2 minutes' "$HIVE_DIR/.watch-coord.last"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=idle "$HIVE" sweep >/dev/null
+  [ "$(alerts)" = 0 ] || fail "overdue reminder sent ahead of the unwatched-mail alert"
 }
 
 t_sweep_unheard_mail_alerts_once() {
@@ -369,6 +508,7 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 assert d.get("preferredNotifChannel") == "notifications_disabled"
 assert d.get("inputNeededNotifEnabled") is False
+assert d.get("agentPushNotifEnabled") is False
 SETTINGSPY
 }
 
@@ -505,6 +645,41 @@ t_status_shows_account() {
   "$HIVE" status > "$T/out"
   grep -qE '^kafka +w2:p1 +alt +' "$T/out" || fail "no account column for kafka: $(cat "$T/out")"
   grep -qE '^sql +w3:p1 +default +' "$T/out" || fail "old meta not shown as default: $(cat "$T/out")"
+}
+
+# --- install.sh: what herdr itself would announce ------------------------------
+
+expect_pings() {  # expect_pings <expected line> — herdr-pings.py on $T/config.toml
+  local out; out=$(python3 "$ROOT/lib/herdr-pings.py" "$T/config.toml")
+  [ "$out" = "$1" ] || fail "expected '$1', got '$out'"
+}
+
+t_pings_herdr_defaults_without_config() {
+  expect_pings "off on"
+}
+
+t_pings_reports_toast_delivery_and_never_writes() {
+  printf '[ui.toast]\ndelivery = "system"\n\n[ui.sound]\nenabled = false\n' > "$T/config.toml"
+  cp "$T/config.toml" "$T/before"
+  expect_pings "system off"
+  cmp -s "$T/config.toml" "$T/before" || fail "the config was changed"
+}
+
+t_pings_agent_sound_overrides_the_global_switch() {
+  printf '[ui.sound]\nenabled = false\n\n[ui.sound.agents]\nclaude = "on"\n' > "$T/config.toml"
+  expect_pings "off on"
+  printf '[ui.sound.agents]\nclaude = "off"\n' > "$T/config.toml"
+  expect_pings "off off"
+}
+
+t_pings_config_with_bom() {
+  printf '\xef\xbb\xbf[ui.toast]\ndelivery = "system"\n' > "$T/config.toml"
+  expect_pings "system on"
+}
+
+t_pings_broken_config_is_unknown() {
+  printf '[ui.toast\ndelivery = \n' > "$T/config.toml"
+  expect_pings "unknown unknown"
 }
 
 # --- coordinator hooks -------------------------------------------------------

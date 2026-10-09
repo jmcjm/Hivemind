@@ -66,8 +66,8 @@ a decision is needed, mail `coord`.
 **While you listen, the swarm is silent towards the user.** A drone reports to you and nobody
 else: `drone-ping.sh` only mails `coord`, a drone has no `PushNotification` tool, and
 `drone-settings.json` turns Claude Code's own notifications off (`preferredNotifChannel`,
-`inputNeededNotifEnabled`). The user hears from the swarm only when nobody hears it (the alerts
-below) — everything else reaches them through you.
+`inputNeededNotifEnabled`, `agentPushNotifEnabled`). The user hears from the swarm only when
+nobody hears it (the alerts below) — everything else reaches them through you.
 
 You hear that mail through **the mail watcher**. Right after `hive coord`, arm it:
 
@@ -115,7 +115,12 @@ reliability net behind the happy path:
   (default 300 s, counted from the last live heartbeat, the last watcher's stop, or `hive coord`
   and spawn, whichever is latest) pings the user, rate-limited. The grace keeps the routine
   re-arm silent: a letter that lands between a monitor's expiry and your re-arm reaches you as
-  the new watcher's backlog line. The ping is a herdr toast when herdr shows toasts, the desktop
+  the new watcher's backlog line. The grace does not look at what you are doing: stay inside one
+  blocking call for longer than the grace after your monitor expired (`hive wait` defaults to
+  the same 300 s) and a letter that arrives meanwhile pings the user although you are alive. A
+  longer grace closes that gap at the price of noticing a coordinator that is really gone that
+  much later. Arming a watcher ends the incident: the next one is alerted without waiting out
+  the old rate limit. The ping is a herdr toast when herdr shows toasts, the desktop
   notifier (`notify-send`, `osascript`) otherwise. hive never turns herdr toasts on — herdr
   cannot exempt drone panes, so its toasts would announce every turn every drone ends.
 - **Unread-mail reminder** — the watcher itself reminds you, in your session, of letters nobody took
@@ -125,11 +130,18 @@ reliability net behind the happy path:
 - **Reconciliation sweep** — a systemd user timer (installed by `install.sh`) runs `hive sweep`
   every 5 minutes: it raises the unwatched-mail alert, retries lost drone wake-ups and failed ssh
   forwards to a remote coordinator, raises a desktop reminder when coord mail sits unread past
-  `HIVE_MAIL_OVERDUE` (default 30 min) while the coordinator is not working (idle, blocked on a
-  dialog, gone — never mid-turn), and mails coord about drones silent with a task in flight —
+  `HIVE_MAIL_OVERDUE` (default 30 min) while a watcher lives and the coordinator is not working
+  (idle, blocked on a dialog), and mails coord about drones silent with a task in flight —
   dead, blocked, idle without a report, or working past `HIVE_WORKING_WARN` (default 60 min). Alerts
   re-fire at most every `HIVE_SWEEP_RENOTIFY` (default 30 min); `hive kill` marks the drone concluded
   so its corpse stops alarming, and a new spawn/task resets the verdicts.
+  A coordinator mid-turn keeps the overdue reminder quiet only until the oldest letter is
+  `HIVE_MAIL_OVERDUE_BUSY` old (default 7200 s): a pane that reports `working` for two hours over
+  waiting mail is stuck — a hung tool call, a retry loop — and nothing else would tell the user.
+  Every alert the sweep raises for the user leaves a line in its output
+  (`journalctl --user -u hive-sweep`), marked `NOT delivered` when neither herdr nor a desktop
+  notifier took it; such an alert is not rate-limited and the next sweep tries again. These
+  settings are whole seconds; anything else falls back to the default with a line on stderr.
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
 they have `hive send`, because only that reaches the mailbox and passes through the safeguards.
@@ -466,7 +478,7 @@ switches it to `--dangerously-skip-permissions`, so the boundaries must be hard 
 | first-run dialog in swarm mode | first spawn on a fresh machine | `hive spawn` handles it itself, like the trust dialog |
 | swarm stands still, no mail at all | drone hook failed, or drone hung/died mid-turn | the sweep mails coord within ~5 min (`SWEEP: ...`); impatient? `hive sweep` by hand, then `hive peek` |
 | no `HIVE-MAIL` notifications at all | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
-| the user gets a desktop ping for every drone turn | herdr's own toasts or sounds for background agents (`[ui.toast] delivery` on, `[ui.sound]` on) — herdr cannot limit them to your pane | tell the user: `delivery = "off"` and `[ui.sound] enabled = false` in the herdr config silence them; hive's own alerts fall back to the desktop notifier |
+| the user gets a desktop ping for every drone turn | herdr's own toasts or sounds for background agents (`[ui.toast] delivery` on, `[ui.sound]` on) — herdr cannot limit them to your pane | tell the user: `delivery = "off"` and `[ui.sound] enabled = false` in the herdr config silence them, after `herdr server reload-config` when the server is running; hive's own alerts fall back to the desktop notifier |
 | `HIVE-WATCH: taken over by another watcher` | armed twice, or another session took the watch | nothing to do if that was you; otherwise `hive coord` + re-arm in the session that should coordinate |
 
 ## Corpses and cleanup

@@ -32,10 +32,8 @@ esac
 # (protocol_mismatch) — until the server restarts, hive cannot reach a single pane.
 # Output captured first: with pipefail, 'grep -q' closing the pipe early could fail herdr's write.
 HERDR_SERVER_STATUS=$(herdr status server 2>/dev/null || true)
-HERDR_REACHABLE=0
 if grep -q '^status: running' <<<"$HERDR_SERVER_STATUS"; then
   if herdr workspace list >/dev/null 2>&1; then
-    HERDR_REACHABLE=1
     ok "herdr server reachable"
   else
     warn "the running herdr server rejects this client (older than the client?) — hive will not work until it restarts: 'herdr server stop' (ends every pane process), then 'herdr'"
@@ -81,39 +79,20 @@ echo "== 5/9 Alerts for the human =="
 # per-pane switch, so they would announce every turn every drone ends. Read-only — the config is
 # yours. The same lookup herdr does: HERDR_CONFIG_PATH, else the XDG config directory.
 HERDR_CONFIG="${HERDR_CONFIG_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml}"
-# Prints "<toast delivery> <sound for Claude Code agents: on|off>", herdr's defaults filled in.
-HERDR_PINGS=$(python3 - "$HERDR_CONFIG" <<'PINGSPY' 2>/dev/null
-import sys
-try:
-    import tomllib                          # Python 3.11+
-    try:
-        with open(sys.argv[1], "rb") as f:
-            cfg = tomllib.load(f)
-    except FileNotFoundError:
-        cfg = {}                            # no config: herdr's defaults
-    def table(d, *keys):
-        for k in keys:
-            d = d.get(k) if isinstance(d, dict) else None
-        return d if isinstance(d, dict) else {}
-    delivery = table(cfg, "ui", "toast").get("delivery") or "off"
-    sound = table(cfg, "ui", "sound")
-    claude = table(cfg, "ui", "sound", "agents").get("claude", "default")
-    on = claude == "on" or (claude != "off" and sound.get("enabled", True) is not False)
-    print(delivery, "on" if on else "off")
-except Exception:
-    print("unknown unknown")
-PINGSPY
-) || HERDR_PINGS="unknown unknown"
+# "<toast delivery> <sound for Claude Code agents: on|off>", herdr's defaults filled in.
+HERDR_PINGS=$(python3 "$SRC/lib/herdr-pings.py" "$HERDR_CONFIG" 2>/dev/null) || HERDR_PINGS="unknown unknown"
 read -r TOAST SOUND <<<"$HERDR_PINGS"
+# A running herdr server keeps the config it started with until told to read it again.
+HERDR_RELOAD="then 'herdr server reload-config' for a running server"
 case "$TOAST" in
   off)     ok "herdr toasts off — drones end their turns without a desktop notification" ;;
   unknown) warn "could not read [ui.toast] delivery from $HERDR_CONFIG" ;;
-  *)       warn "herdr toasts are on ([ui.toast] delivery = \"$TOAST\" in $HERDR_CONFIG): herdr notifies you of every turn every drone ends and cannot exempt drone panes. hive does not need them — set delivery = \"off\" to silence the drones (earlier installers set \"system\" themselves)" ;;
+  *)       warn "herdr toasts are on ([ui.toast] delivery = \"$TOAST\" in $HERDR_CONFIG): herdr notifies you of every turn every drone ends and cannot exempt drone panes. hive does not need them — set delivery = \"off\" to silence the drones (earlier installers set \"system\" themselves), $HERDR_RELOAD" ;;
 esac
 case "$SOUND" in
   off)     ok "herdr sounds off for Claude Code agents" ;;
   unknown) : ;;
-  *)       warn "herdr plays a sound for every turn every drone ends (background workspaces) — [ui.sound] enabled = false, or [ui.sound.agents] claude = \"off\", in $HERDR_CONFIG silences it" ;;
+  *)       warn "herdr plays a sound for every turn every drone ends (background workspaces) — [ui.sound] enabled = false, or [ui.sound.agents] claude = \"off\", in $HERDR_CONFIG silences it, $HERDR_RELOAD" ;;
 esac
 if NOTIFIER=$(command -v notify-send || command -v osascript); then
   ok "desktop notifier for hive's alerts: $NOTIFIER"
