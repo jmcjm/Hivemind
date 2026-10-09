@@ -19,6 +19,9 @@ command -v python3 >/dev/null || die "python3 missing"
 command -v flock  >/dev/null || die "flock missing (util-linux package)"
 ok "herdr $(herdr --version 2>/dev/null | awk '{print $2}')"
 ok "claude $(claude --version 2>/dev/null | awk '{print $1}')"
+# Optional: an account's limits are read from a throwaway tmux session, nothing else uses tmux.
+if command -v tmux >/dev/null; then ok "tmux $(tmux -V 2>/dev/null | awk '{print $2}')"
+else warn "tmux missing — optional, needed only to read account limits ('hive usage', 'hive accounts')"; fi
 HERDR_MAJOR_MINOR=$(herdr --version 2>/dev/null | awk '{print $2}' | cut -d. -f1,2)
 case "$HERDR_MAJOR_MINOR" in
   0.8|0.9) : ;;
@@ -44,7 +47,7 @@ fi
 echo "== 2/9 Skill files =="
 mkdir -p "$SKILL_DST"
 for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-inject.sh \
-         coord-compact-brief.sh coord-creed.md drone-settings.json SKILL.md; do
+         coord-compact-brief.sh coord-creed.md drone-settings.json accounts.conf.example SKILL.md; do
   if [ -e "$SKILL_DST/$f" ] && ! cmp -s "$SRC/skill/$f" "$SKILL_DST/$f"; then
     cp "$SKILL_DST/$f" "$SKILL_DST/$f.bak-$STAMP"
     warn "existing $f archived as $f.bak-$STAMP"

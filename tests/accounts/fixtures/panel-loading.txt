@@ -1,0 +1,44 @@
+
+  ⎿  SessionStart:startup says: example hook output
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◉ xhigh · /effort ▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0000
+   Total duration (API):  0s
+   Total duration (wall): 5s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+
+   Plugin skill-listing footprint
+   What each plugin's skill descriptions add to the system prompt (cached input after the first turn). Agents and MCP tools not yet counted.
+
+   example-plugin-a            5 skills · ~140 tok/turn
+   example-plugin-b            2 skills · ~53 tok/turn
+   example-plugin-c            1 skill · ~30 tok/turn
+
+   Total                       ~223 tok/turn
+
+   Current session
+   █████████████████▌                                 35% used
+   Resets 4:10pm (Europe/Berlin)
+
+   Current week (all models)
+   █████                                              10% used
+   Resets Oct 15, 9am (Europe/Berlin)
+
+   Current week (Fable)
+                                                      0% used
+   Resets Oct 15, 9am (Europe/Berlin)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Scanning local sessions…
+
+   Usage credits
+   Usage credits are off · /usage-credits to turn them on
+
+   Esc to cancel

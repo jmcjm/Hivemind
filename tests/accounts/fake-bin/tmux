@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Stand-in for tmux in tests/accounts: no session ever starts, no Claude Code runs.
+# State lives in $FAKE_TMUX_DIR; every call is appended to $FAKE_TMUX_DIR/log.
+#   new-session    records which account the session belongs to (from the CLAUDE_CONFIG_DIR in the command)
+#   send-keys      '/usage' followed by Enter opens the panel
+#   capture-pane   the prompt screen, then $FAKE_PANELS/<account>.txt once the panel is open
+#   kill-session   forgets the session
+#   list-sessions  the names of the sessions that exist
+# Targets are matched like the real tmux matches them: "=name" (and "=name:" for a pane) is that
+# session exactly, a bare "name" is a PREFIX and hits the first session whose name starts with it.
+# $FAKE_PANELS/<account>.noprompt makes the session never show a prompt (a Claude Code that hangs),
+# $FAKE_PANELS/<account>.login makes it open on the login selector (a logged-out account),
+# $FAKE_PANELS/<account>.nosession makes new-session fail after a second (no session ever exists).
+set -u
+dir="${FAKE_TMUX_DIR:?}"; panels="${FAKE_PANELS:?}"
+sub="${1:-}"; shift || true
+target=""; args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in -t|-s) target="${args[i+1]}" ;; esac
+done
+ses="$target"
+if [ "$sub" != new-session ] && [ -n "$target" ]; then
+  if [ "${target:0:1}" = "=" ]; then
+    ses="${target#=}"; ses="${ses%:}"
+  else
+    ses=""
+    for f in "$dir/${target%:}"*.account; do
+      [ -f "$f" ] && { ses="$(basename "$f" .account)"; break; }
+    done
+  fi
+fi
+case "$sub" in
+  new-session)
+    cmd="${args[-1]}"; acc=default
+    [[ "$cmd" =~ CLAUDE_CONFIG_DIR=[^[:space:]]*/\.claude-([a-z0-9_-]+) ]] && acc="${BASH_REMATCH[1]}"
+    [ -f "$panels/$acc.nosession" ] && { sleep 1; exit 1; }
+    echo "$acc" > "$dir/$ses.account"
+    echo "new $ses $acc" >> "$dir/log" ;;
+  list-sessions)
+    for f in "$dir"/*.account; do [ -f "$f" ] && basename "$f" .account; done ;;
+  send-keys)
+    [ -f "$dir/$ses.account" ] || exit 1
+    key="${args[-1]}"
+    [ "$key" = /usage ] && : > "$dir/$ses.typed"
+    [ "$key" = Enter ] && [ -f "$dir/$ses.typed" ] && : > "$dir/$ses.usage"
+    echo "keys $ses $key" >> "$dir/log" ;;
+  capture-pane)
+    [ -f "$dir/$ses.account" ] || exit 1
+    acc=$(cat "$dir/$ses.account")
+    [ -f "$panels/$acc.noprompt" ] && { echo "starting…"; exit 0; }
+    [ -f "$panels/$acc.login" ] && { printf ' Select login method:\n\n ❯ 1. Claude account with subscription\n   2. Anthropic Console account\n'; exit 0; }
+    if [ -f "$dir/$ses.usage" ] && [ -f "$panels/$acc.txt" ]; then cat "$panels/$acc.txt"
+    else printf '\n❯ \n'; fi ;;
+  kill-session)
+    [ -f "$dir/$ses.account" ] || exit 1
+    echo "kill $ses" >> "$dir/log"
+    rm -f "$dir/$ses".account "$dir/$ses".typed "$dir/$ses".usage ;;
+esac
+exit 0
