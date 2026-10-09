@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stand-in for ssh: records the call to $FAKE_HERDR_LOG and fails like a host that cannot be
+# reached, so no test ever opens a connection. The letter body hive pipes in is read and dropped.
+printf '%s\n' "ssh $*" >> "${FAKE_HERDR_LOG:?FAKE_HERDR_LOG must be set}"
+cat > /dev/null
+exit 255

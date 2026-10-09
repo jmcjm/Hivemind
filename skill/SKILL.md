@@ -120,10 +120,11 @@ reliability net behind the happy path:
   the same 300 s) and a letter that arrives meanwhile pings the user although you are alive. A
   longer grace closes that gap at the price of noticing a coordinator that is really gone that
   much later. Arming a watcher ends the incident: the next one is alerted without waiting out
-  the old rate limit. The ping goes through the desktop notifier (`notify-send`, `osascript`);
-  only a machine without one gets a herdr toast instead, which herdr may not display (see
-  "herdr technicalities"). hive never turns herdr toasts on — herdr cannot exempt drone panes,
-  so its toasts would announce every turn every drone ends.
+  the old rate limit. The ping goes through the desktop notifier: `notify-send`, then
+  `osascript` when the first is missing or fails. Only a machine with neither gets a herdr toast
+  instead, which herdr may not display (see "herdr technicalities"). hive never turns herdr
+  toasts on — herdr cannot exempt drone panes, so its toasts would announce every turn every
+  drone ends.
 - **Unread-mail reminder** — the watcher itself reminds you, in your session, of letters nobody took
   with `hive inbox` for `HIVE_MAIL_REMIND` (default 600 s): `HIVE-MAIL reminder: N unread, oldest
   M min`. Answer it with `hive inbox`, like any `HIVE-MAIL` line.
@@ -140,9 +141,12 @@ reliability net behind the happy path:
   `HIVE_MAIL_OVERDUE_BUSY` old (default 7200 s): a pane that reports `working` for two hours over
   waiting mail is stuck — a hung tool call, a retry loop — and nothing else would tell the user.
   Every alert the sweep raises for the user leaves a line in its output
-  (`journalctl --user -u hive-sweep`), marked `NOT delivered` when the desktop notifier failed
-  (or there is none and herdr showed nothing); such an alert is not rate-limited and the next
-  sweep tries again. These
+  (`journalctl --user -u hive-sweep`) that names the channel — `via notify-send`, or `via herdr
+  toast` with the reminder that herdr may have displayed nothing. It is marked `NOT delivered`
+  when the desktop notifier failed (or there is none and herdr showed nothing); such an alert is
+  not rate-limited and the next sweep tries again. A sweep run from cron instead of the systemd
+  timer needs the session bus in its environment (`DBUS_SESSION_BUS_ADDRESS`), or `notify-send`
+  fails every time. These
   settings are whole seconds; anything else falls back to the default with a line on stderr.
 
 `hive say` is your channel to a drone (prompt injection). Drones do **not** use it among themselves —
@@ -224,7 +228,7 @@ Traps:
 
 ### Which account a drone lands on — `hive accounts`
 
-`~/.herdr-hive/accounts.conf` lists the accounts in the owner's order. With it in place, a `spawn`
+`~/.herdr-hive/accounts.conf` lists the accounts in the user's order of preference. With it in place, a `spawn`
 without `--account` (and without `HIVE_ACCOUNT`) picks the account itself and prints why, and a
 `revive` moves a drone off an account that has run out of room. Without the file nothing changes:
 a drone stays on the default account.
@@ -259,6 +263,7 @@ spare    claude  3     week 90%       s@example.com    -        -               
 ```
 
 EMAIL is the login each account's own `.claude.json` records — it tells two config dirs apart.
+ENGINE is the agent an account runs; hive drives only Claude Code, so every row says `claude`.
 
 - **The pick**: the lowest `prio` among the accounts under their threshold. When none is, the first
   over-threshold account not marked `hard` — a LAST RESORT, and the output says so. Never: `disabled`,
@@ -286,8 +291,9 @@ EMAIL is the login each account's own `.claude.json` records — it tells two co
 - **A spawn never picks on old numbers.** A measurement older than `max_age` minutes is re-measured
   before the pick, under a lock, so a burst of spawns measures once. It cannot hang, but the bound is
   not seconds: each step (Claude Code starting, the panel loading) is limited by `HIVE_USAGE_TIMEOUT`
-  (default 45 s), so one hanging account costs a spawn up to ~95 s once per `max_age`, and a second
-  spawn waits for the first one's measurement (up to 150 s) instead of measuring again.
+  (default 45 s, whole seconds; `hive usage` obeys it too), so one hanging account costs a spawn
+  up to ~95 s once per `max_age`, and a second spawn waits for the first one's measurement (up to
+  twice the timeout plus 60 s — 150 s by default) instead of measuring again.
 - **A broken `accounts.conf` refuses spawn and revive** without `--account` — loudly, with the line
   number. `--account NAME` and `HIVE_ACCOUNT=NAME` do not read the file and keep working.
 
@@ -310,15 +316,20 @@ Traps:
   `tests/accounts/test-accounts.sh` (no real sessions).
 - **A logged-out account is `UNAVAILABLE`, not a timeout.** A dead token makes Claude Code open on the
   login selector, whose cursor is the same `❯` as the prompt; the measurement recognises the selector
-  and types nothing into it.
-- **The measurement runs in `$HOME`**, where no project hooks or MCP servers load, and pre-trusts it
-  in the measured account's `.claude.json` (as `spawn` does for a drone's cwd), so no trust dialog
-  stands between hive and the panel.
+  and types nothing into it. The same goes for an account that never finished onboarding, the
+  default one included: it is not measured at all.
+- **The measurement runs in `~/.herdr-hive/usage-cwd`**, a directory of hive's own: empty, so no
+  project hooks, MCP servers or `CLAUDE.md` load there. hive pre-trusts that directory, and no
+  other, in the measured account's `.claude.json`, so no trust dialog stands between it and the
+  panel. Never `$HOME`: Claude Code looks for trust in the parent directories too, so a trusted
+  home would cover every directory under it that is not inside a git repository. `hive usage
+  --cwd DIR` measures elsewhere, and then only in a directory the account trusts already.
 - **A burst lands on one account.** The pick is by priority, not by load: five spawns in a minute all
   take the same account, and its numbers move only at the next measurement.
 - **Measurement sessions are `hive-usage-<pid>-<account>` in tmux.** A hive that exits, or is killed by
   TERM/INT/HUP, kills its own; a session orphaned by SIGKILL is collected by the next measurement
-  (its pid is dead). `tmux ls | grep hive-usage` outside a measurement should be empty.
+  (its pid is dead), and so is a `hive-usage-<pid>` left by a version from before accounts.
+  `tmux ls | grep hive-usage` outside a measurement should be empty.
 
 ## The machine gate — one window for anything that eats the whole machine
 
@@ -539,9 +550,9 @@ about whether the work succeeded.
 - `herdr notification show` answering `"shown": true` does not mean anybody saw it. The server
   says so once it has handed the notification to an attached client; the client then follows its
   own `[ui.toast] delivery` — `"off"` drops it, `"herdr"` draws it inside the terminal, only
-  `"terminal"` and `"system"` leave herdr. `"shown": false` comes with no client attached or
-  under the API's rate limit. That is why hive's alerts use the desktop notifier and ask herdr
-  only where there is none.
+  `"terminal"` and `"system"` leave herdr. `"shown": false` comes with no client attached,
+  under the API's rate limit, or when the write to every client failed. That is why hive's
+  alerts use the desktop notifier and ask herdr only where there is none.
 - The `herdr integration install claude` integration (a `SessionStart` hook) reports the
   `session_id` and transcript path to herdr — that is what makes `revive` possible. Check:
   `herdr integration status`. A drone's session id is also visible in `herdr agent get <drone>`

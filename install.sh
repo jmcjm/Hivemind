@@ -161,7 +161,9 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
     warn "could not enable hive-sweep.timer — run: systemctl --user enable --now hive-sweep.timer"
   fi
 else
-  warn "no systemd user session — schedule '$SKILL_DST/hive sweep' yourself (cron: */5 * * * *)"
+  # cron starts its jobs without the session bus, and without it notify-send cannot reach the
+  # desktop: every alert of the sweep would end as NOT delivered.
+  warn "no systemd user session — schedule the sweep yourself. On Linux give it the session bus, or its alerts cannot reach the desktop: */5 * * * * DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus $SKILL_DST/hive sweep"
 fi
 
 echo "== 8/9 CLAUDE.md entry =="

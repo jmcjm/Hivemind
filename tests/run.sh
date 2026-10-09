@@ -310,15 +310,26 @@ t_alert_goes_to_the_desktop_whatever_herdr_says() {
 }
 
 t_alert_desktop_failure_is_not_covered_by_herdr() {
-  # notify-send is there and fails (no session bus): the alert did not go out, and herdr's
-  # "shown" does not pass for it.
+  # notify-send is there and fails (no session bus), and there is no osascript: the alert did not
+  # go out, and herdr's "shown" does not pass for it.
   coord_gone
-  FAKE_NOTIFY_FAIL=1 send_coord kafka done "first"
+  PATH="$(path_without osascript)" FAKE_NOTIFY_FAIL=1 send_coord kafka done "first"
   [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "a failed alert left its rate-limit marker"
   assert_not_contains "$FAKE_HERDR_LOG" "notification show"
   send_coord sql done "second"                            # the notifier works again: no rate limit in the way
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 2
   [ -e "$HIVE_DIR/.stranded-notice" ] || fail "a delivered alert left no rate-limit marker"
+}
+
+t_alert_falls_through_to_osascript_when_notify_send_fails() {
+  # A notify-send with no notification service behind it (libnotify from a package manager on
+  # macOS) must not keep the alert from the notifier that works.
+  coord_gone
+  FAKE_NOTIFY_FAIL=1 send_coord kafka done "finished"
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
+  assert_count "$FAKE_HERDR_LOG" "osascript -e on run argv" 1
+  assert_not_contains "$FAKE_HERDR_LOG" "notification show"
+  [ -e "$HIVE_DIR/.stranded-notice" ] || fail "osascript took the alert, yet no rate-limit marker"
 }
 
 t_alert_uses_osascript_without_notify_send() {
@@ -383,7 +394,28 @@ t_sweep_notifies_when_unwatched() {
   "$HIVE" sweep > "$T/out"
   assert_count "$FAKE_HERDR_LOG" "notify-send" 1
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
-  assert_contains "$T/out" "sweep: unwatched-mail alert (1 letters)"
+  assert_contains "$T/out" "sweep: unwatched-mail alert (1 letters) via notify-send"
+}
+
+t_sweep_names_a_herdr_toast_for_what_it_is() {
+  # No desktop notifier: the alert is a herdr toast, and "shown" is all herdr says — also for a
+  # toast its client drops. The journal must not read as if somebody had seen it.
+  coord_gone
+  mail_aged '-10 minutes'
+  rm -f "$HIVE_DIR/.stranded-notice"
+  PATH="$(path_without notify-send osascript)" "$HIVE" sweep > "$T/out"
+  assert_contains "$T/out" 'sweep: unwatched-mail alert (1 letters) via herdr toast (herdr says shown; nothing is displayed when [ui.toast] delivery is "off")'
+}
+
+t_sweep_rate_limited_unwatched_alert_prints_nothing() {
+  # An alert went out a moment ago: this sweep sends nothing, and says nothing either — a line
+  # here would read as a second alert.
+  coord_gone
+  mail_aged '-10 minutes'                                 # alerts through the send path, marker left
+  : > "$FAKE_HERDR_LOG"
+  "$HIVE" sweep > "$T/out"
+  [ "$(alerts)" = 0 ] || fail "alerted again inside the rate limit"
+  [ ! -s "$T/out" ] || fail "the sweep reported an alert it did not send: $(cat "$T/out")"
 }
 
 t_sweep_reports_alert_nobody_saw() {
@@ -392,7 +424,7 @@ t_sweep_reports_alert_nobody_saw() {
   coord_gone
   mail_aged '-10 minutes'
   rm -f "$HIVE_DIR/.stranded-notice"
-  FAKE_NOTIFY_FAIL=1 "$HIVE" sweep > "$T/out"
+  PATH="$(path_without osascript)" FAKE_NOTIFY_FAIL=1 "$HIVE" sweep > "$T/out"
   assert_contains "$T/out" "sweep: unwatched-mail alert NOT delivered (1 letters)"
   [ ! -e "$HIVE_DIR/.stranded-notice" ] || fail "an alert nobody saw left its rate-limit marker"
 }
@@ -442,7 +474,7 @@ t_sweep_overdue_alerts_when_coordinator_stuck() {
   : > "$FAKE_HERDR_LOG"
   FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/out"
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread for 40 min" 1
-  assert_contains "$T/out" "sweep: overdue mail reminder (1 letters, 40 min old)"
+  assert_contains "$T/out" "sweep: overdue mail reminder (1 letters, 40 min old) via notify-send"
 }
 
 t_sweep_overdue_waits_for_threshold() {
@@ -456,9 +488,39 @@ t_sweep_overdue_waits_for_threshold() {
 t_sweep_overdue_reminder_nobody_saw() {
   mail_aged '-40 minutes'
   touch "$HIVE_DIR/.watch-coord"
-  FAKE_NOTIFY_FAIL=1 FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/out"
+  PATH="$(path_without osascript)" FAKE_NOTIFY_FAIL=1 FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/out"
   assert_contains "$T/out" "sweep: overdue mail reminder NOT delivered (1 letters, 40 min old)"
   [ ! -e "$HIVE_DIR/.overdue-notice" ] || fail "a reminder nobody saw started the re-nag interval"
+}
+
+t_sweep_overdue_renags_once_per_interval() {
+  mail_aged '-40 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=blocked "$HIVE" sweep >/dev/null
+  FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/second"
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread" 1
+  [ ! -s "$T/second" ] || fail "the sweep reported a reminder it held back: $(cat "$T/second")"
+  touch -d '-31 minutes' "$HIVE_DIR/.overdue-notice"      # HIVE_SWEEP_RENOTIFY (30 min) has passed
+  FAKE_AGENT_STATUS=blocked "$HIVE" sweep >/dev/null
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread" 2
+  "$HIVE" inbox >/dev/null                                # the mail is read: the next overdue letter is a new matter
+  mail_aged '-40 minutes'
+  FAKE_AGENT_STATUS=blocked "$HIVE" sweep >/dev/null
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread" 3
+}
+
+t_sweep_overdue_remote_coordinator() {
+  # The coordinator lives on another machine and the ssh forward keeps failing: the letters wait
+  # here, and no watcher or pane on this machine can vouch for them — the overdue alert goes out
+  # whatever their state.
+  echo "coordhost" > "$HIVE_DIR/coord.remote"
+  mail_aged '-40 minutes'
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=working "$HIVE" sweep > "$T/out"
+  assert_contains "$FAKE_HERDR_LOG" "ssh -o BatchMode=yes -o ConnectTimeout=5 coordhost"
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread for 40 min" 1
+  [ "$(letters)" = 1 ] || fail "a letter whose forward failed left the mailbox"
 }
 
 t_sweep_bad_overdue_falls_back_to_default() {
@@ -583,7 +645,7 @@ trusted() {  # trusted <config.json> <dir> — True when the dir is pre-trusted 
 }
 
 t_spawn_default_account_sets_no_config_dir() {
-  mkdir -p "$T/home/work"
+  mkdir -p "$T/home/work"; echo '{}' > "$T/home/.claude.json"
   # The caller's CLAUDE_CONFIG_DIR (a coordinator on another account) must not leak into the drone.
   CLAUDE_CONFIG_DIR="$T/elsewhere" hive_home spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 \
     || fail "spawn failed: $(cat "$T/out")"
@@ -593,6 +655,23 @@ t_spawn_default_account_sets_no_config_dir() {
   [ -z "$(drone_meta_field kafka account)" ] || fail "meta account: $(drone_meta_field kafka account)"
   [ "$(trusted "$T/home/.claude.json" "$T/home/work")" = True ] || fail "cwd not trusted in ~/.claude.json"
   [ ! -e "$T/elsewhere" ] || fail "the caller's CLAUDE_CONFIG_DIR was written to"
+}
+
+t_spawn_trust_never_creates_a_config() {
+  # No ~/.claude.json: the account never ran, and a config holding nothing but a trust entry is
+  # not hive's to put there. The spawn goes on; its bootstrap answers the dialog if one shows.
+  mkdir -p "$T/home/work"
+  hive_home spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  [ ! -e "$T/home/.claude.json" ] || fail "a config was created: $(cat "$T/home/.claude.json")"
+}
+
+t_spawn_trust_keeps_a_symlinked_config_a_link() {
+  mkdir -p "$T/home/work" "$T/dotfiles"; echo '{"theme":"dark"}' > "$T/dotfiles/claude.json"
+  ln -s "$T/dotfiles/claude.json" "$T/home/.claude.json"
+  hive_home spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  [ -L "$T/home/.claude.json" ] || fail "the symlinked config was replaced by a regular file"
+  [ "$(trusted "$T/dotfiles/claude.json" "$T/home/work")" = True ] || fail "cwd not trusted at the link's target"
+  assert_contains "$T/dotfiles/claude.json" '"theme": "dark"'
 }
 
 t_spawn_named_account() {
