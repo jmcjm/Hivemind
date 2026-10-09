@@ -5,6 +5,9 @@
 # Safeguards:
 #  - runs ONLY when $HIVE_DRONE is set (spawn injects it) -> the coordinator session never fires it
 #  - all the heavy lifting (mailbox, locks, empty prompt) lives in `hive send` — this only reports
+#  - it reports to the coordinator, never to the human: a desktop ping here would fire on every turn
+#    of every drone while the coordinator listens. Mail nobody hears reaches the human through
+#    `hive send` (see coord_unheard in hive), and only then.
 set -uo pipefail
 
 [ -n "${HIVE_DRONE:-}" ] || exit 0          # not a drone -> silence
@@ -43,10 +46,8 @@ if [ "$KIND_ARG" = decision ]; then
     *"waiting for your input"*) exit 0 ;;
   esac
   subject="needs a decision"
-  herdr notification show "Drone $HIVE_DRONE awaits a decision" --sound request >/dev/null 2>&1
 else
   subject="finished a turn (report: $status)"
-  herdr notification show "Drone $HIVE_DRONE finished ($status)" --sound done >/dev/null 2>&1
 fi
 
 body="${note:-}"

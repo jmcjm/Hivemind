@@ -1,4 +1,7 @@
 {
+  "preferredNotifChannel": "notifications_disabled",
+  "inputNeededNotifEnabled": false,
+  "agentPushNotifEnabled": false,
   "hooks": {
     "Stop": [
       {
