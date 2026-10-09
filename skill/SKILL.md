@@ -34,6 +34,7 @@ hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives th
 hive rename <old> <new>            rename a drone and its workspace
 hive revive <name> [--account NAME]  resurrection with full conversation history (--resume); --account moves it
 hive adopt  <name> <pane_id> [--account NAME]  pull a Claude Code started outside hive into the swarm
+hive accounts [--refresh] [--pick] accounts table: limits, resets, status, and the account a spawn takes
 hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
 hive sweep                         reconciliation pass — retry lost wake-ups, surface silent drones
 ```
@@ -193,6 +194,104 @@ Traps:
   "default" drone on that account while `hive status` still says `default`.
 - **Folder trust is pre-seeded in the drone's account**, never in the caller's `CLAUDE_CONFIG_DIR` — a
   coordinator running on another account exports it into every command it runs.
+
+### Which account a drone lands on — `hive accounts`
+
+`~/.herdr-hive/accounts.conf` lists the accounts in the owner's order. With it in place, a `spawn`
+without `--account` (and without `HIVE_ACCOUNT`) picks the account itself and prints why, and a
+`revive` moves a drone off an account that has run out of room. Without the file nothing changes:
+a drone stays on the default account.
+
+What it needs:
+- **`tmux`** — a limit is read by opening a throwaway Claude Code session in tmux and typing `/usage`.
+  Without tmux every account is taken blind (see Traps).
+- **Every listed account ready to run**: `default` is `~/.claude`, any other name is `~/.claude-<name>`
+  set up as in the section above (logged in, onboarded, `projects` symlinked — only an account that
+  shares `projects/` can take over a drone on `revive`).
+- **The file itself.** A commented example sits next to `hive`:
+  `cp ~/.claude/skills/hivemind/accounts.conf.example ~/.herdr-hive/accounts.conf`, then edit.
+
+```
+max_age = 10                                    # minutes a /usage measurement stays good for a spawn
+account alt      prio=1  week_threshold=80      # lower prio = preferred; "alt" = ~/.claude-alt
+account default  prio=2  week_threshold=60  hard       # hard: over the threshold = never taken
+account spare    prio=3  disabled                      # disabled: never taken, never measured
+```
+
+**The threshold is on the weekly limit.** `week_threshold=80` reads "use this account up to 80% of
+its week" (default 90; 100 = until it is full). The session limit is a 5-hour window that comes back
+by itself, so it blocks an account only at 100%; `session_threshold=<percent>` makes it count earlier.
+
+```
+$ hive accounts
+usage from 4 min ago
+ACCOUNT  ENGINE  PRIO  THRESHOLD      EMAIL            SESSION  SESSION RESET            WEEK  WEEK RESET    STATUS
+alt      claude  1     week 80%       alt@example.com  57%      Oct 08 20:00 (in 3h42m)  98%   Oct 14 14:00  over threshold: week
+default  claude  2     week 60% hard  me@example.com   2%       Oct 08 21:10 (in 4h52m)  11%   Oct 15 09:00  available <- SELECTED
+spare    claude  3     week 90%       s@example.com    -        -                        -     -             disabled
+```
+
+EMAIL is the login each account's own `.claude.json` records — it tells two config dirs apart.
+
+- **The pick**: the lowest `prio` among the accounts under their threshold. When none is, the first
+  over-threshold account not marked `hard` — a LAST RESORT, and the output says so. Never: `disabled`,
+  `UNAVAILABLE` (session or week at 100%, or an account that is logged out) and an account over a
+  `hard` threshold. When nothing is left, spawn refuses and starts nothing — the message lists every
+  account with what blocks it and when it gets room again, and names the one that is first
+  (`First to get room: alt, Oct 08 18:40 (in 1h02m).`); `--account NAME` still forces one. STATUS
+  names the limit that decides: `over threshold: week`, `UNAVAILABLE: session 100%`.
+- **Precedence**: `--account` > `HIVE_ACCOUNT` > the pick. `HIVE_ACCOUNT=<name>` (including `default`)
+  switches the selection off — spawn uses that account, revive brings a drone back where it ran.
+  `--account` bypasses the selection whole, `disabled` and `hard` included: thresholds are enforced
+  only on the automatic pick.
+- **`hive revive` keeps a drone on its account for as long as that account has room.** A better
+  priority elsewhere is no reason to move, and neither is an account that could not be measured or
+  is not in `accounts.conf`. The drone moves only off an account that is over its threshold, full,
+  logged out or `disabled` — to the picked account, and only to one that sees its transcript (shared
+  `projects/`), so a move never loses the history. The output says `stays on X — <why>` or
+  `moves X -> Y — X has no room (<state>); Y: <why>`. When no account can take the drone, revive
+  refuses before closing anything and names the way out (`hive revive <name> --account X`).
+  `hive spawn <name> --resume` by hand stays put.
+- `hive accounts` only reads the cache (`~/.herdr-hive/usage-cache.json`); the header gives its age.
+  `--refresh` measures every enabled account in parallel — one throwaway tmux session each, a few
+  seconds in total. `--pick` prints what a spawn would take right now and why, measuring first if it
+  has to.
+- **A spawn never picks on old numbers.** A measurement older than `max_age` minutes is re-measured
+  before the pick, under a lock, so a burst of spawns measures once. It cannot hang, but the bound is
+  not seconds: each step (Claude Code starting, the panel loading) is limited by `HIVE_USAGE_TIMEOUT`
+  (default 45 s), so one hanging account costs a spawn up to ~95 s once per `max_age`, and a second
+  spawn waits for the first one's measurement (up to 150 s) instead of measuring again.
+- **A broken `accounts.conf` refuses spawn and revive** without `--account` — loudly, with the line
+  number. `--account NAME` and `HIVE_ACCOUNT=NAME` do not read the file and keep working.
+
+Traps:
+- **An account whose measurement fails is taken BLIND, after every measured one** — the reason line
+  starts with `BLIND`. Among the blind ones an account last seen over its threshold goes last: usage
+  only grows inside a window. A failed measurement is retried only after `max_age`, so a broken
+  account does not cost every spawn its timeout. Look at `hive accounts`: the status names the failure.
+- **The SELECTED mark and the pick come from one ranking**, so on the same stored numbers they cannot
+  disagree. Under a `STALE` header the mark is what a spawn takes if its measurement fails; a
+  measurement that succeeds may move it.
+- **A window whose reset time has passed counts as 0%** — the table shows the account as it stands
+  now, not as it was measured. Inside a window usage only grows, so an old `UNAVAILABLE` stays
+  `UNAVAILABLE` until its reset, while an old `available` is not trusted (re-measured, or blind).
+- **The parser reads two sections of the `/usage` panel: `Current session` and `Current week (all
+  models)`** (written against Claude Code 2.1.294). Per-model sections are ignored. A panel missing
+  either one is refused, not guessed, and saved to `~/.herdr-hive/usage-panel-<account>.txt` — that
+  is what a Claude Code update that renames them looks like, and the saved panel is the fixture for
+  teaching the parser. Tests with captured panels live in the repository:
+  `tests/accounts/test-accounts.sh` (no real sessions).
+- **A logged-out account is `UNAVAILABLE`, not a timeout.** A dead token makes Claude Code open on the
+  login selector, whose cursor is the same `❯` as the prompt; the measurement recognises the selector
+  and types nothing into it.
+- **The measurement runs in `$HOME`**, where no project hooks or MCP servers load, and pre-trusts it
+  in the measured account's `.claude.json` (as `spawn` does for a drone's cwd), so no trust dialog
+  stands between hive and the panel.
+- **A burst lands on one account.** The pick is by priority, not by load: five spawns in a minute all
+  take the same account, and its numbers move only at the next measurement.
+- **Measurement sessions are `hive-usage-<pid>-<account>` in tmux.** A hive that exits, or is killed by
+  TERM/INT/HUP, kills its own; a session orphaned by SIGKILL is collected by the next measurement
+  (its pid is dead). `tmux ls | grep hive-usage` outside a measurement should be empty.
 
 ## The machine gate — one window for anything that eats the whole machine
 

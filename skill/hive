@@ -322,6 +322,619 @@ except Exception:
 PY
 }
 
+# --- account selection ------------------------------------------------------
+# A fleet burns an account's limits in hours, so a new drone lands on the account that has room:
+# accounts.conf lists the accounts in the owner's order, usage-cache.json holds the last /usage
+# measurement of each, and 'hive accounts' shows both. Without accounts.conf nothing here runs and
+# a drone stays on the default account, as before.
+ACCOUNTS_CONF="$HIVE_DIR/accounts.conf"
+USAGE_CACHE="$HIVE_DIR/usage-cache.json"
+
+# usage_precheck <account> <cwd> — what must hold before a measurement: tmux, the directory, the
+# account. Says why on stderr; returns 3 when the account cannot run Claude Code at all, 1 otherwise.
+usage_precheck() {
+  command -v tmux >/dev/null || { echo "hive: usage: tmux not found" >&2; return 1; }
+  (cd "$2") 2>/dev/null || { echo "hive: usage: no such directory: $2" >&2; return 1; }
+  (account_dir "$1") >/dev/null || return 3     # in a subshell: account_dir dies, and only it may
+}
+
+# usage_capture <account> <cwd> <timeout> — prints the raw /usage panel of one account.
+# Starts a fresh `claude` in a tmux session (in a TRUSTED directory — the trust dialog is not answered
+# on purpose), types /usage, captures the panel and kills the session. Returns 3 when the account
+# cannot run Claude Code at all (not logged in, no config dir), 1 when the measurement failed.
+# MUST run in a subshell — $(...) or ( ... ) & — because the EXIT trap that kills the throwaway
+# session belongs to that subshell. The trap covers a hive that exits or is killed by TERM/INT/HUP;
+# sessions orphaned by SIGKILL are collected by usage_sweep at the next measurement.
+usage_capture() {
+  local account="$1" cwd="$2" timeout="$3"
+  usage_precheck "$account" "$cwd" || return $?
+  cwd=$(cd "$cwd" && pwd)   # absolute, because the trust key in .claude.json is the absolute path
+  local acc_dir; acc_dir=$(account_dir "$account")
+  # The measured account is set explicitly both ways: the caller's CLAUDE_CONFIG_DIR (a coordinator
+  # on a second account exports it) must not decide which account's limits get printed. A named
+  # account gets its cwd pre-trusted like a drone's — a fresh account trusts no folder at all.
+  local acc_env="-u CLAUDE_CONFIG_DIR"
+  if [ -n "$acc_dir" ]; then acc_env="CLAUDE_CONFIG_DIR=$(printf '%q' "$acc_dir")"; ensure_trusted "$cwd" "$acc_dir"; fi
+  # The account is part of the name: accounts are measured in parallel from one hive process.
+  # tmux matches a bare target by PREFIX — "-t …-ab" would hit the session of account "abc" — so
+  # every target is exact: "=name" for a session, "=name:" for its pane.
+  local ses="hive-usage-$$-$(account_label "$account")" out
+  tmux kill-session -t "=$ses" 2>/dev/null
+  # The name is expanded now: the trap fires after this function returned and its locals are gone.
+  trap "tmux kill-session -t $(printf '%q' "=$ses") 2>/dev/null" EXIT
+  # 120 rows: the limit sections sit under the plugin list, and a longer list must not push them
+  # off the captured screen.
+  tmux new-session -d -s "$ses" -x 200 -y 120 -c "$cwd" \
+    "env -u CLAUDECODE -u HIVE_DRONE -u HERDR_HIVE_ROLE $acc_env claude" || return 1
+  local i=0
+  while [ $i -lt "$timeout" ]; do
+    out=$(tmux capture-pane -t "=$ses:" -p 2>/dev/null)
+    case "$out" in
+      *"Yes, I trust this folder"*)
+        echo "hive: usage: $cwd is not a trusted folder for Claude Code — run from a trusted project or pass --cwd" >&2
+        return 1 ;;
+      *"Select login method"*)
+        # A credentials file with a dead token: Claude Code opens on the login selector, whose
+        # cursor is the same ❯ as the prompt. Typing /usage into it would start a login.
+        echo "hive: account '$(account_label "$account")' is logged out (Claude Code opens on the login screen) — run: ${acc_dir:+CLAUDE_CONFIG_DIR=$acc_dir }claude   (then /login)" >&2
+        return 3 ;;
+      *"❯"*) break ;;
+    esac
+    sleep 1; i=$((i+1))
+  done
+  [ $i -lt "$timeout" ] || { echo "hive: usage: claude did not start in ${timeout}s" >&2; return 1; }
+  sleep 2
+  tmux send-keys -t "=$ses:" '/usage'; sleep 1; tmux send-keys -t "=$ses:" Enter
+  # The panel is complete once the weekly section carries its percentage. A panel without a weekly
+  # section never gets there, so three polls of a panel that shows any percentage settle it too.
+  local seen=0
+  i=0
+  while [ $i -lt "$timeout" ]; do
+    out=$(tmux capture-pane -t "=$ses:" -p 2>/dev/null)
+    case "$out" in
+      *"Current week"*"% used"*) break ;;
+      *"% used"*) seen=$((seen+1)); [ "$seen" -ge 3 ] && break ;;
+    esac
+    sleep 1; i=$((i+1))
+  done
+  [ $i -lt "$timeout" ] || { echo "hive: usage: no /usage panel in ${timeout}s" >&2; return 1; }
+  printf '%s\n' "$out"
+}
+
+# accounts_py <subcommand> [args] — the accounts engine: config, cache, /usage parser, table, ranking.
+#   check                 validates accounts.conf (exit 2 when missing, 1 when broken)
+#   due <all|stale>       names of the enabled accounts to measure now
+#   store <dir> <name>... stores measurements: <dir>/<name>.panel|.err|.rc, written by accounts_refresh
+#   parse <file> [epoch]  parses one captured panel, prints JSON (the parser on its own, for the tests)
+#   table                 the 'hive accounts' table
+#   rank                  the accounts a spawn may take, best first: <name>\t<reason> per line
+#   room <name>           exit 0 when that account still has room for the drone running on it; prints why
+accounts_py() {
+  python3 - "$ACCOUNTS_CONF" "$USAGE_CACHE" "$@" <<'PY'
+import json, os, re, sys, tempfile, time
+from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
+conf_path, cache_path, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+HOME = os.path.expanduser('~')
+now = int(time.time())
+
+def fail(msg, code=1):
+    print('hive: accounts: ' + msg, file=sys.stderr)
+    sys.exit(code)
+
+# --- accounts.conf ---
+NAME = re.compile(r'^(default|[a-z0-9][a-z0-9_-]{0,31})$')
+FORMAT = '''one account per line, lower prio = preferred:
+
+  max_age = 10                                    # minutes a measurement stays good for a spawn
+  account alt      prio=1  week_threshold=80      # "alt" = ~/.claude-alt; 80% of the WEEKLY limit = over threshold
+  account default  prio=2  week_threshold=60  hard       # hard: over the threshold = never used
+  account spare    prio=3  disabled                      # disabled: never used, never measured
+
+The threshold is on the weekly limit (default 90). The session limit blocks an account only at 100%;
+session_threshold=<percent> makes it count as "over threshold" earlier.'''
+
+def load_conf():
+    try:
+        raw = open(conf_path, encoding='utf-8').read()
+    except FileNotFoundError:
+        fail(f'no config at {conf_path} — without it a drone stays on the default account.\n'
+             f'Create it, {FORMAT}', 2)
+    except (OSError, UnicodeDecodeError) as e:      # unreadable, a directory, not text
+        fail(f'{conf_path} cannot be read: {e}')
+    conf, errs = {'max_age': 10, 'accounts': []}, []
+    for no, line in enumerate(raw.splitlines(), 1):
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        m = re.match(r'^max_age\s*=\s*(\d+)$', line)
+        if m:
+            conf['max_age'] = int(m.group(1))
+            if conf['max_age'] < 1:
+                errs.append(f'line {no}: max_age is in minutes, 1 or more')
+            continue
+        tok = line.split()
+        if tok[0] != 'account' or len(tok) < 2:
+            errs.append(f'line {no}: expected "account <name> ..." or "max_age = <minutes>"')
+            continue
+        # The threshold belongs to the weekly limit. A session is a 5-hour window that comes back by
+        # itself, so by default it only counts when it is full (100 = no session threshold).
+        acc = {'name': tok[1], 'prio': None, 'week_threshold': 90, 'session_threshold': 100,
+               'hard': False, 'disabled': False, 'order': len(conf['accounts'])}
+        if not NAME.match(acc['name']):
+            errs.append(f'line {no}: account name {acc["name"]!r} rejected: default or [a-z0-9][a-z0-9_-]{{0,31}}')
+        if any(a['name'] == acc['name'] for a in conf['accounts']):
+            errs.append(f'line {no}: account {acc["name"]!r} is listed twice')
+        for t in tok[2:]:
+            key, _, val = t.partition('=')
+            val = val.rstrip('%')
+            if t in ('hard', 'disabled'):
+                acc[t] = True
+            elif key == 'prio' and val.isdigit():
+                acc['prio'] = int(val)
+            elif key in ('week_threshold', 'session_threshold') and val.isdigit() and 1 <= int(val) <= 100:
+                acc[key] = int(val)
+            else:
+                errs.append(f'line {no}: {t!r} not understood — prio=<n>, week_threshold=<1-100>, '
+                            f'session_threshold=<1-100>, hard, disabled')
+        conf['accounts'].append(acc)
+    if not conf['accounts'] and not errs:
+        errs.append('no "account" line')
+    if errs:
+        fail(f'{conf_path} is broken:\n  ' + '\n  '.join(errs) + f'\nFormat — {FORMAT}')
+    for a in conf['accounts']:
+        if a['prio'] is None:
+            a['prio'] = a['order'] + 1      # no prio = the position in the file
+    conf['accounts'].sort(key=lambda a: (a['prio'], a['order']))
+    return conf
+
+def limits(acc):
+    """The thresholds of an account as the human reads them: 'week 80%', plus the session one when set."""
+    return f'week {acc["week_threshold"]}%' + (
+        f', session {acc["session_threshold"]}%' if acc['session_threshold'] < 100 else '')
+
+def email(name):
+    path = os.path.join(HOME, '.claude.json' if name == 'default' else f'.claude-{name}/.claude.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            return (json.load(f).get('oauthAccount') or {}).get('emailAddress') or '-'
+    except Exception:
+        return '-'
+
+# --- usage-cache.json ---
+def clean(entry):
+    """One cache entry with every field of the type the rest of the engine relies on. Hive writes
+    them that way; a hand-edited file must end as 'no data', not as a traceback that refuses a spawn."""
+    if not isinstance(entry, dict):
+        return {}
+    num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    text = lambda v: v if isinstance(v, str) else None
+    out = {}
+    if None not in (num(entry.get('measured_at')), num(entry.get('session_pct')), num(entry.get('week_pct'))):
+        out['measured_at'] = entry['measured_at']
+        for key in ('session', 'week'):
+            out[key + '_pct'] = entry[key + '_pct']
+            out[key + '_reset'] = num(entry.get(key + '_reset'))
+            out[key + '_reset_text'] = text(entry.get(key + '_reset_text'))
+    if text(entry.get('error')):
+        out['error'], out['error_at'] = entry['error'], num(entry.get('error_at')) or 0
+        if entry.get('unusable') is True:
+            out['unusable'] = True
+    return out
+
+def load_cache():
+    try:
+        with open(cache_path, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get('accounts'), dict):
+            return {'accounts': {name: clean(entry) for name, entry in d['accounts'].items()}}
+    except Exception:
+        pass
+    return {'accounts': {}}
+
+def save_cache(cache):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache_path) or '.', prefix='.usage-cache.')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, cache_path)
+
+# --- the /usage panel ---
+# A limit section is three lines: its label, a bar ending in "N% used", and "Resets <when>".
+# Sections are found by label: the panel also prints lines like "93% of your usage was at >150k
+# context", which are not limits.
+SECTIONS = (('session', ('Current session',)),
+            ('week', ('Current week (all models)', 'Current week')))
+PCT = re.compile(r'(?<![\d.,])(\d{1,3})(?:[.,]\d+)?%\s*used')    # "35.5% used" is 35, never 5
+RESET = re.compile(r'^Resets\s+(?:(?P<mon>[A-Za-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2})(?:\s*,|\s+at)?\s+)?'
+                   r'(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap]m)?\s*(?:\((?P<tz>[^)]+)\))?\s*$', re.I)
+MONTHS = {m: i for i, m in enumerate('jan feb mar apr may jun jul aug sep oct nov dec'.split(), 1)}
+
+def reset_epoch(line, at):
+    """'Resets 4:10pm (Europe/Berlin)' / 'Resets Oct 15, 9am (Europe/Berlin)' -> epoch, None when not understood."""
+    m = RESET.match(line)
+    if not m:
+        return None
+    tz = None
+    if m['tz'] and ZoneInfo:
+        try:
+            tz = ZoneInfo(m['tz'].strip())
+        except Exception:
+            tz = None
+    base = datetime.fromtimestamp(at, tz)       # no zone on the panel = this machine's local time
+    hour, minute, ap = int(m['h']), int(m['m'] or 0), (m['ap'] or '').lower()
+    if ap:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ap == 'pm' else 0)
+    try:
+        if m['mon']:
+            month = MONTHS.get(m['mon'].lower())
+            if not month:
+                return None
+            when = base.replace(month=month, day=int(m['day']), hour=hour, minute=minute, second=0, microsecond=0)
+            if when < base - timedelta(days=1):     # the panel prints no year: "Jan 2" seen in December
+                when = when.replace(year=when.year + 1)
+        else:
+            when = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if when <= base - timedelta(minutes=1): # a bare time already behind us is tomorrow's
+                when += timedelta(days=1)
+    except ValueError:
+        return None
+    return int(when.timestamp())
+
+def parse_panel(text, at):
+    """-> (fields, None) or (None, why). Both sections are required: a panel that lost one is a
+    changed format, and guessing would report an exhausted account as free."""
+    lines = [l.strip() for l in text.splitlines()]
+    out, missing = {}, []
+    for key, labels in SECTIONS:
+        idx = next((i for lab in labels for i, l in enumerate(lines) if l == lab), None)
+        if idx is None:
+            missing.append(f'no "{labels[0]}" section')
+            continue
+        body = [l for l in lines[idx + 1:] if l][:2]
+        m = PCT.search(body[0]) if body else None
+        if not m:
+            missing.append(f'no percentage under "{lines[idx]}"')
+            continue
+        out[key + '_pct'] = int(m.group(1))
+        out[key + '_reset'] = out[key + '_reset_text'] = None
+        if len(body) > 1 and body[1].lower().startswith('resets'):
+            out[key + '_reset'] = reset_epoch(body[1], at)
+            out[key + '_reset_text'] = body[1][len('Resets'):].strip()
+    if missing:
+        return None, 'the /usage panel was not understood: ' + ', '.join(missing)
+    out['measured_at'] = at
+    return out, None
+
+# --- status ---
+def view(entry):
+    """The entry as it stands NOW: a window whose reset time has passed since the measurement is over."""
+    v = {'measured_at': entry.get('measured_at')}
+    for key in ('session', 'week'):
+        pct, reset, text = entry.get(key + '_pct'), entry.get(key + '_reset'), entry.get(key + '_reset_text')
+        if pct is not None and reset and reset <= now:
+            pct, reset, text = 0, None, None
+        v[key], v[key + '_reset'], v[key + '_reset_text'] = pct, reset, text
+    return v
+
+def status(acc, entry):
+    """-> (kind, text); kind: disabled | unusable | nodata | full | over_hard | over | ok."""
+    if acc['disabled']:
+        return 'disabled', 'disabled'
+    if entry.get('unusable'):
+        return 'unusable', 'UNAVAILABLE: ' + entry.get('error', 'account cannot run Claude Code')
+    v = view(entry)
+    if v['measured_at'] is None:
+        return 'nodata', 'no data' + (f' — measurement failed: {entry["error"]}' if entry.get('error') else '')
+    failed = f' — last measurement FAILED: {entry["error"]}' if entry.get('error') else ''
+    for key in ('week', 'session'):
+        if (v[key] or 0) >= 100:
+            return 'full', f'UNAVAILABLE: {key} 100%' + failed
+    over = [key for key in ('session', 'week') if (v[key] or 0) >= acc[key + '_threshold']]
+    if over and acc['hard']:
+        return 'over_hard', 'over threshold: ' + ', '.join(over) + ' (hard)' + failed
+    if over:
+        return 'over', 'over threshold: ' + ', '.join(over) + failed
+    return 'ok', 'available' + failed
+
+def blocked_until(acc, entry):
+    """When a full or over-a-hard-threshold account gets its room back: the latest reset among the
+    windows that block it. None when a reset time is unknown."""
+    v = view(entry)
+    resets = [v[key + '_reset'] for key in ('session', 'week')
+              if (v[key] or 0) >= (acc[key + '_threshold'] if acc['hard'] else 100)]
+    return max(resets) if resets and all(resets) else None
+
+def is_fresh(conf, entry):
+    return entry.get('measured_at') is not None and now - entry['measured_at'] <= conf['max_age'] * 60
+
+def rank(conf, cache):
+    """The accounts a spawn may take, best first, as (account, reason). One ranking serves the pick
+    and the table's SELECTED mark, so the two cannot disagree on the same stored numbers.
+    Measured within max_age: under the threshold by priority, then over it and not hard, by priority
+    (last resort). Behind them the accounts without a fresh measurement (blind): by priority those
+    last seen under their threshold or never measured, then those last seen over it. Usage only
+    grows inside a window, so an old 'over' is still over and an old 'full' is still full, while an
+    old 'available' is a guess. Never: disabled, unusable, full, over a hard threshold.
+    A spawn re-measures whatever is older than max_age before it asks."""
+    below, last_resort, blind, blind_over, passed = [], [], [], [], []
+    for acc in conf['accounts']:
+        entry = cache['accounts'].get(acc['name'], {})
+        kind, text = status(acc, entry)
+        v = view(entry)
+        numbers = f'session {v["session"]}%, week {v["week"]}%'
+        head = f'prio {acc["prio"]}'
+        ahead = f'; passed over: {", ".join(passed)}' if passed else ''
+        state = text.split(' — ')[0]
+        if kind == 'nodata' or (kind in ('ok', 'over') and not is_fresh(conf, entry)):
+            why = text if kind == 'nodata' else f'last measured {age(now - v["measured_at"])} ago ({numbers})'
+            (blind_over if kind == 'over' else blind).append(
+                (acc, f'BLIND — no fresh usage data: {why}; {head}{ahead}'))
+            state = f'{state}, stale' if kind == 'over' else 'no fresh usage data'
+        elif kind == 'ok':
+            below.append((acc, f'{head}, {numbers}, under its threshold ({limits(acc)}){ahead}'))
+            continue        # taken in its turn, so never "passed over"
+        elif kind == 'over':
+            last_resort.append((acc, f'LAST RESORT — no account is under its threshold; {head}, {numbers}, '
+                                     f'its threshold ({limits(acc)}) is not hard{ahead}'))
+        passed.append(f'{acc["name"]} ({state})')
+    return below + last_resort + blind + blind_over
+
+def room(conf, cache, name):
+    """Does the account a drone runs on still have room for it? -> (yes, why). A drone leaves its
+    account only on evidence: an account outside accounts.conf, or one without a measurement, keeps it."""
+    acc = next((a for a in conf['accounts'] if a['name'] == name), None)
+    if acc is None:
+        return True, f'{name} is not in accounts.conf'
+    entry = cache['accounts'].get(name, {})
+    kind, text = status(acc, entry)
+    if kind == 'nodata':
+        return True, text
+    if kind != 'ok':
+        return False, text.split(' — ')[0]
+    v = view(entry)
+    measured = '' if is_fresh(conf, entry) else f', measured {age(now - v["measured_at"])} ago'
+    return True, f'session {v["session"]}%, week {v["week"]}%, under its threshold ({limits(acc)}){measured}'
+
+# --- output ---
+def age(sec):
+    sec = max(0, int(sec))
+    if sec < 60:
+        return '<1 min'
+    if sec < 3600:
+        return f'{sec // 60} min'
+    return f'{sec // 3600}h{sec % 3600 // 60:02d}m'
+
+def until(sec):
+    sec = max(0, int(sec))
+    d, h, m = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    return f'{d}d{h}h' if d else f'{h}h{m:02d}m' if h else f'{m}m'
+
+def table(conf, cache):
+    color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+    paint = lambda code, s, width=0: (f'\x1b[{code}m{s}\x1b[0m' if color and code else s) + ' ' * max(0, width - len(s))
+    KIND_COLOR = {'ok': '32', 'over': '33', 'nodata': '33', 'over_hard': '31', 'full': '31',
+                  'unusable': '31', 'disabled': '2'}
+    pinned = os.environ.get('HIVE_ACCOUNT') or ''
+    ranked = rank(conf, cache)
+    selected = pinned if pinned else (ranked[0][0]['name'] if ranked else None)
+    rows, measured = [], []
+    for acc in conf['accounts']:
+        entry = cache['accounts'].get(acc['name'], {})
+        kind, text = status(acc, entry)
+        v = view(entry)
+        if not acc['disabled'] and v['measured_at'] is not None:
+            measured.append(v['measured_at'])
+        def pct(key):
+            p = v[key] if v['measured_at'] is not None and not acc['disabled'] else None
+            if p is None:
+                return ('', '-')
+            return ('31' if p >= 100 else '33' if p >= acc[key + '_threshold'] else '32', f'{p}%')
+        def reset(key, relative):
+            if acc['disabled'] or v['measured_at'] is None:
+                return '-'
+            if v[key + '_reset']:
+                s = time.strftime('%b %d %H:%M', time.localtime(v[key + '_reset']))
+                return s + (f' (in {until(v[key + "_reset"] - now)})' if relative else '')
+            return v[key + '_reset_text'] or '-'
+        if acc['name'] == selected:
+            text += ' <- SELECTED' + (' (HIVE_ACCOUNT)' if pinned else '')
+            kind_color = '32'
+        else:
+            kind_color = KIND_COLOR[kind]
+        rows.append([(kind_color, acc['name']), ('', 'claude'), ('', str(acc['prio'])),
+                     ('', limits(acc) + (' hard' if acc['hard'] else '')), ('', email(acc['name'])),
+                     pct('session'), ('', reset('session', True)), pct('week'), ('', reset('week', False)),
+                     (kind_color, text)])
+    if not measured:
+        print('usage: never measured — run: hive accounts --refresh')
+    else:
+        oldest = now - min(measured)
+        stale = oldest > conf['max_age'] * 60
+        print(f'usage from {age(oldest)} ago' + (
+            f' — STALE (max_age {conf["max_age"]} min): a spawn re-measures before it picks; '
+            f'refresh now: hive accounts --refresh' if stale else ''))
+    head = ['ACCOUNT', 'ENGINE', 'PRIO', 'THRESHOLD', 'EMAIL', 'SESSION', 'SESSION RESET', 'WEEK', 'WEEK RESET', 'STATUS']
+    widths = [max(len(head[i]), *(len(r[i][1]) for r in rows)) for i in range(len(head))]
+    print('  '.join(h.ljust(w) for h, w in zip(head, widths)).rstrip())
+    for r in rows:
+        print('  '.join(paint(code, s, w) for (code, s), w in zip(r, widths)).rstrip())
+    if pinned:
+        print(f'HIVE_ACCOUNT={pinned} is set: spawn uses it and the automatic selection is off'
+              + ('' if any(a['name'] == pinned for a in conf['accounts']) else f' ({pinned} is not in accounts.conf)'))
+    elif not ranked:
+        print('no account is selectable: a spawn without --account is refused until a limit resets')
+
+if cmd == 'parse':
+    at = int(args[1]) if len(args) > 1 else now
+    fields, why = parse_panel(open(args[0], encoding='utf-8', errors='replace').read(), at)
+    if why:
+        fail(why)
+    print(json.dumps(fields, indent=1))
+    sys.exit(0)
+
+conf = load_conf()
+cache = load_cache()
+
+if cmd == 'check':
+    pass
+elif cmd == 'due':
+    for acc in conf['accounts']:
+        entry = cache['accounts'].get(acc['name'], {})
+        tried = max(entry.get('measured_at') or 0, entry.get('error_at') or 0)
+        if not acc['disabled'] and (args[0] == 'all' or now - tried > conf['max_age'] * 60):
+            print(acc['name'])
+elif cmd == 'store':
+    tmp = args[0]
+    read = lambda name, ext: open(os.path.join(tmp, f'{name}.{ext}'), encoding='utf-8', errors='replace').read()
+    for name in args[1:]:
+        old = cache['accounts'].get(name, {})
+        try:
+            rc = int(read(name, 'rc').strip() or 1)
+        except Exception:
+            rc = 1
+        fields = why = None
+        if rc == 0:
+            fields, why = parse_panel(read(name, 'panel'), now)
+            if why:
+                # Evidence for whoever has to teach the parser the new panel.
+                keep = os.path.join(os.path.dirname(cache_path), f'usage-panel-{name}.txt')
+                try:
+                    with open(keep, 'w', encoding='utf-8') as f:
+                        f.write(read(name, 'panel'))
+                    why += f' (raw panel kept in {keep})'
+                except OSError:
+                    pass
+        else:
+            err = [l.strip() for l in read(name, 'err').splitlines() if l.strip()]
+            why = re.sub(r'^hive: (usage: )?', '', err[-1]) if err else f'measurement failed (exit {rc})'
+        if fields:
+            cache['accounts'][name] = fields
+        else:
+            # A failed attempt keeps the last good numbers: usage only grows inside a window, so they
+            # still say something. An account that cannot run Claude Code at all has nothing to keep.
+            entry = {} if rc == 3 else {k: v for k, v in old.items() if k not in ('error', 'error_at', 'unusable')}
+            entry.update(error=why, error_at=now)
+            if rc == 3:
+                entry['unusable'] = True
+            cache['accounts'][name] = entry
+            print(f'accounts: {name}: {why}', file=sys.stderr)
+    save_cache(cache)
+elif cmd == 'table':
+    table(conf, cache)
+elif cmd == 'room':
+    yes, why = room(conf, cache, args[0])
+    print(why)
+    sys.exit(0 if yes else 1)
+elif cmd == 'rank':
+    ranked = rank(conf, cache)
+    if not ranked:
+        # Nothing to take: say for every account what blocks it and when that ends, and which is first.
+        clock = lambda t: f'{time.strftime("%b %d %H:%M", time.localtime(t))} (in {until(t - now)})'
+        lines, first = [], None
+        for acc in conf['accounts']:
+            entry = cache['accounts'].get(acc['name'], {})
+            kind, text = status(acc, entry)
+            back = blocked_until(acc, entry) if kind in ('full', 'over_hard') else None
+            if back and (first is None or back < first[0]):
+                first = (back, acc['name'])
+            lines.append(f'  {acc["name"]}: {text}' + (f' — room again {clock(back)}' if back else ''))
+        fail('no account is selectable:\n' + '\n'.join(lines)
+             + (f'\nFirst to get room: {first[1]}, {clock(first[0])}.' if first else '')
+             + '\nWait for that reset, or force an account with --account NAME.', 3)
+    for acc, reason in ranked:
+        print(f'{acc["name"]}\t{reason}')
+else:
+    fail(f'unknown engine command {cmd!r}')
+PY
+}
+
+# usage_sweep — kills the measurement sessions of hive processes that no longer exist. A hive killed
+# by SIGKILL runs no trap, and its throwaway Claude Code sessions would sit in tmux for good. The pid
+# in the session name says whose it is; the session of a live hive is a measurement in progress.
+usage_sweep() {
+  local ses pid
+  for ses in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^hive-usage-[0-9]+-[a-z0-9_-]+$'); do
+    pid=${ses#hive-usage-}; pid=${pid%%-*}
+    kill -0 "$pid" 2>/dev/null || tmux kill-session -t "=$ses" 2>/dev/null
+  done
+}
+
+# accounts_refresh <all|stale> — measures the enabled accounts (all of them, or the ones whose
+# measurement is older than max_age) in parallel, one throwaway session each, and stores the result.
+# Serialised by a lock: two spawns that both find the cache stale measure once. Each step of a
+# measurement (Claude Code starting, the panel loading) is bounded by HIVE_USAGE_TIMEOUT seconds.
+accounts_refresh() {
+  local mode="$1" timeout="${HIVE_USAGE_TIMEOUT:-45}" names n tmp rc=0
+  exec 7>"$HIVE_DIR/.usage-lock"
+  flock -w 150 7 || { echo "hive: accounts: another measurement holds the lock (150 s) — nothing measured" >&2; return 1; }
+  # Decided under the lock: a measurement another process has just stored makes this one a no-op.
+  names=$(accounts_py due "$mode") || { flock -u 7; return 1; }
+  if [ -n "$names" ]; then
+    tmp=$(mktemp -d) || { flock -u 7; return 1; }
+    trap "rm -rf $(printf '%q' "$tmp")" EXIT     # a hive killed mid-measurement leaves no litter
+    usage_sweep
+    echo "accounts: measuring $(echo $names) — /usage in a throwaway session each, up to ${timeout}s per step" >&2
+    local -a pids=()
+    for n in $names; do
+      # The session runs in $HOME, where no project hooks or MCP servers load. usage_capture
+      # pre-trusts it for a named account; the default account gets it here, the way a spawn
+      # without --cwd does — otherwise its measurement would stop on the trust dialog.
+      [ "$n" = default ] && ensure_trusted "$(cd "$HOME" && pwd)"
+      # fd 7 is closed for the child — a tmux server born here would otherwise hold the lock for good.
+      ( usage_capture "$n" "$HOME" "$timeout" >"$tmp/$n.panel" 2>"$tmp/$n.err"; echo $? >"$tmp/$n.rc" ) 7>&- &
+      pids+=($!)
+    done
+    wait "${pids[@]}"
+    accounts_py store "$tmp" $names || rc=1
+    rm -rf "$tmp"; trap - EXIT
+  fi
+  flock -u 7
+  return "$rc"
+}
+
+# account_pick [session-id [own-account]] — the account a drone lands on when nobody named one.
+# Prints "<name>\t<reason>"; progress and refusals go to stderr. Stale measurements are refreshed
+# first: landing a drone on an account that filled up an hour ago costs more than the seconds /usage
+# takes, and the measurement is bounded by its timeout.
+# A revive passes the drone's session id and the account it runs on. The drone then keeps its
+# account for as long as that account has room, and moves only off one that is over its threshold,
+# full, unusable or disabled — to an account that sees the session's transcript.
+account_pick() {
+  local sid="${1:-}" own="${2:-}" ranked name reason dir note="" left=""
+  accounts_py check >&2 || return 1      # a broken accounts.conf is reported once, before anything is measured
+  accounts_refresh stale >&2 || echo "hive: accounts: picking on the measurements already stored" >&2
+  if [ -n "$own" ]; then
+    if reason=$(accounts_py room "$own"); then printf '%s\t%s\n' "$own" "$reason"; return 0; fi
+    left="$own has no room ($reason); "
+  fi
+  ranked=$(accounts_py rank) || return 1
+  while IFS=$'\t' read -r name reason; do
+    # account_dir has the last word on whether an account can run a drone; the cache may be behind.
+    if ! dir=$(account_dir "$name" 2>/dev/null); then
+      note+="; $name cannot run Claude Code"; continue
+    fi
+    if [ -n "$sid" ] && ! compgen -G "${dir:-$HOME/.claude}/projects/*/$sid.jsonl" >/dev/null; then
+      note+="; $name does not see session $sid"; continue
+    fi
+    # Its own account can still top the ranking, as the last resort: then the drone stays after all.
+    if [ -n "$left" ] && [ "$name" != "$own" ]; then reason="$left$name: $reason"; fi
+    printf '%s\t%s%s\n' "$name" "$reason" "$note"
+    return 0
+  done <<<"$ranked"
+  echo "hive: accounts: no selectable account can take this drone${note}" >&2
+  return 1
+}
+
+# auto_account — true when the account is hive's to choose: accounts.conf exists and HIVE_ACCOUNT
+# does not pin one. (--account is checked by the caller: it always wins.)
+auto_account() { [ -z "${HIVE_ACCOUNT:-}" ] && [ -f "$ACCOUNTS_CONF" ]; }
+
 # --- commands -------------------------------------------------------------
 
 cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
@@ -339,11 +952,17 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
       *) die "unknown argument: $1" ;;
     esac
   done
+  [ -d "$cwd" ] || die "cwd does not exist: $cwd"
   # A resumed session stays on the account it ran on unless moved explicitly — HIVE_ACCOUNT is the
   # default for NEW drones and must not quietly carry an existing one elsewhere.
-  [ "$resume" = 1 ] && [ "$account_given" = 0 ] && [ -f "$(drone_meta "$name")" ] \
-    && account=$(meta_get "$name" account)
-  [ -d "$cwd" ] || die "cwd does not exist: $cwd"
+  if [ "$resume" = 1 ] && [ "$account_given" = 0 ] && [ -f "$(drone_meta "$name")" ]; then
+    account=$(meta_get "$name" account)
+  elif [ "$account_given" = 0 ] && auto_account; then
+    # Nobody named an account for this new drone: it lands on the one with room (see 'hive accounts').
+    local picked; picked=$(account_pick) || die "spawn: no account for $name — nothing started"
+    account="${picked%%$'\t'*}"
+    echo "spawn: account $account — ${picked#*$'\t'}"
+  fi
   local acc_dir; acc_dir=$(account_dir "$account") || exit 1
   [ "$account" = default ] && account=""
   ensure_trusted "$cwd" "$acc_dir"   # so a fresh cwd never stalls (or quits) on the trust dialog
@@ -1036,12 +1655,13 @@ EOF
 cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its conversation history intact
   local name="${1:?usage: hive revive <name> [--account NAME]}"; shift
   local cwd; cwd=$(meta_get "$name" cwd) || die "unknown drone: $name"
-  # A drone comes back on the account it ran on; --account moves it (e.g. off an account that hit
-  # its limit).
-  local account; account=$(meta_get "$name" account)
+  # A drone comes back on the account it ran on. --account moves it; without it the drone moves
+  # only when its account has no room left (over its threshold, full, unusable, disabled) — then to
+  # the account 'hive accounts' selects. With HIVE_ACCOUNT pinned or no accounts.conf it never moves.
+  local account account_given=0; account=$(meta_get "$name" account)
   while [ $# -gt 0 ]; do
     case "$1" in
-      --account) account="${2?--account needs a name}"; shift 2 ;;
+      --account) account="${2?--account needs a name}"; account_given=1; shift 2 ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -1049,6 +1669,15 @@ cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its
   # none at all) after the old one is already gone — the history would be lost, not revived.
   local sid; sid=$(meta_get "$name" session_id)
   [ -n "$sid" ] && [ -n "$cwd" ] || die "revive: $name has no recorded session id or cwd — it cannot be resumed; nothing closed"
+  if [ "$account_given" = 0 ] && auto_account; then
+    # Only an account that sees the transcript qualifies, so a move can never lose the history.
+    local picked was; was=$(account_label "$account")
+    picked=$(account_pick "$sid" "$was") \
+      || die "revive: no account for $name — nothing closed. To bring it back where it ran: hive revive $name --account $was"
+    account="${picked%%$'\t'*}"
+    if [ "$account" = "$was" ]; then echo "revive: $name stays on $account — ${picked#*$'\t'}"
+    else echo "revive: $name moves $was -> $account — ${picked#*$'\t'}"; fi
+  fi
   local acc_dir; acc_dir=$(account_dir "$account") || exit 1
   # A move between accounts resumes only when the target account sees the transcript, i.e. both
   # share projects/ (the ~/.claude-<name>/projects symlink). Checked here, while the drone lives.
@@ -1250,46 +1879,36 @@ cmd_usage() {  # usage [--cwd DIR] [--timeout SEC] — measures the account limi
       *) echo "hive: usage: unknown argument $1" >&2; return 2 ;;
     esac
   done
-  command -v tmux >/dev/null || { echo "hive: usage: tmux not found" >&2; return 1; }
-  local abs; abs=$(cd "$cwd" 2>/dev/null && pwd) || { echo "hive: usage: no such directory: $cwd" >&2; return 1; }
-  cwd="$abs"   # absolute, because the trust key in .claude.json is the absolute path
-  local acc_dir; acc_dir=$(account_dir "$account") || return 1
-  # The measured account is set explicitly both ways: the caller's CLAUDE_CONFIG_DIR (a coordinator
-  # on a second account exports it) must not decide which account's limits get printed. A named
-  # account gets its cwd pre-trusted like a drone's — a fresh account trusts no folder at all.
-  local acc_env="-u CLAUDE_CONFIG_DIR"
-  if [ -n "$acc_dir" ]; then acc_env="CLAUDE_CONFIG_DIR=$(printf '%q' "$acc_dir")"; ensure_trusted "$cwd" "$acc_dir"; fi
+  usage_precheck "$account" "$cwd" || return 1
   echo "account: $(account_label "$account")"
-  local ses="hive-usage-$$" out
-  tmux kill-session -t "$ses" 2>/dev/null
-  tmux new-session -d -s "$ses" -x 200 -y 60 -c "$cwd" \
-    "env -u CLAUDECODE -u HIVE_DRONE -u HERDR_HIVE_ROLE $acc_env claude" || return 1
-  local i=0
-  while [ $i -lt "$timeout" ]; do
-    out=$(tmux capture-pane -t "$ses" -p 2>/dev/null)
-    case "$out" in
-      *"Yes, I trust this folder"*)
-        tmux kill-session -t "$ses" 2>/dev/null
-        echo "hive: usage: $cwd is not a trusted folder for Claude Code — run from a trusted project or pass --cwd" >&2
-        return 1 ;;
-      *"❯"*) break ;;
-    esac
-    sleep 1; i=$((i+1))
-  done
-  [ $i -lt "$timeout" ] || { tmux kill-session -t "$ses" 2>/dev/null; echo "hive: usage: claude did not start in ${timeout}s" >&2; return 1; }
-  sleep 2
-  tmux send-keys -t "$ses" '/usage'; sleep 1; tmux send-keys -t "$ses" Enter
-  i=0
-  while [ $i -lt "$timeout" ]; do
-    out=$(tmux capture-pane -t "$ses" -p 2>/dev/null)
-    case "$out" in *"% used"*) break ;; esac
-    sleep 1; i=$((i+1))
-  done
-  tmux kill-session -t "$ses" 2>/dev/null
-  [ $i -lt "$timeout" ] || { echo "hive: usage: no /usage panel in ${timeout}s" >&2; return 1; }
+  local out; out=$(usage_capture "$account" "$cwd" "$timeout") || return 1
   # Print the panel compactly: the section label, its percentage and its reset time; strip the bars.
   printf '%s\n' "$out" | sed 's/[█▌▏▎▍▋▊▉ ]\{3,\}/ /g' | grep -E 'Current session|Current week|% used|Resets|promo' \
     | sed 's/^ *//' | uniq
+}
+
+cmd_accounts() {  # accounts [--refresh] [--pick] — the accounts, their limits, and the one a spawn would take
+  local refresh=0 pick=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --refresh) refresh=1; shift ;;
+      --pick) pick=1; shift ;;
+      *) echo "hive: accounts: unknown argument $1" >&2; return 2 ;;
+    esac
+  done
+  accounts_py check || return 1
+  if [ "$refresh" = 1 ]; then accounts_refresh all || return 1; fi
+  if [ "$pick" = 1 ]; then
+    # The spawn's own answer, measurement included — not the table's reading of an old cache.
+    if [ -n "${HIVE_ACCOUNT:-}" ]; then
+      printf '%s — HIVE_ACCOUNT pins it; the automatic selection is off\n' "$(account_label "$HIVE_ACCOUNT")"
+      return 0
+    fi
+    local picked; picked=$(account_pick) || return 1
+    printf '%s — %s\n' "${picked%%$'\t'*}" "${picked#*$'\t'}"
+    return 0
+  fi
+  accounts_py table
 }
 
 # The machine gate: one exclusive window for anything that eats the whole machine (full test gates,
@@ -1438,6 +2057,8 @@ case "${1:-}" in
   sweep)  shift; cmd_sweep  "$@" ;;
   gate)   shift; cmd_gate   "$@" ;;
   usage)  shift; cmd_usage  "$@" ;;
+  accounts) shift; cmd_accounts "$@" ;;
+  _usage-parse) shift; accounts_py parse "${1:?missing panel file}" ${2:+"$2"} ;;   # internal, for tests/accounts
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
 
@@ -1455,6 +2076,8 @@ hive — command a swarm of Claude Code agents in herdr
   hive report <name>                 show a drone's report
   hive mute   <name> [--off]         silence automatic wake-ups (conversational drone)
   hive usage  [--cwd DIR] [--account NAME]  measure the account limits (/usage in a throwaway session)
+  hive accounts [--refresh] [--pick] accounts table: limits, resets, status, and the one a spawn takes
+                                     (--refresh measures every enabled account; --pick prints the pick and why)
   hive peek   <name> [lines]         view of the drone's terminal
   hive kill   <name> [--purge]       kill a drone (a dead one is archived and removed)
   hive prune  [--purge] [--dry-run] [names]  clear out dead drones (archived unless --purge)
@@ -1469,6 +2092,8 @@ hive — command a swarm of Claude Code agents in herdr
 Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/
 Accounts: --account NAME runs on CLAUDE_CONFIG_DIR=~/.claude-NAME (logged in, onboarded);
           HIVE_ACCOUNT sets the default for spawn and usage; none/"default" = ~/.claude.
+          With ~/.herdr-hive/accounts.conf, spawn and revive without --account/HIVE_ACCOUNT take the
+          account 'hive accounts' marks SELECTED: lowest prio under its threshold, measured by /usage.
 EOF
   ;;
 esac

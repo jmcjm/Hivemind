@@ -1,0 +1,23 @@
+# accounts.conf — the Claude Code accounts drones may run on, and how far each may be used.
+#
+# Copy to ~/.herdr-hive/accounts.conf ($HIVE_DIR/accounts.conf) and edit; 'hive accounts' shows the
+# result. Without that file hive never picks an account: a drone runs on the default one unless
+# --account or HIVE_ACCOUNT names another.
+#
+#   account <name> [prio=<n>] [week_threshold=<1-100>] [session_threshold=<1-100>] [hard] [disabled]
+#
+#   <name>             "default" is ~/.claude; any other name is ~/.claude-<name>, logged in and
+#                      onboarded ("Several Claude Code accounts" in SKILL.md shows how to make one)
+#   prio               lower = preferred; left out, it is the line's position among the accounts
+#   week_threshold     percent of the WEEKLY limit up to which the account is used (default 90)
+#   session_threshold  the same for the 5-hour session limit (default 100: only a full session blocks)
+#   hard               over its threshold the account is never taken, not even as a last resort
+#   disabled           never taken, never measured
+#
+# The accounts below are examples — replace them with your own.
+
+max_age = 10                                        # minutes a /usage measurement stays good for a spawn
+
+account alt      prio=1  week_threshold=80          # ~/.claude-alt: taken first, up to 80% of its week
+account default  prio=2  week_threshold=60  hard    # ~/.claude: the human works here — never past 60%
+# account spare  prio=3  disabled                   # ~/.claude-spare: on the list, never used

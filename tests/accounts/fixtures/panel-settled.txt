@@ -1,0 +1,60 @@
+
+  ⎿  SessionStart:startup says: example hook output
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◉ xhigh · /effort ▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0000
+   Total duration (API):  0s
+   Total duration (wall): 5s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+
+   Plugin skill-listing footprint
+   What each plugin's skill descriptions add to the system prompt (cached input after the first turn). Agents and MCP tools not yet counted.
+
+   example-plugin-a            5 skills · ~140 tok/turn
+   example-plugin-b            2 skills · ~53 tok/turn
+   example-plugin-c            1 skill · ~30 tok/turn
+
+   Total                       ~223 tok/turn
+
+   Current session
+   █████████████████▌                                 35% used
+   Resets 4:10pm (Europe/Berlin)
+
+   Current week (all models)
+   █████                                              10% used
+   Resets Oct 15, 9am (Europe/Berlin)
+
+   Current week (Fable)
+                                                      0% used
+   Resets Oct 15, 9am (Europe/Berlin)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   93% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   88% of your usage was while 4+ sessions ran in parallel
+    All sessions share one limit. If you don't need them all at once, queueing uses
+    it more evenly.
+
+   16% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   16% of your usage came from sessions active for 8+ hours
+    These are often background/loop sessions. Continuous usage can add up quickly
+    so make sure it is intentional.
+
+   13% of your usage came from /example-plugin-a:example-skill
+    Heavy skills can be scoped down or run with a cheaper model via skill
+    frontmatter.
+                                                                                                                                                                                                      ↓

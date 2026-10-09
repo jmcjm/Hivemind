@@ -23,6 +23,8 @@ integration, appends a section to `~/.claude/CLAUDE.md`, verifies syntax.
 **Requirements:** `herdr` **≥ 0.8** (tested on 0.8.2 and 0.9.1 — 0.7.5 removed `agent send` and the
 top-level `wait` that the old version rode on; for herdr 0.7.x use commit `604848c`), `claude`
 (Claude Code CLI), `python3`, `flock`. The herdr server must be running — check `herdr status`.
+`tmux` is optional: only reading an account's limits needs it (`hive usage`, `hive accounts` and the
+automatic account selection — "Several Claude Code accounts" below).
 
 **After updating herdr, restart its server.** The update replaces only the client; the old server
 keeps running, and a newer client refuses it (`protocol_mismatch`) — until the restart every drone
@@ -69,12 +71,15 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.claude/skills/hivemind/coord-compact-brief.sh` | `PreCompact` hook: tells the summarizer which coordination state must survive |
 | `~/.claude/skills/hivemind/coord-scope.sh` | shared scoping helper — the coordinator hooks fire in one session only |
 | `~/.claude/skills/hivemind/drone-settings.json` | `Stop`/`Notification` hooks **for drones only** |
+| `~/.claude/skills/hivemind/accounts.conf.example` | commented example of the accounts file — never read by `hive` |
 | `~/.local/bin/hive` | symlink so drones have `hive` in PATH |
 | `~/.claude/CLAUDE.md` | the "Hivemind" section — the coordinator's identity |
 | `~/.claude/hooks/herdr-agent-state.sh` | installed by `herdr integration install claude` |
 | `~/.herdr-hive/drones/<name>/` | `meta.json`, `brief.md`, `report.md` |
 | `~/.herdr-hive/mail/<recipient>/` | mailboxes (file = message) |
 | `~/.herdr-hive/.watch-coord`, `.watch-coord.pid` | the mail watcher's heartbeat and owner |
+| `~/.herdr-hive/accounts.conf` | optional, written by you: the accounts drones may take, their order and thresholds |
+| `~/.herdr-hive/usage-cache.json` | the last `/usage` measurement of each listed account |
 | herdr config (`$HERDR_CONFIG_PATH`, default `~/.config/herdr/config.toml`) | `[ui.toast] delivery = "system"` when unset (backup first; `lib/herdr-toasts.py`) — the unwatched-mail alert is a herdr toast |
 
 The global `~/.claude/settings.json` receives **only** the herdr integration hook. Swarm hooks
@@ -167,6 +172,55 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
   after work finished outside UI focus — CLI reads do not clear it.
 - The official API cheat sheet: `herdr --skill`.
 
+## Several Claude Code accounts
+
+A fleet burns one subscription's limits in hours. `hive` can run drones on other Claude Code logins
+and choose, at every spawn, the one that still has room. All of it is optional: **without
+`~/.herdr-hive/accounts.conf` nothing changes** — a drone runs on the default account (`~/.claude`)
+unless `--account` or `HIVE_ACCOUNT` names another.
+
+**Requirements:** one config directory per extra account, and `tmux` for the automatic selection —
+an account's limits are read from the `/usage` panel: `hive` opens a throwaway Claude Code session in
+tmux, types `/usage` and reads the answer.
+
+**1. Prepare an account directory.** A named account is `~/.claude-<name>`: its own login and its own
+`.claude.json`, everything else symlinked into `~/.claude`, so every account runs the same
+instructions, hooks, skills and plugins and sees the same session transcripts:
+
+```bash
+mkdir -m 700 ~/.claude-alt
+for f in CLAUDE.md settings.json skills plugins projects; do ln -s ~/.claude/$f ~/.claude-alt/$f; done
+CLAUDE_CONFIG_DIR=~/.claude-alt claude      # once, interactively: onboarding + /login
+hive usage --account alt                    # the account answers: its session and weekly limits
+```
+
+**2. Use it by hand** — no config needed: `hive spawn <name> --account alt`, or `HIVE_ACCOUNT=alt`
+for every new drone. `hive revive <name> --account alt` moves an existing drone there, history included.
+
+**3. Let `hive` choose.** List the accounts in your order of preference, each with the share of its
+weekly limit it may be used up to:
+
+```bash
+cp ~/.claude/skills/hivemind/accounts.conf.example ~/.herdr-hive/accounts.conf   # then edit
+hive accounts --refresh         # measure every listed account and show the table
+hive accounts --pick            # the account a spawn would take right now, and why
+```
+
+```
+max_age = 10                                        # minutes a /usage measurement stays good for a spawn
+account alt      prio=1  week_threshold=80          # ~/.claude-alt: taken first, up to 80% of its week
+account default  prio=2  week_threshold=60  hard    # ~/.claude: never past 60%
+```
+
+From then on `hive spawn <name>` without `--account` lands on the lowest `prio` that is under its
+threshold and says why (`spawn: account alt — prio 1, session 24%, week 60%, under its threshold
+(week 80%)`), and `hive revive` moves a drone off an account that ran out of room — only to one that
+shares `projects/`, so the history comes along. When no account has room, spawn starts nothing and
+names the account that gets room first. Precedence: `--account` > `HIVE_ACCOUNT` > the pick.
+
+The table, the selection rules and the traps: "Several Claude Code accounts" and "Which account a
+drone lands on" in `skill/SKILL.md`.
+
 ## Diagnostics
 
 | Symptom | Cause | Move |
@@ -181,13 +235,20 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 | `dead` drones pile up in `status` | directories outlive the sessions | `hive prune --dry-run`, then `hive prune` |
 | `hive revive` loses history | herdr integration missing | `herdr integration status` → must say `claude: current` |
 | drones bypass the mailbox | old spawn without the system prompt | kill and spawn anew |
+| `hive accounts` shows `no data — measurement failed: …` | tmux missing, Claude Code slower than `HIVE_USAGE_TIMEOUT`, or a `/usage` panel the parser does not know | the status names the cause; an unknown panel is kept in `~/.herdr-hive/usage-panel-<account>.txt` |
+| spawn refuses: `no account is selectable` | every listed account is full, over a `hard` threshold or `disabled` | wait for the reset the message names, or force one with `--account NAME` |
 
 ## Customization
 
 - Drone model: `HIVE_MODEL=sonnet hive spawn <name>` (default `opus`).
 - Claude Code account: `hive spawn <name> --account alt` runs the drone with `CLAUDE_CONFIG_DIR=~/.claude-alt`
-  (`HIVE_ACCOUNT=alt` for every new drone). Setup and traps: "Several Claude Code accounts" in `skill/SKILL.md`.
+  (`HIVE_ACCOUNT=alt` for every new drone); `~/.herdr-hive/accounts.conf` lets `hive` pick the account
+  with room. Setup: "Several Claude Code accounts" above.
+- Limit measurement: `HIVE_USAGE_TIMEOUT=<seconds>` bounds each step of a `/usage` measurement
+  (default 45).
 - Swarm directory: `HIVE_DIR=/other/path` (consistently for all invocations).
 - Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
   `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.
-- Tests: `tests/run.sh` — hermetic tests of the coordinator mail path and of account handling against a fake herdr.
+- Tests: `tests/run.sh` — hermetic tests of the coordinator mail path and of account handling against a fake herdr;
+  `tests/accounts/test-accounts.sh` — the accounts table, the selection and the `/usage` parser against a
+  fake tmux and captured panels. Neither starts a real session.
