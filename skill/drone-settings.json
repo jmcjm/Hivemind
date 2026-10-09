@@ -1,4 +1,6 @@
 {
+  "preferredNotifChannel": "notifications_disabled",
+  "inputNeededNotifEnabled": false,
   "hooks": {
     "Stop": [
       {

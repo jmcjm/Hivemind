@@ -16,7 +16,8 @@ setup() {
   T=$(mktemp -d)
   export HIVE_DIR="$T/hive" FAKE_HERDR_LOG="$T/herdr.log"
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
-  unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID
+  unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN \
+        HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE
   mkdir -p "$HIVE_DIR"
   : > "$FAKE_HERDR_LOG"
   echo "w1:p1" > "$HIVE_DIR/coord.pane"
@@ -41,6 +42,21 @@ send_coord() {  # send_coord <from> <kind> <subject> [body]
 }
 
 letters() { find "$HIVE_DIR/mail/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }
+
+# Every way hive can reach the human: a herdr toast or the desktop notifier (both faked).
+alerts() { grep -cE '^(notification show|notify-send|osascript) ' "$FAKE_HERDR_LOG"; }
+
+# The coordinator registered an hour ago and its last watcher stopped ten minutes ago: nobody
+# has listened for longer than the grace period.
+coord_gone() {
+  touch -d '-1 hour' "$HIVE_DIR/coord.pane"
+  touch -d '-10 minutes' "$HIVE_DIR/.watch-coord.last"
+}
+
+mail_aged() {  # mail_aged <touch -d offset> — one unread coord letter of that age
+  send_coord kafka done "finished"
+  touch -d "$1" "$HIVE_DIR"/mail/coord/*.json
+}
 
 fail()                { echo "    FAIL: $*"; TEST_OK=0; }
 assert_contains()     { grep -qF -- "$2" "$1" || fail "$(basename "$1") lacks: $2"; }
@@ -117,6 +133,9 @@ t_watch_heartbeat_cleared_on_exit() {
   start_watch "$T/out"
   kill "${WATCH_PIDS[0]}"; wait "${WATCH_PIDS[0]}" 2>/dev/null
   "$HIVE" _watched && fail "_watched true right after the watcher was stopped"
+  # ...and the stop is remembered, so a re-arm gap is not mistaken for a coordinator gone.
+  local age; age=$(( $(date +%s) - $(stat -c %Y "$HIVE_DIR/.watch-coord.last" 2>/dev/null || echo 0) ))
+  [ "$age" -lt 5 ] || fail "the stopped watcher left no fresh .watch-coord.last"
 }
 
 t_watch_heartbeat_refreshes() {
@@ -162,6 +181,17 @@ t_watch_heartbeat() {
   "$HIVE" _watched && fail "_watched true with a 40 s old heartbeat"
 }
 
+t_watch_reminds_coordinator_of_unread_mail() {
+  # Mail heard but never taken with hive inbox: the watcher reminds the coordinator itself,
+  # and the human hears nothing of it.
+  mail_aged '-20 minutes'
+  HIVE_MAIL_REMIND=5 start_watch "$T/out"
+  sleep 10
+  assert_contains "$T/out" "HIVE-MAIL backlog: 1 unread — run hive inbox"
+  assert_contains "$T/out" "HIVE-MAIL reminder: 1 unread, oldest 20 min — run hive inbox"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted"
+}
+
 t_watch_refused_for_drone() {
   HIVE_DRONE=kafka timeout 5 "$HIVE" watch > "$T/out" 2>&1 && fail "drone was allowed to run hive watch"
   assert_contains "$T/out" "coordinator's mail watcher"
@@ -179,12 +209,47 @@ t_send_watched_touches_nothing() {
 }
 
 t_send_unwatched_notifies_once_never_prompts() {
+  coord_gone
   send_coord kafka done "first"
   send_coord sql decision "second"
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
   assert_count "$FAKE_HERDR_LOG" "notification show" 1
   assert_contains "$FAKE_HERDR_LOG" "arm Monitor(hive watch)"
+  assert_not_contains "$FAKE_HERDR_LOG" "notify-send"     # herdr showed it — no second ping
   [ "$(letters)" = 2 ] || fail "expected 2 letters, found $(letters)"
+}
+
+t_send_in_rearm_gap_is_silent() {
+  # The Monitor expired a moment ago and the coordinator is re-arming it — a letter landing in
+  # that gap is no reason to ping the human.
+  touch -d '-1 hour' "$HIVE_DIR/coord.pane"
+  start_watch "$T/out"
+  kill "${WATCH_PIDS[0]}"; wait "${WATCH_PIDS[0]}" 2>/dev/null
+  send_coord kafka done "finished"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted during a re-arm gap"
+  [ "$(letters)" = 1 ] || fail "letter not delivered"
+}
+
+t_send_new_coordinator_gets_grace() {
+  # hive coord ran a moment ago (setup) and no watcher is armed yet: time to arm one first.
+  send_coord kafka done "finished"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted before the coordinator could arm its watcher"
+}
+
+t_send_grace_is_configurable() {
+  touch -d '-1 hour' "$HIVE_DIR/coord.pane"
+  touch -d '-2 minutes' "$HIVE_DIR/.watch-coord.last"
+  send_coord kafka done "first"
+  [ "$(alerts)" = 0 ] || fail "alerted 2 min into the default 5 min grace"
+  HIVE_UNWATCHED_GRACE=60 send_coord sql done "second"
+  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+}
+
+t_alert_falls_back_to_desktop_when_toasts_off() {
+  coord_gone
+  FAKE_TOAST_SHOWN=0 send_coord kafka done "finished"
+  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail: no coordinator is listening" 1
 }
 
 t_send_unwatched_herdr_down() {
@@ -210,10 +275,58 @@ t_adopted_drone_not_woken() {
 t_sweep_notifies_when_unwatched() {
   send_coord kafka done "finished"
   rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
-  touch -d '-2 minutes' "$HIVE_DIR/.watch-coord"
+  touch -d '-1 hour' "$HIVE_DIR/coord.pane"
+  touch -d '-10 minutes' "$HIVE_DIR/.watch-coord"         # a watcher killed before its trap ran
   "$HIVE" sweep >/dev/null
   assert_count "$FAKE_HERDR_LOG" "notification show" 1
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+}
+
+t_sweep_quiet_within_grace() {
+  send_coord kafka done "finished"
+  touch -d '-1 hour' "$HIVE_DIR/coord.pane"
+  touch -d '-2 minutes' "$HIVE_DIR/.watch-coord"
+  rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
+  "$HIVE" sweep >/dev/null
+  assert_contains "$FAKE_HERDR_LOG" "workspace list"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted 2 min after the watcher stopped"
+}
+
+t_sweep_overdue_quiet_while_coordinator_works() {
+  mail_aged '-40 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=working "$HIVE" sweep >/dev/null
+  assert_contains "$FAKE_HERDR_LOG" "pane get w1:p1"
+  [ "$(alerts)" = 0 ] || fail "the human was alerted about a coordinator mid-turn"
+}
+
+t_sweep_overdue_alerts_when_coordinator_stuck() {
+  # A watcher printed the letters, yet the coordinator sits on a dialog: only the human can help.
+  mail_aged '-40 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/out"
+  assert_count "$FAKE_HERDR_LOG" "notification show Swarm mail unread for 40 min" 1
+  assert_contains "$T/out" "sweep: overdue mail reminder (1 letters, 40 min old)"
+}
+
+t_sweep_overdue_waits_for_threshold() {
+  mail_aged '-20 minutes'
+  touch "$HIVE_DIR/.watch-coord"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_AGENT_STATUS=idle "$HIVE" sweep >/dev/null
+  [ "$(alerts)" = 0 ] || fail "alerted about 20 min old mail (threshold 30 min)"
+}
+
+t_sweep_unheard_mail_alerts_once() {
+  # Nobody listens and the mail is overdue too: one alert, the one that names the cure.
+  coord_gone
+  mail_aged '-40 minutes'
+  rm -f "$HIVE_DIR/.stranded-notice"; : > "$FAKE_HERDR_LOG"
+  "$HIVE" sweep >/dev/null
+  assert_count "$FAKE_HERDR_LOG" "notification show" 1
+  assert_contains "$FAKE_HERDR_LOG" "no coordinator is listening"
 }
 
 t_sweep_quiet_when_watched() {
@@ -224,6 +337,39 @@ t_sweep_quiet_when_watched() {
   assert_contains "$FAKE_HERDR_LOG" "workspace list"      # the sweep ran, it did not bail out early
   assert_not_contains "$FAKE_HERDR_LOG" "notification show"
   assert_not_contains "$FAKE_HERDR_LOG" "agent prompt"
+}
+
+# --- drones never reach the human ---------------------------------------------
+
+t_drone_ping_reports_only_to_coordinator() {
+  mkdir -p "$T/home/.claude/skills/hivemind"
+  ln -s "$ROOT/skill/hive" "$T/home/.claude/skills/hivemind/hive"
+  start_watch "$T/out"
+  : > "$FAKE_HERDR_LOG"
+  echo '{"message":"Claude needs your permission"}' \
+    | HOME="$T/home" HIVE_DRONE=kafka bash "$ROOT/skill/drone-ping.sh" decision
+  echo '{}' | HOME="$T/home" HIVE_DRONE=kafka bash "$ROOT/skill/drone-ping.sh" done
+  sleep 2
+  [ "$(letters)" = 2 ] || fail "expected 2 letters, found $(letters)"
+  assert_contains "$T/out" "HIVE-MAIL kafka [DECISION] needs a decision"
+  assert_contains "$T/out" "HIVE-MAIL kafka [finished] finished a turn (report: no report)"
+  [ "$(alerts)" = 0 ] || fail "a drone hook alerted the human while the coordinator listens"
+}
+
+t_spawn_drone_cannot_push() {
+  mkdir -p "$T/home/work"
+  hive_home spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "--disallowedTools PushNotification"
+}
+
+t_drone_settings_silence_claude_code() {
+  python3 - "$ROOT/skill/drone-settings.json" <<'SETTINGSPY' \
+    || fail "drone-settings.json leaves Claude Code's own notifications on"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("preferredNotifChannel") == "notifications_disabled"
+assert d.get("inputNeededNotifEnabled") is False
+SETTINGSPY
 }
 
 t_status_shows_watcher() {
@@ -381,118 +527,6 @@ t_board_reports_watcher_state() {
   echo '{"session_id":"S1","source":"compact"}' \
     | FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-creed-inject.sh" > "$T/on"
   assert_contains "$T/on" "Mail watcher: a watcher is live — if this session has no hive watch monitor, arm one: $ARM."
-}
-
-# --- herdr toasts (install-time) ---------------------------------------------
-
-toasts() { python3 "$ROOT/lib/herdr-toasts.py" "$1" .bak-test; }
-toast_delivery() {
-  python3 -c "import sys,tomllib; print(tomllib.load(open(sys.argv[1],'rb'))['ui']['toast']['delivery'])" "$1" 2>/dev/null
-}
-expect_enabled() {  # expect_enabled <config> <expected backup path or ->
-  local out; out=$(toasts "$1")
-  [ "$out" = "enabled $2" ] || fail "expected 'enabled $2', got '$out'"
-  [ "$(toast_delivery "$(readlink -f "$1")")" = system ] || fail "delivery is not system"
-}
-expect_left_alone() {  # expect_left_alone <config> — an error, and the file byte-identical
-  local before; before=$(cat "$1" 2>/dev/null; echo x)
-  toasts "$1" | grep -q '^error ' || fail "expected an error"
-  [ "$(cat "$1" 2>/dev/null; echo x)" = "$before" ] || fail "config changed"
-  [ -e "$1.bak-test" ] && fail "backup written without a change"
-}
-
-t_toasts_enabled_when_unset() {
-  printf 'onboarding = false\n\n[ui.sound]\nenabled = false\n' > "$T/config.toml"
-  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
-  assert_contains "$T/config.toml" "enabled = false"
-  cmp -s "$T/config.toml.bak-test" <(printf 'onboarding = false\n\n[ui.sound]\nenabled = false\n') \
-    || fail "backup is not the original"
-}
-
-t_toasts_enabled_when_config_missing() {
-  expect_enabled "$T/config.toml" -
-  [ -e "$T/config.toml.bak-test" ] && fail "backup written for a file that did not exist"
-}
-
-t_toasts_inserted_into_existing_table() {
-  printf '[ui.toast]\nposition = "top-right"\n\n[theme]\nname = "nord"\n' > "$T/config.toml"
-  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
-  assert_contains "$T/config.toml" 'position = "top-right"'
-  assert_count "$T/config.toml" "ui.toast" 1
-}
-
-t_toasts_header_with_spaces_and_comment() {
-  printf '[ ui . toast ]  # popups\nposition = "top-right"\n' > "$T/config.toml"
-  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
-  assert_count "$T/config.toml" "toast ]" 1
-}
-
-t_toasts_crlf_file_keeps_crlf() {
-  printf '[ui.toast]\r\nposition = "top-right"\r\n' > "$T/config.toml"
-  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
-  [ "$(grep -c $'\r$' "$T/config.toml")" = "$(wc -l < "$T/config.toml")" ] || fail "mixed line endings"
-}
-
-t_toasts_mode_preserved() {
-  printf '[theme]\nname = "nord"\n' > "$T/config.toml"
-  chmod 640 "$T/config.toml"
-  expect_enabled "$T/config.toml" "$T/config.toml.bak-test"
-  [ "$(stat -c %a "$T/config.toml")" = 640 ] || fail "mode is $(stat -c %a "$T/config.toml"), expected 640"
-}
-
-t_toasts_explicit_choice_kept() {
-  printf '[ui.toast]\ndelivery = "herdr"\n' > "$T/config.toml"
-  [ "$(toasts "$T/config.toml")" = "kept herdr" ] || fail "expected 'kept herdr'"
-  [ "$(toast_delivery "$T/config.toml")" = herdr ] || fail "explicit choice overwritten"
-  [ -e "$T/config.toml.bak-test" ] && fail "backup written without a change"
-}
-
-t_toasts_explicit_off_respected() {
-  printf '[ui.toast]\ndelivery = "off"\n' > "$T/config.toml"
-  [ "$(toasts "$T/config.toml")" = off-by-choice ] || fail "expected 'off-by-choice'"
-  [ "$(toast_delivery "$T/config.toml")" = off ] || fail "explicit off overwritten"
-}
-
-t_toasts_invalid_value_reported() {
-  # herdr ignores the whole config on an unknown delivery — reporting it as kept would be a lie.
-  printf '[ui.toast]\ndelivery = "System"\n' > "$T/config.toml"
-  expect_left_alone "$T/config.toml"
-}
-
-t_toasts_inline_table_left_alone() {
-  printf '[ui]\ntoast = { position = "top-right" }\n' > "$T/config.toml"
-  expect_left_alone "$T/config.toml"
-}
-
-t_toasts_dotted_keys_left_alone() {
-  printf '[ui]\ntoast.position = "top-right"\n' > "$T/config.toml"
-  expect_left_alone "$T/config.toml"
-}
-
-t_toasts_broken_config_left_alone() {
-  printf '[ui.toast\ndelivery = \n' > "$T/config.toml"
-  expect_left_alone "$T/config.toml"
-}
-
-t_toasts_read_only_config_left_alone() {
-  printf '[theme]\nname = "nord"\n' > "$T/config.toml"
-  chmod 444 "$T/config.toml"
-  expect_left_alone "$T/config.toml"
-}
-
-t_toasts_symlinked_config_stays_a_link() {
-  mkdir -p "$T/dotfiles"
-  printf '[theme]\nname = "nord"\n' > "$T/dotfiles/herdr.toml"
-  ln -s "$T/dotfiles/herdr.toml" "$T/config.toml"
-  expect_enabled "$T/config.toml" "$T/dotfiles/herdr.toml.bak-test"
-  [ -L "$T/config.toml" ] || fail "symlink replaced by a regular file"
-  [ -f "$T/dotfiles/herdr.toml.bak-test" ] || fail "backup not next to the link target"
-}
-
-t_toasts_dangling_symlink_left_alone() {
-  ln -s "$T/dotfiles/herdr.toml" "$T/config.toml"
-  expect_left_alone "$T/config.toml"
-  [ -e "$T/dotfiles" ] && fail "created the link target's directory"
 }
 
 # --- main --------------------------------------------------------------------

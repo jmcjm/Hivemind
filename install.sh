@@ -75,28 +75,51 @@ grep -q '^claude: current' <<<"$(herdr integration status 2>/dev/null || true)" 
   && ok "claude integration active (settings.json backup: settings.json.bak-$STAMP)" \
   || die "claude integration does not report as active"
 
-echo "== 5/9 herdr toasts =="
-# The alert for coord mail nobody is watching is a herdr notification, and herdr's default toast
-# delivery is "off". An unset delivery is switched on; an explicit choice, "off" included, stays.
-# The same lookup herdr does: HERDR_CONFIG_PATH, else the XDG config directory.
+echo "== 5/9 Alerts for the human =="
+# hive alerts the human only when nobody hears coord mail. The alert is a herdr toast when herdr
+# shows one, the desktop notifier otherwise. hive never turns herdr toasts on: herdr has no
+# per-pane switch, so they would announce every turn every drone ends. Read-only — the config is
+# yours. The same lookup herdr does: HERDR_CONFIG_PATH, else the XDG config directory.
 HERDR_CONFIG="${HERDR_CONFIG_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml}"
-TOAST=$(python3 "$SRC/lib/herdr-toasts.py" "$HERDR_CONFIG" ".bak-$STAMP" 2>/dev/null) || TOAST="error python3 failed"
+# Prints "<toast delivery> <sound for Claude Code agents: on|off>", herdr's defaults filled in.
+HERDR_PINGS=$(python3 - "$HERDR_CONFIG" <<'PINGSPY' 2>/dev/null
+import sys
+try:
+    import tomllib                          # Python 3.11+
+    try:
+        with open(sys.argv[1], "rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        cfg = {}                            # no config: herdr's defaults
+    def table(d, *keys):
+        for k in keys:
+            d = d.get(k) if isinstance(d, dict) else None
+        return d if isinstance(d, dict) else {}
+    delivery = table(cfg, "ui", "toast").get("delivery") or "off"
+    sound = table(cfg, "ui", "sound")
+    claude = table(cfg, "ui", "sound", "agents").get("claude", "default")
+    on = claude == "on" or (claude != "off" and sound.get("enabled", True) is not False)
+    print(delivery, "on" if on else "off")
+except Exception:
+    print("unknown unknown")
+PINGSPY
+) || HERDR_PINGS="unknown unknown"
+read -r TOAST SOUND <<<"$HERDR_PINGS"
 case "$TOAST" in
-  enabled\ *)
-    TOAST_BACKUP="${TOAST#enabled }"
-    [ "$TOAST_BACKUP" = - ] && TOAST_BACKUP="none, the file is new"
-    ok "herdr toasts on: [ui.toast] delivery = \"system\" in $HERDR_CONFIG (backup: $TOAST_BACKUP)"
-    if [ "$HERDR_REACHABLE" = 1 ]; then
-      herdr server reload-config >/dev/null 2>&1 && ok "running herdr server reloaded its config" \
-        || warn "could not reload the running herdr server — the setting applies from its next start"
-    fi ;;
-  kept\ *)
-    ok "herdr toasts: ${TOAST#kept } (set in $HERDR_CONFIG, kept)" ;;
-  off-by-choice)
-    warn "$HERDR_CONFIG turns herdr toasts off explicitly — kept, but the unwatched-mail alert will not show" ;;
-  *)
-    warn "could not turn herdr toasts on (${TOAST#error }) — set [ui.toast] delivery = \"system\" in $HERDR_CONFIG yourself" ;;
+  off)     ok "herdr toasts off — drones end their turns without a desktop notification" ;;
+  unknown) warn "could not read [ui.toast] delivery from $HERDR_CONFIG" ;;
+  *)       warn "herdr toasts are on ([ui.toast] delivery = \"$TOAST\" in $HERDR_CONFIG): herdr notifies you of every turn every drone ends and cannot exempt drone panes. hive does not need them — set delivery = \"off\" to silence the drones (earlier installers set \"system\" themselves)" ;;
 esac
+case "$SOUND" in
+  off)     ok "herdr sounds off for Claude Code agents" ;;
+  unknown) : ;;
+  *)       warn "herdr plays a sound for every turn every drone ends (background workspaces) — [ui.sound] enabled = false, or [ui.sound.agents] claude = \"off\", in $HERDR_CONFIG silences it" ;;
+esac
+if NOTIFIER=$(command -v notify-send || command -v osascript); then
+  ok "desktop notifier for hive's alerts: $NOTIFIER"
+else
+  warn "no desktop notifier (notify-send or osascript) — the alert for mail nobody hears shows only as a herdr toast, when herdr shows toasts"
+fi
 
 echo "== 6/9 Coordinator hooks =="
 # Three hooks, all self-scoping to the registered coordinator session (drones and unrelated

@@ -68,6 +68,7 @@ print(last)
 # Globals, not locals: cmd_watch's EXIT trap reads them after the function has returned.
 WATCH_BEAT="$HIVE_DIR/.watch-coord"        # heartbeat, touched every ~10 s by the live watcher
 WATCH_OWNER="$HIVE_DIR/.watch-coord.pid"   # PID of the watcher armed last
+WATCH_LAST="$HIVE_DIR/.watch-coord.last"   # touched by a watcher as it stops: the last moment one listened
 # The copy-paste arm instruction. The Monitor tool refuses a call without a description.
 WATCH_ARM='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
 
@@ -77,6 +78,38 @@ WATCH_ARM='Monitor(command: "hive watch", description: "swarm mail", timeout_ms:
 coord_watched() {
   [ -f "$WATCH_BEAT" ] || return 1
   [ $(( $(date +%s) - $(stat -c %Y "$WATCH_BEAT" 2>/dev/null || echo 0) )) -lt 30 ]
+}
+
+# Has nobody listened to coord mail for HIVE_UNWATCHED_GRACE seconds (default 300)? Listening
+# counts from the latest of: the live heartbeat, the mark a stopping watcher leaves, and the
+# coordinator's registration (hive coord, spawn) — the moment listening became expected. The grace
+# keeps the routine gap silent: a Monitor expires every 30 min and the coordinator re-arms it
+# seconds later, and a letter that lands in between reaches it as the new watcher's backlog line.
+coord_unheard() {
+  coord_watched && return 1
+  local f m since=0
+  for f in "$WATCH_BEAT" "$WATCH_LAST" "$HIVE_DIR/coord.pane"; do
+    m=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [ "$m" -gt "$since" ] && since=$m
+  done
+  [ $(( $(date +%s) - since )) -ge "${HIVE_UNWATCHED_GRACE:-300}" ]
+}
+
+# Tells the human what only the human can fix. A herdr toast when herdr shows one; when it does
+# not (toasts off, herdr's default, or no client attached) the desktop notifier instead. hive never
+# turns herdr toasts on for this: herdr has no per-pane switch, so its toasts would also announce
+# every turn every drone ends, with the coordinator listening the whole time.
+human_alert() {  # human_alert <title> <body>
+  local out
+  out=$(herdr notification show "$1" --body "$2" --sound request 2>/dev/null)
+  [ "$(jqp "print(r.get('shown') is True)" <<<"$out")" = True ] && return 0
+  if command -v notify-send >/dev/null; then
+    notify-send -a hive "$1" "$2" >/dev/null 2>&1
+  elif command -v osascript >/dev/null; then
+    osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+      -e 'end run' "$1" "$2" >/dev/null 2>&1
+  fi
+  return 0
 }
 
 # Computes the event line for a coord letter: sender, kind, subject — never the body. Control
@@ -119,9 +152,9 @@ json.dump({'ts':time.strftime('%Y-%m-%d %H:%M:%S'),'from':frm,'to':to,
   mv "$tmp" "$box/$(date +%s%N)-$from.json"
 }
 
-# Desktop escalation for coord mail nobody is watching (no live 'hive watch' heartbeat). The
-# coordinator's prompt is never typed into, so without a watcher the letters wait in silence —
-# the one failure the swarm cannot heal on its own, so the human gets a ping.
+# Desktop escalation for coord mail nobody hears (coord_unheard). The coordinator's prompt is
+# never typed into, so without a watcher the letters wait in silence — the one failure the swarm
+# cannot heal on its own, so the human gets a ping.
 # Rate-limited by a marker so a burst of drone hooks does not fire one ping per letter.
 coord_stranded_notice() {
   local mark="$HIVE_DIR/.stranded-notice" age n
@@ -131,9 +164,8 @@ coord_stranded_notice() {
   fi
   : > "$mark"
   n=$(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
-  herdr notification show \
-    "Swarm mail waiting, no coordinator is watching ($n letters). In the coordinator session: hive coord, then arm Monitor(hive watch)" \
-    --sound request >/dev/null 2>&1
+  human_alert "Swarm mail: no coordinator is listening" \
+    "$n letter(s) waiting. In the coordinator session: hive coord, then arm Monitor(hive watch)"
 }
 
 # Wakes a DRONE by injecting a message into its prompt. Safeguards:
@@ -151,8 +183,9 @@ wake_recipient() {
     # A remote coordinator has no watcher on this machine — the letter waits in the mailbox
     # (cmd_send forwards over ssh; this path only runs when that forward failed).
     [ -n "$(coord_remote)" ] && return 0
-    # A live watcher prints the letter within a second; without one, the human gets a ping.
-    coord_watched || coord_stranded_notice
+    # A live watcher prints the letter within a second. The human hears of it only once nobody
+    # has listened for the grace period — never during a Monitor re-arm.
+    coord_unheard && coord_stranded_notice
     return 0
   fi
   pane=$(pane_of "$who" 2>/dev/null)
@@ -200,6 +233,13 @@ pane_status() {
   local pane="$1" out
   out=$(herdr pane get "$pane" 2>/dev/null) || { echo dead; return; }
   echo "$out" | jqp "p=r.get('pane',r); print(p.get('agent_status') or 'unknown')" || echo dead
+}
+
+# Is the coordinator mid-turn? Idle, blocked on a dialog, dead or unknown all mean it is not
+# working through its mail.
+coord_busy() {
+  local pane; pane=$(coord_pane)
+  [ -n "$pane" ] && [ "$(pane_status "$pane")" = working ]
 }
 
 # Is the pane stuck on a Claude Code dialog (trust / permission / resume / choice)?
@@ -1023,8 +1063,11 @@ Report questions and blockers via 'hive send coord' — do not wait idly, nobody
   # so the system prompt goes as a single line.
   sysprompt=$(printf '%s' "$sysprompt" | tr '\n' ' ' | tr -s ' ')
 
+  # A drone reaches the human only through the coordinator: no PushNotification tool, so it cannot
+  # push to the human's phone or desktop on its own (drone-settings.json silences the rest).
   local -a argv=(--dangerously-skip-permissions --model "$MODEL"
                  --settings "$SKILL_DIR/drone-settings.json"
+                 --disallowedTools "PushNotification"
                  --append-system-prompt "$sysprompt")
   if [ "$resume" = 1 ]; then argv+=(--resume "$sid"); else argv+=(--session-id "$sid"); fi
 
@@ -1220,11 +1263,13 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
   touch "$WATCH_BEAT"
   # The heartbeat dies with its owner, and only with its owner: after a takeover it belongs to the
   # new watcher. bash runs the EXIT trap on fatal signals too, so a watcher killed by SIGPIPE
-  # (reader gone) cleans up as well; a Monitor stop (TaskStop, expiry) is a plain exit 0.
-  trap '[ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] && rm -f "$WATCH_BEAT"' EXIT
+  # (reader gone) cleans up as well; a Monitor stop (TaskStop, expiry) is a plain exit 0. The
+  # stop leaves its time in WATCH_LAST, so coord_unheard tells a re-arm gap from a coordinator gone.
+  trap '[ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] && { touch "$WATCH_LAST"; rm -f "$WATCH_BEAT"; }' EXIT
   trap 'exit 0' TERM INT HUP
   local -A seen=()
-  local f line n=0 last_beat=$SECONDS
+  local f m line n=0 last_beat=$SECONDS last_remind=$SECONDS oldest unread
+  local remind="${HIVE_MAIL_REMIND:-600}"
   for f in "$box"/*.json; do
     [ -e "$f" ] || continue
     seen[$f]=1; n=$((n+1))
@@ -1250,7 +1295,20 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
     # The guarded expansion keeps an empty mailbox legal under set -u on bash < 4.4.
     seen=()
     for f in ${now[@]+"${!now[@]}"}; do seen[$f]=1; done
-    if [ $((SECONDS - last_beat)) -ge 10 ]; then touch "$WATCH_BEAT"; last_beat=$SECONDS; fi
+    [ $((SECONDS - last_beat)) -ge 10 ] || continue
+    touch "$WATCH_BEAT"; last_beat=$SECONDS
+    # Mail the coordinator heard but never took with 'hive inbox' (a letter handled without it, a
+    # turn that ended first): remind it here, every HIVE_MAIL_REMIND, in its own session — long
+    # before the sweep takes unread mail to the human (HIVE_MAIL_OVERDUE).
+    [ $((SECONDS - last_remind)) -ge "$remind" ] || continue
+    oldest=$(date +%s); unread=0
+    for f in ${now[@]+"${!now[@]}"}; do
+      m=$(stat -c %Y "$f" 2>/dev/null) || continue
+      unread=$((unread+1)); [ "$m" -lt "$oldest" ] && oldest=$m
+    done
+    [ "$unread" -gt 0 ] && [ $(( $(date +%s) - oldest )) -ge "$remind" ] || continue
+    printf '%s\n' "HIVE-MAIL reminder: $unread unread, oldest $(( ($(date +%s) - oldest) / 60 )) min — run hive inbox" || exit 0
+    last_remind=$SECONDS
   done
 }
 
@@ -1749,9 +1807,16 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
       wake_recipient coord
     fi
   fi
-  # Overdue reminder: mail nobody read for HIVE_MAIL_OVERDUE means the coordinator is not
-  # hearing it — tell the human on the desktop, re-nag at most every HIVE_SWEEP_RENOTIFY.
-  if [ ${#letters[@]} -gt 0 ]; then
+  # Overdue reminder: mail nobody took with 'hive inbox' for HIVE_MAIL_OVERDUE — tell the human
+  # on the desktop, re-nag at most every HIVE_SWEEP_RENOTIFY. With a local coordinator only when
+  # it is not working: one mid-turn gets to its inbox (its watcher keeps reminding it), and one
+  # nobody hears already got the alert above. What is left is a coordinator that heard and does
+  # not act — blocked on a dialog, out of usage, its session gone.
+  local quiet=0
+  if [ ${#letters[@]} -gt 0 ] && [ -z "$remote" ]; then
+    { coord_unheard || coord_busy; } && quiet=1
+  fi
+  if [ ${#letters[@]} -gt 0 ] && [ "$quiet" = 0 ]; then
     local oldest age mark="$HIVE_DIR/.overdue-notice" skip=0 mage
     oldest=$(stat -c %Y "${letters[0]}" 2>/dev/null || echo "$now")
     age=$(( now - oldest ))
@@ -1762,9 +1827,8 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
       fi
       if [ "$skip" = 0 ]; then
         : > "$mark"
-        herdr notification show \
-          "Swarm mail unread for $((age/60)) min (${#letters[@]} letter(s) for coord) — run hive inbox in the coordinator pane" \
-          --sound request >/dev/null 2>&1
+        human_alert "Swarm mail unread for $((age/60)) min" \
+          "${#letters[@]} letter(s) for coord — run hive inbox in the coordinator pane"
         echo "sweep: overdue mail reminder (${#letters[@]} letters, $((age/60)) min old)"
       fi
     fi

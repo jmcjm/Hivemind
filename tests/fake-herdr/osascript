@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Stand-in for osascript: records the call to $FAKE_HERDR_LOG, so no test ever reaches a real desktop.
+printf '%s\n' "osascript $*" >> "${FAKE_HERDR_LOG:?FAKE_HERDR_LOG must be set}"
