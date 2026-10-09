@@ -25,8 +25,9 @@ unset HIVE_ACCOUNT CLAUDE_CONFIG_DIR HIVE_DRONE HERDR_HIVE_ROLE HIVE_COORD_PANE 
 export HIVE_USAGE_TIMEOUT=5     # seconds per measurement step; the hang tests lower it
 
 # --- assertions -------------------------------------------------------------
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()    { PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
+skip()  { SKIP=$((SKIP+$1)); printf '  skip  %s (%d assertions)\n' "$2" "$1"; }   # skip <count> <why>
 bad()   { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; shift; printf '        %s\n' "$@"; }
 eq()    { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected: $2" "actual:   $3"; fi; }
 has()   { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "missing:  $2" "in:       $3" ;; esac; }
@@ -41,6 +42,11 @@ at()  { date -d "$1" +%s; }
 jget() { python3 -c "import json,sys; v=json.load(sys.stdin).get(sys.argv[1]); print('null' if v is None else v)" "$1"; }
 meta_account() { python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['account'] or 'default')" "$HIVE_DIR/drones/$1/meta.json"; }
 sessions() { grep -c "^new " "$FAKE_TMUX_DIR/log" 2>/dev/null || true; }
+session_dirs() { grep '^new ' "$FAKE_TMUX_DIR/log" | awk '{print $4}' | sort -u; }      # where the sessions ran
+trusted() {  # trusted <account> <dir> — True when that account's config pre-trusts the directory
+  local cfg="$HOME/.claude.json"; [ "$1" = default ] || cfg="$HOME/.claude-$1/.claude.json"
+  python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('projects',{}).get(sys.argv[2],{}).get('hasTrustDialogAccepted'))" "$cfg" "$2" 2>/dev/null
+}
 kills()    { grep -c "^kill " "$FAKE_TMUX_DIR/log" 2>/dev/null || true; }
 
 # --- the world ----------------------------------------------------------------
@@ -175,6 +181,8 @@ eq "no accounts.conf: hive accounts fails"       1 "$RC"
 has "no accounts.conf: says so"                  "no config at $HIVE_DIR/accounts.conf" "$ERR"
 has "no accounts.conf: prints the format"        "account alt      prio=1  week_threshold=80" "$ERR"
 has "no accounts.conf: says the threshold is weekly" "The threshold is on the weekly limit" "$ERR"
+has "no accounts.conf: gives the command that copies the shipped example" \
+    "cp $(dirname "$HIVE")/accounts.conf.example $HIVE_DIR/accounts.conf" "$ERR"
 
 conf <<'EOF'
 max_age = 10
@@ -274,7 +282,7 @@ if command -v script >/dev/null; then
   TTY_OUT=$(NO_COLOR=1 script -qec "$(printf '%q' "$HIVE") accounts" /dev/null)
   hasnt "NO_COLOR switches colours off on a TTY" $'\x1b[3' "$TTY_OUT"
 else
-  echo "  skip  colour tests: no script(1) to provide a TTY"
+  skip 7 "colour tests: no script(1) to provide a TTY"
 fi
 
 cache alpha:2820:10:3600:10:432000
@@ -296,6 +304,8 @@ if command -v script >/dev/null; then
   TTY_OUT=$(script -qec "$(printf '%q' "$HIVE") accounts" /dev/null)
   has "on a TTY: a session over its own threshold yellow" $'\x1b[33m95%\x1b[0m' "$TTY_OUT"
   has "on a TTY: a session at 95% without a session threshold green" $'\x1b[32m95%\x1b[0m' "$TTY_OUT"
+else
+  skip 2 "session colour tests: no script(1) to provide a TTY"
 fi
 
 HIVE_ACCOUNT=beta run "$HIVE" accounts
@@ -487,16 +497,44 @@ like "alpha measured: 24% / 91%, resets shown"   "^alpha .* 24% +[A-Z][a-z]{2} [
 like "beta measured: session 100%"               'UNAVAILABLE: session 100%$' "$(row beta)"
 like "default measured: unknown reset wording shown as printed" '^default .* 0% +- +28% +tomorrow at noon +available <- SELECTED$' "$(row default)"
 like "ghost: not logged in = UNAVAILABLE"        "^ghost .* - +- +- +- +UNAVAILABLE: account 'ghost' is not logged in" "$(row ghost)"
+# The measurement runs in a directory of hive's own, and that is the only directory it pre-trusts.
+eq "refresh: every session runs in hive's own measurement directory" "$HIVE_DIR/usage-cwd" "$(session_dirs)"
+eq "refresh: that directory is private"          700 "$(stat -c %a "$HIVE_DIR/usage-cwd")"
+eq "refresh: it is pre-trusted for a named account" True "$(trusted alpha "$HIVE_DIR/usage-cwd")"
+eq "refresh: it is pre-trusted for the default account" True "$(trusted default "$HIVE_DIR/usage-cwd")"
+eq "refresh: an account that cannot run gets no config written" no "$([ -e "$HOME/.claude-ghost/.claude.json" ] && echo yes || echo no)"
 run "$HIVE" accounts --pick
 like "pick after refresh: the only account with room" '^default — prio 3' "$OUT"
 eq "pick on a fresh cache measures nothing"      3 "$(sessions)"
 
-run "$HIVE" usage --account alpha --cwd "$HOME" --timeout 5
+run "$HIVE" usage --account alpha --timeout 5
 has "hive usage still prints the compact panel: account" "account: alpha" "$OUT"
 has "hive usage still prints the compact panel: session" "Current session" "$OUT"
 has "hive usage still prints the compact panel: percent" "24% used" "$OUT"
 has "hive usage still prints the compact panel: reset"   "$SESSION_IN_2H" "$OUT"
 eq "hive usage kills its session"                "$(sessions)" "$(kills)"
+eq "hive usage runs in hive's own measurement directory too" "$HIVE_DIR/usage-cwd" "$(session_dirs)"
+mkdir -p "$T/elsewhere"
+run "$HIVE" usage --account alpha --cwd "$T/elsewhere" --timeout 5
+has "hive usage --cwd: measures there"           "$T/elsewhere" "$(session_dirs)"
+eq "hive usage --cwd: that directory is not pre-trusted" None "$(trusted alpha "$T/elsewhere")"
+
+# HIVE_USAGE_TIMEOUT bounds hive usage as it bounds a refresh; neither takes anything but seconds.
+: > "$FAKE_PANELS/alpha.noprompt"
+HIVE_USAGE_TIMEOUT=2 run "$HIVE" usage --account alpha
+has "hive usage: bounded by HIVE_USAGE_TIMEOUT"  "claude did not start in 2s" "$ERR"
+rm -f "$FAKE_PANELS/alpha.noprompt"
+n=$(sessions)
+run "$HIVE" usage --account alpha --timeout soon
+eq "hive usage --timeout that is not seconds: refused" 2 "$RC"
+has "hive usage --timeout that is not seconds: says so" "--timeout takes whole seconds, not 'soon'" "$ERR"
+eq "hive usage --timeout that is not seconds: nothing is started" "$n" "$(sessions)"
+HIVE_USAGE_TIMEOUT=soon run "$HIVE" accounts --refresh
+has "HIVE_USAGE_TIMEOUT that is not seconds: says so" "HIVE_USAGE_TIMEOUT='soon' is not a whole number of seconds — using 45" "$ERR"
+has "HIVE_USAGE_TIMEOUT that is not seconds: the default applies" "up to 45s per step" "$ERR"
+HIVE_USAGE_TIMEOUT=09 run "$HIVE" accounts --refresh
+eq "HIVE_USAGE_TIMEOUT with a leading zero: measured" 0 "$RC"
+has "HIVE_USAGE_TIMEOUT with a leading zero: read as decimal" "up to 9s per step" "$ERR"
 
 printf 'something else entirely\n 5%% used\n' > "$FAKE_PANELS/beta.txt"
 run "$HIVE" accounts --refresh
@@ -534,11 +572,15 @@ has "hive usage in a missing directory: says why" "no such directory: $T/nowhere
 ( exit 0 ) & dead=$!; wait "$dead"
 echo alpha > "$FAKE_TMUX_DIR/hive-usage-$dead-alpha.account"    # its hive is gone
 echo beta  > "$FAKE_TMUX_DIR/hive-usage-$$-beta.account"        # its hive is alive (this script's pid)
-echo alpha > "$FAKE_TMUX_DIR/hive-usage-$dead.account"          # the naming of the old hive usage: not ours to judge
+echo alpha > "$FAKE_TMUX_DIR/hive-usage-$dead.account"          # the naming of hive usage before accounts existed
+echo alpha > "$FAKE_TMUX_DIR/hive-usage-$$.account"             # the same naming, its hive alive
+echo alpha > "$FAKE_TMUX_DIR/hive-usage-notes.account"          # somebody's own session: no pid, not hive's
 run "$HIVE" accounts --refresh
 eq "a session orphaned by a dead hive is swept"  1 "$(grep -c -- "^kill hive-usage-$dead-alpha\$" "$FAKE_TMUX_DIR/log")"
 eq "a session of a live hive is left alone"      0 "$(grep -c -- "^kill hive-usage-$$-beta\$" "$FAKE_TMUX_DIR/log")"
-eq "a session with the old naming is left alone" 0 "$(grep -c -- "^kill hive-usage-$dead\$" "$FAKE_TMUX_DIR/log")"
+eq "an orphan with the old naming is swept too"  1 "$(grep -c -- "^kill hive-usage-$dead\$" "$FAKE_TMUX_DIR/log")"
+eq "the old naming of a live hive is left alone" 0 "$(grep -c -- "^kill hive-usage-$$\$" "$FAKE_TMUX_DIR/log")"
+eq "a session that only looks alike is left alone" 0 "$(grep -c -- "^kill hive-usage-notes\$" "$FAKE_TMUX_DIR/log")"
 
 # tmux matches a bare target by prefix. The session of account "ab" never comes up, and while "abc"
 # is still being measured the clean-up of "ab" fires: it must not reach into the session of "abc".
@@ -555,18 +597,44 @@ like "an account whose name is a prefix of another: abc is measured" '^abc .* 11
 like "an account whose name is a prefix of another: ab failed on its own" '^ab .* no data — measurement failed' "$(row ab)"
 eq "the session of abc is killed once, when its own measurement ends" 1 "$(kills)"
 
-# A named account gets $HOME pre-trusted by the measurement itself. The default account has trusted
-# it only if a drone was ever spawned there — on a machine where none was, the measurement trusts it.
+# The default account on a machine where no drone ever ran in $HOME: the measurement trusts its own
+# directory and leaves $HOME alone. Trust for $HOME would cover every directory under it that is
+# not inside a git repository.
 world
 conf <<'EOF'
 account default prio=1
 EOF
-printf '{"hasCompletedOnboarding":true,"oauthAccount":{"emailAddress":"owner@example.com"}}\n' > "$HOME/.claude.json"
+mkdir -p "$T/dotfiles"                  # the config kept in a dotfiles checkout, ~/.claude.json a link to it
+printf '{"hasCompletedOnboarding":true,"oauthAccount":{"emailAddress":"owner@example.com"}}\n' > "$T/dotfiles/claude.json"
+ln -sf "$T/dotfiles/claude.json" "$HOME/.claude.json"
 panel 3 "$SESSION_IN_2H" 4 "$WEEK_IN_3D" > "$FAKE_PANELS/default.txt"
 run "$HIVE" accounts --refresh
-eq "the default account: \$HOME is trusted before its first measurement" True \
-   "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('projects',{}).get(sys.argv[2],{}).get('hasTrustDialogAccepted'))" "$HOME/.claude.json" "$(cd "$HOME" && pwd)")"
+eq "the default account: the measurement directory is trusted before its first measurement" True \
+   "$(trusted default "$HIVE_DIR/usage-cwd")"
+eq "the default account: \$HOME is not trusted by a measurement" None "$(trusted default "$(cd "$HOME" && pwd)")"
+eq "the default account: a symlinked config stays a link" yes "$([ -L "$HOME/.claude.json" ] && echo yes || echo no)"
 like "the default account: measured, the rest of its config kept" '^default +claude +1 +week 90% +owner@example.com +3% .* 4% ' "$(row default)"
+
+# A default account that never finished onboarding opens on its first-run screens: nothing is typed
+# into them, and its config is left as it was.
+world
+conf <<'EOF'
+account default prio=1
+account alpha   prio=2
+EOF
+printf '{"oauthAccount":{"emailAddress":"owner@example.com"}}\n' > "$HOME/.claude.json"
+cp "$HOME/.claude.json" "$T/before.json"
+panel 3 "$SESSION_IN_2H" 4 "$WEEK_IN_3D" > "$FAKE_PANELS/default.txt"
+panel 5 "$SESSION_IN_2H" 6 "$WEEK_IN_3D" > "$FAKE_PANELS/alpha.txt"
+run "$HIVE" accounts --refresh
+like "a default account without onboarding is UNAVAILABLE" "^default .* UNAVAILABLE: account 'default' never finished onboarding" "$(row default)"
+hasnt "a default account without onboarding: no session is started for it" " default " "$(cat "$FAKE_TMUX_DIR/log")"
+eq "a default account without onboarding: its config is untouched" same "$(cmp -s "$HOME/.claude.json" "$T/before.json" && echo same || echo changed)"
+like "a default account without onboarding: the next account is picked" '^alpha .* available <- SELECTED$' "$(row alpha)"
+rm -f "$HOME/.claude.json"
+run "$HIVE" accounts --refresh
+like "a default account without any config is UNAVAILABLE" "^default .* UNAVAILABLE: account 'default' never finished onboarding" "$(row default)"
+eq "a default account without any config: none is created" no "$([ -e "$HOME/.claude.json" ] && echo yes || echo no)"
 
 # =============================================================================
 section "selection on a stale cache — measure first, then pick"
@@ -824,6 +892,16 @@ eq "broken accounts.conf: no workspace is created" "$n" "$(spawned)"
 run "$HIVE" spawn d8 --account beta
 eq "broken accounts.conf: --account still spawns" beta "$(meta_account d8)"
 
+# anything named accounts.conf is a config to judge — a directory there is broken, not absent
+rm -f "$HIVE_DIR/accounts.conf"; mkdir "$HIVE_DIR/accounts.conf"
+n=$(spawned)
+run "$HIVE" accounts
+has "accounts.conf is a directory: hive accounts says so" "$HIVE_DIR/accounts.conf cannot be read" "$ERR"
+run "$HIVE" spawn d9
+eq "accounts.conf is a directory: spawn is refused" 1 "$RC"
+has "accounts.conf is a directory: spawn says why" "$HIVE_DIR/accounts.conf cannot be read" "$ERR"
+eq "accounts.conf is a directory: no workspace is created" "$n" "$(spawned)"
+
 # =============================================================================
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" = 0 ]

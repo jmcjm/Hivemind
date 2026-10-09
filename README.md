@@ -80,6 +80,7 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.herdr-hive/.watch-coord`, `.watch-coord.pid`, `.watch-coord.last` | the mail watcher's heartbeat, owner, and the moment the last one stopped |
 | `~/.herdr-hive/accounts.conf` | optional, written by you: the accounts drones may take, their order and thresholds |
 | `~/.herdr-hive/usage-cache.json` | the last `/usage` measurement of each listed account |
+| `~/.herdr-hive/usage-cwd/` | the empty directory `/usage` is measured in — the only one a measurement pre-trusts |
 | herdr config (`$HERDR_CONFIG_PATH`, default `~/.config/herdr/config.toml`) | read, never written: `install.sh` warns when herdr toasts or sounds would announce every drone turn |
 
 The global `~/.claude/settings.json` receives **only** the herdr integration hook. Swarm hooks
@@ -110,9 +111,9 @@ until that mail is `HIVE_MAIL_OVERDUE_BUSY` old (default 2 h): a pane "working" 
 waiting mail is stuck. The grace is a trade-off — it ignores what the coordinator is doing, so a
 blocking call that outlasts it after the monitor expired can still ping you, and a longer grace
 notices a dead coordinator later. All four are set in whole seconds. The alert goes through the
-desktop notifier (`notify-send`, `osascript`). Only a machine without one gets a herdr toast
-instead, and herdr reports that as shown once a client has it, even when `[ui.toast] delivery`
-makes the client drop it or draw it inside the terminal.
+desktop notifier: `notify-send`, then `osascript` when the first is missing or fails. Only a
+machine with neither gets a herdr toast instead, and herdr reports that as shown once a client has
+it, even when `[ui.toast] delivery` makes the client drop it or draw it inside the terminal.
 
 herdr's own notifications cannot be limited to the coordinator's pane: with `[ui.toast] delivery`
 on or `[ui.sound]` on (herdr's default), herdr announces every turn every drone ends. Keep both off
@@ -201,7 +202,10 @@ unless `--account` or `HIVE_ACCOUNT` names another.
 
 **Requirements:** one config directory per extra account, and `tmux` for the automatic selection —
 an account's limits are read from the `/usage` panel: `hive` opens a throwaway Claude Code session in
-tmux, types `/usage` and reads the answer.
+tmux, types `/usage` and reads the answer. That session runs in `~/.herdr-hive/usage-cwd`, an empty
+directory of hive's own, and a measurement adds one entry to the measured account's `.claude.json`:
+trust for that directory, so no trust dialog stands in the way. It never trusts `$HOME` or a
+project.
 
 **1. Prepare an account directory.** A named account is `~/.claude-<name>`: its own login and its own
 `.claude.json`, everything else symlinked into `~/.claude`, so every account runs the same
@@ -247,7 +251,7 @@ drone lands on" in `skill/SKILL.md`.
 |---|---|---|
 | every drone `dead` right after a herdr update | new client, old server (`protocol_mismatch`) | `herdr status` → `restart_needed: yes`; stop the old server when no drone works, start `herdr` |
 | no `HIVE-MAIL` notifications | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
-| unwatched-mail alert never shows | no desktop notifier (`notify-send` / `osascript`), so the alert is a herdr toast that herdr drops or keeps inside the terminal; or the notifier cannot reach a desktop session | install `libnotify` (`notify-send`); the alert also waits `HIVE_UNWATCHED_GRACE` (5 min) before it fires. `journalctl --user -u hive-sweep` shows each alert the sweep raised, `NOT delivered` when the notifier failed |
+| unwatched-mail alert never shows | no desktop notifier (`notify-send` / `osascript`), so the alert is a herdr toast that herdr drops or keeps inside the terminal; or the notifier cannot reach a desktop session | install `libnotify` (`notify-send`); the alert also waits `HIVE_UNWATCHED_GRACE` (5 min) before it fires. `journalctl --user -u hive-sweep` shows each alert the sweep raised and its channel, `NOT delivered` when the notifier failed. A sweep run from cron has no session bus: give it `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` |
 | a desktop ping for every drone turn | herdr's own toasts or sounds for background agents | `[ui.toast] delivery = "off"` and `[ui.sound] enabled = false` in `~/.config/herdr/config.toml`, then `herdr server reload-config` — a running server keeps the config it started with |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
@@ -265,8 +269,8 @@ drone lands on" in `skill/SKILL.md`.
 - Claude Code account: `hive spawn <name> --account alt` runs the drone with `CLAUDE_CONFIG_DIR=~/.claude-alt`
   (`HIVE_ACCOUNT=alt` for every new drone); `~/.herdr-hive/accounts.conf` lets `hive` pick the account
   with room. Setup: "Several Claude Code accounts" above.
-- Limit measurement: `HIVE_USAGE_TIMEOUT=<seconds>` bounds each step of a `/usage` measurement
-  (default 45).
+- Limit measurement: `HIVE_USAGE_TIMEOUT=<seconds>` bounds each step of a `/usage` measurement,
+  for `hive usage` and `hive accounts` alike (default 45).
 - Swarm directory: `HIVE_DIR=/other/path` (consistently for all invocations).
 - Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
   `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.

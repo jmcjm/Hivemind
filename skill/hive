@@ -28,14 +28,15 @@ $1" 2>/dev/null; }
 
 # A duration setting in whole seconds: secs <VAR> <default>. Anything but digits ("5m", "-1")
 # gives the default and a line on stderr — left as typed it would fail every [ ] comparison it
-# meets, and the alert behind that comparison would switch off without a word.
+# meets, and the alert behind that comparison would switch off without a word. Printed in plain
+# decimal: "090" read back inside $(( )) would be taken for octal.
 secs() {
   local v="${!1:-}"
   case "$v" in
     '')       v=$2 ;;
     *[!0-9]*) echo "hive: $1='$v' is not a whole number of seconds — using $2" >&2; v=$2 ;;
   esac
-  printf '%s\n' "$v"
+  printf '%s\n' "$((10#$v))"
 }
 
 # Is the herdr server up AND willing to talk to this client? A real API round trip, because the
@@ -107,27 +108,35 @@ coord_unheard() {
   [ $(( $(date +%s) - since )) -ge "$(secs HIVE_UNWATCHED_GRACE 300)" ]
 }
 
-# Tells the human what only the human can fix, through the desktop notifier: notify-send, or
-# osascript on macOS. herdr's answer cannot stand in for that. 'notification show' says
-# "shown": true as soon as the server has handed the notification to an attached client, and the
-# client then decides by its own [ui.toast] delivery: "off" (herdr's default) drops it, "herdr"
-# draws it inside the terminal, where only somebody looking at herdr sees it. So herdr is asked
-# only on a machine without a desktop notifier, where its "shown" is the best evidence there is.
+# Tells the human what only the human can fix, through the desktop notifier: notify-send, then
+# osascript (macOS) when the first is missing or fails — a notify-send installed without a
+# notification service behind it must not keep the alert from the notifier that works.
+# herdr's answer cannot stand in for either. 'notification show' says "shown": true as soon as
+# the server has handed the notification to an attached client, and the client then decides by its
+# own [ui.toast] delivery: "off" (herdr's default) drops it, "herdr" draws it inside the terminal,
+# where only somebody looking at herdr sees it. So herdr is asked only on a machine without a
+# desktop notifier, where its "shown" is the best evidence there is.
 # hive never turns herdr toasts on for this: herdr has no per-pane switch, so its toasts would
 # also announce every turn every drone ends, with the coordinator listening the whole time.
-# Fails when the channel did not take the alert, so the caller neither rate-limits nor reports
-# a ping nobody saw.
+# Fails when no channel took the alert, so the caller neither rate-limits nor reports a ping
+# nobody saw. ALERT_VIA names the channel that took it, for the caller's trace.
+ALERT_VIA=""
 human_alert() {  # human_alert <title> <body>
+  local desktop=0 out
+  ALERT_VIA=""
   if command -v notify-send >/dev/null; then
-    notify-send -a hive "$1" "$2" >/dev/null 2>&1
-  elif command -v osascript >/dev/null; then
-    osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
-      -e 'end run' "$1" "$2" >/dev/null 2>&1
-  else
-    local out
-    out=$(herdr notification show "$1" --body "$2" --sound request 2>/dev/null)
-    [ "$(jqp "print(r.get('shown') is True)" <<<"$out")" = True ]
+    desktop=1
+    notify-send -a hive "$1" "$2" >/dev/null 2>&1 && { ALERT_VIA="notify-send"; return 0; }
   fi
+  if command -v osascript >/dev/null; then
+    desktop=1
+    osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+      -e 'end run' "$1" "$2" >/dev/null 2>&1 && { ALERT_VIA="osascript"; return 0; }
+  fi
+  [ "$desktop" = 0 ] || return 1
+  out=$(herdr notification show "$1" --body "$2" --sound request 2>/dev/null)
+  [ "$(jqp "print(r.get('shown') is True)" <<<"$out")" = True ] || return 1
+  ALERT_VIA='herdr toast (herdr says shown; nothing is displayed when [ui.toast] delivery is "off")'
 }
 
 # Computes the event line for a coord letter: sender, kind, subject — never the body. Control
@@ -327,6 +336,13 @@ drone_remove() {
 # named one: its own CLAUDE_CONFIG_DIR at ~/.claude-<name>, holding its own login and its own
 # .claude.json (trust, onboarding, MCP servers). HIVE_ACCOUNT sets the account 'spawn' uses when no
 # --account is given; "" or "default" is the default account.
+# onboarded <.claude.json> — has the account behind this config finished Claude Code's onboarding?
+# Without the flag Claude Code opens on its onboarding screens, whatever else the config holds.
+onboarded() {
+  python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('hasCompletedOnboarding') is True else 1)" \
+      "$1" 2>/dev/null
+}
+
 # account_dir <name> — prints the account's config dir, nothing for the default account. Refuses an
 # account that is not logged in or never finished onboarding: the drone would hang on the login or
 # onboarding screen, which the startup bootstrap does not answer.
@@ -338,8 +354,7 @@ account_dir() {
   [ -d "$d" ] || die "account '$acc': no config dir $d"
   [ -f "$d/.credentials.json" ] \
     || die "account '$acc' is not logged in — run: CLAUDE_CONFIG_DIR=$d claude   (then /login)"
-  python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('hasCompletedOnboarding') is True else 1)" \
-      "$d/.claude.json" 2>/dev/null \
+  onboarded "$d/.claude.json" \
     || die "account '$acc' never finished onboarding — run once interactively: CLAUDE_CONFIG_DIR=$d claude"
   echo "$d"
 }
@@ -351,9 +366,12 @@ account_label() { case "${1:-}" in ""|default) echo default ;; *) echo "$1" ;; e
 # "Do you trust this folder?" dialog. That dialog appears despite --dangerously-skip-permissions
 # (it is a separate gate), and its default button is "No, exit", which QUITS Claude Code — so
 # answering it blind by keystroke kills the drone. Setting hasTrustDialogAccepted in the config
-# makes the dialog never appear. Best-effort: every failure path is non-fatal (an unparseable or
-# concurrently-written config is left untouched), and the keystroke bootstrap in cmd_spawn stays
-# as a fallback. The config is the drone's account, never the caller's CLAUDE_CONFIG_DIR: the drone
+# makes the dialog never appear. Best-effort: every failure path is non-fatal (an unparseable
+# config is left untouched), and the keystroke bootstrap in cmd_spawn stays as a fallback. A config
+# that does not exist is not created: an account that never ran has no trust to seed, and a file
+# holding nothing but this entry would be the first thing Claude Code finds there. A symlinked
+# config is written at its target, so it stays a link.
+# The config is the drone's account, never the caller's CLAUDE_CONFIG_DIR: the drone
 # shell is spawned by the herdr server and does not inherit the caller's environment (a coordinator
 # running on a second account exports CLAUDE_CONFIG_DIR into every command it runs).
 ensure_trusted() {
@@ -361,13 +379,11 @@ ensure_trusted() {
   if [ -n "${2:-}" ]; then cfg="$2/.claude.json"; else cfg="$HOME/.claude.json"; fi
   python3 - "$cfg" "$cwd" <<'PY' 2>/dev/null || true
 import json,os,sys,tempfile
-cfg,cwd=sys.argv[1],sys.argv[2]
+cfg,cwd=os.path.realpath(sys.argv[1]),sys.argv[2]
 try:
     with open(cfg) as f: d=json.load(f)
-except FileNotFoundError:
-    d={}
 except Exception:
-    sys.exit(0)          # never clobber a config we could not parse
+    sys.exit(0)          # no config, or one we could not parse: never create, never clobber
 if not isinstance(d,dict): sys.exit(0)
 proj=d.setdefault("projects",{})
 if not isinstance(proj,dict): sys.exit(0)
@@ -379,7 +395,10 @@ dd=os.path.dirname(cfg) or "."
 fd,tmp=tempfile.mkstemp(dir=dd)
 try:
     with os.fdopen(fd,"w") as f: json.dump(d,f,indent=2,ensure_ascii=False)
-    os.replace(tmp,cfg)                 # atomic swap; a racing writer loses at most this flag
+    # Atomic swap, but read-modify-write without Claude Code's own lock: whatever a running session
+    # writes between the read above and this replace is lost. A window of milliseconds, entered once
+    # per account and directory — the flag is set once and found set from then on.
+    os.replace(tmp,cfg)
 except Exception:
     try: os.unlink(tmp)
     except OSError: pass
@@ -388,37 +407,60 @@ PY
 
 # --- account selection ------------------------------------------------------
 # A fleet burns an account's limits in hours, so a new drone lands on the account that has room:
-# accounts.conf lists the accounts in the owner's order, usage-cache.json holds the last /usage
-# measurement of each, and 'hive accounts' shows both. Without accounts.conf nothing here runs and
-# a drone stays on the default account, as before.
+# accounts.conf lists the accounts in the human's order of preference, usage-cache.json holds the
+# last /usage measurement of each, and 'hive accounts' shows both. Without accounts.conf nothing
+# here runs and a drone stays on the default account, as before.
 ACCOUNTS_CONF="$HIVE_DIR/accounts.conf"
 USAGE_CACHE="$HIVE_DIR/usage-cache.json"
 
-# usage_precheck <account> <cwd> — what must hold before a measurement: tmux, the directory, the
-# account. Says why on stderr; returns 3 when the account cannot run Claude Code at all, 1 otherwise.
-usage_precheck() {
-  command -v tmux >/dev/null || { echo "hive: usage: tmux not found" >&2; return 1; }
-  (cd "$2") 2>/dev/null || { echo "hive: usage: no such directory: $2" >&2; return 1; }
-  (account_dir "$1") >/dev/null || return 3     # in a subshell: account_dir dies, and only it may
+# usage_home — prints the directory /usage is measured in, creating it. It is hive's own and empty:
+# no project hooks, MCP servers or CLAUDE.md load there, and trusting it for an account trusts
+# nothing else. Never $HOME: Claude Code looks for trust in the parent directories too, so a trusted
+# home covers every directory under it that is not inside a git repository — which is why Claude
+# Code itself keeps trust for the home directory to the session.
+usage_home() {
+  local d="$HIVE_DIR/usage-cwd"
+  mkdir -p -m 700 "$d" 2>/dev/null || { echo "hive: usage: cannot create $d" >&2; return 1; }
+  echo "$d"
 }
 
-# usage_capture <account> <cwd> <timeout> — prints the raw /usage panel of one account.
-# Starts a fresh `claude` in a tmux session (in a TRUSTED directory — the trust dialog is not answered
-# on purpose), types /usage, captures the panel and kills the session. Returns 3 when the account
-# cannot run Claude Code at all (not logged in, no config dir), 1 when the measurement failed.
+# usage_precheck <account> [cwd] — what must hold before a measurement: tmux, the directory when
+# one is given, the account. Says why on stderr; returns 3 when the account cannot run Claude Code
+# at all, 1 otherwise.
+usage_precheck() {
+  command -v tmux >/dev/null || { echo "hive: usage: tmux not found" >&2; return 1; }
+  [ -z "${2:-}" ] || (cd "$2") 2>/dev/null || { echo "hive: usage: no such directory: $2" >&2; return 1; }
+  (account_dir "$1") >/dev/null || return 3     # in a subshell: account_dir dies, and only it may
+  # account_dir vouches for a named account only. The default one has to be past its onboarding
+  # too: /usage typed into the first-run screens would answer their questions.
+  case "$1" in ""|default)
+    onboarded "$HOME/.claude.json" \
+      || { echo "hive: account 'default' never finished onboarding — run once interactively: claude" >&2; return 3; } ;;
+  esac
+}
+
+# usage_capture <account> <timeout> [cwd] — prints the raw /usage panel of one account.
+# Starts a fresh `claude` in a tmux session, types /usage, captures the panel and kills the session.
+# The session runs in hive's own measurement directory (usage_home), pre-trusted for the measured
+# account. A cwd given instead (hive usage --cwd) has to be trusted by that account already: the
+# trust dialog is not answered on purpose, and a measurement trusts no directory but hive's own.
+# Returns 3 when the account cannot run Claude Code at all (not logged in, no config dir), 1 when
+# the measurement failed.
 # MUST run in a subshell — $(...) or ( ... ) & — because the EXIT trap that kills the throwaway
 # session belongs to that subshell. The trap covers a hive that exits or is killed by TERM/INT/HUP;
 # sessions orphaned by SIGKILL are collected by usage_sweep at the next measurement.
 usage_capture() {
-  local account="$1" cwd="$2" timeout="$3"
+  local account="$1" timeout="$2" cwd="${3:-}" own=0
+  [ -n "$cwd" ] || { cwd=$(usage_home) || return 1; own=1; }
   usage_precheck "$account" "$cwd" || return $?
   cwd=$(cd "$cwd" && pwd)   # absolute, because the trust key in .claude.json is the absolute path
   local acc_dir; acc_dir=$(account_dir "$account")
   # The measured account is set explicitly both ways: the caller's CLAUDE_CONFIG_DIR (a coordinator
-  # on a second account exports it) must not decide which account's limits get printed. A named
-  # account gets its cwd pre-trusted like a drone's — a fresh account trusts no folder at all.
+  # on a second account exports it) must not decide which account's limits get printed.
   local acc_env="-u CLAUDE_CONFIG_DIR"
-  if [ -n "$acc_dir" ]; then acc_env="CLAUDE_CONFIG_DIR=$(printf '%q' "$acc_dir")"; ensure_trusted "$cwd" "$acc_dir"; fi
+  [ -n "$acc_dir" ] && acc_env="CLAUDE_CONFIG_DIR=$(printf '%q' "$acc_dir")"
+  # After the precheck, so the config written to is that of an account known to run.
+  [ "$own" = 1 ] && ensure_trusted "$cwd" "$acc_dir"
   # The account is part of the name: accounts are measured in parallel from one hive process.
   # tmux matches a bare target by PREFIX — "-t …-ab" would hit the session of account "abc" — so
   # every target is exact: "=name" for a session, "=name:" for its pane.
@@ -435,7 +477,7 @@ usage_capture() {
     out=$(tmux capture-pane -t "=$ses:" -p 2>/dev/null)
     case "$out" in
       *"Yes, I trust this folder"*)
-        echo "hive: usage: $cwd is not a trusted folder for Claude Code — run from a trusted project or pass --cwd" >&2
+        echo "hive: usage: $cwd is not a trusted folder for account '$(account_label "$account")' — leave --cwd out to measure in hive's own directory" >&2
         return 1 ;;
       *"Select login method"*)
         # A credentials file with a dead token: Claude Code opens on the login selector, whose
@@ -474,15 +516,15 @@ usage_capture() {
 #   rank                  the accounts a spawn may take, best first: <name>\t<reason> per line
 #   room <name>           exit 0 when that account still has room for the drone running on it; prints why
 accounts_py() {
-  python3 - "$ACCOUNTS_CONF" "$USAGE_CACHE" "$@" <<'PY'
-import json, os, re, sys, tempfile, time
+  python3 - "$ACCOUNTS_CONF" "$USAGE_CACHE" "$SKILL_DIR/accounts.conf.example" "$@" <<'PY'
+import json, os, re, shlex, sys, tempfile, time
 from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
 
-conf_path, cache_path, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+conf_path, cache_path, example_path, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
 HOME = os.path.expanduser('~')
 now = int(time.time())
 
@@ -506,8 +548,12 @@ def load_conf():
     try:
         raw = open(conf_path, encoding='utf-8').read()
     except FileNotFoundError:
+        start = 'Create it, '
+        if os.path.isfile(example_path):     # the commented example install.sh puts next to hive
+            start = (f'Start from the commented example:\n\n'
+                     f'  cp {shlex.quote(example_path)} {shlex.quote(conf_path)}\n\nThe format: ')
         fail(f'no config at {conf_path} — without it a drone stays on the default account.\n'
-             f'Create it, {FORMAT}', 2)
+             f'{start}{FORMAT}', 2)
     except (OSError, UnicodeDecodeError) as e:      # unreadable, a directory, not text
         fail(f'{conf_path} cannot be read: {e}')
     conf, errs = {'max_age': 10, 'accounts': []}, []
@@ -921,9 +967,10 @@ PY
 # usage_sweep — kills the measurement sessions of hive processes that no longer exist. A hive killed
 # by SIGKILL runs no trap, and its throwaway Claude Code sessions would sit in tmux for good. The pid
 # in the session name says whose it is; the session of a live hive is a measurement in progress.
+# The name without an account is the one 'hive usage' gave its session before accounts existed.
 usage_sweep() {
   local ses pid
-  for ses in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^hive-usage-[0-9]+-[a-z0-9_-]+$'); do
+  for ses in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^hive-usage-[0-9]+(-[a-z0-9_-]+)?$'); do
     pid=${ses#hive-usage-}; pid=${pid%%-*}
     kill -0 "$pid" 2>/dev/null || tmux kill-session -t "=$ses" 2>/dev/null
   done
@@ -932,11 +979,14 @@ usage_sweep() {
 # accounts_refresh <all|stale> — measures the enabled accounts (all of them, or the ones whose
 # measurement is older than max_age) in parallel, one throwaway session each, and stores the result.
 # Serialised by a lock: two spawns that both find the cache stale measure once. Each step of a
-# measurement (Claude Code starting, the panel loading) is bounded by HIVE_USAGE_TIMEOUT seconds.
+# measurement (Claude Code starting, the panel loading) is bounded by HIVE_USAGE_TIMEOUT seconds,
+# and the wait for the lock covers a whole measurement of that length: both steps and the rest.
 accounts_refresh() {
-  local mode="$1" timeout="${HIVE_USAGE_TIMEOUT:-45}" names n tmp rc=0
+  local mode="$1" timeout names n tmp rc=0
+  timeout=$(secs HIVE_USAGE_TIMEOUT 45)
+  local patience=$(( 2 * timeout + 60 ))
   exec 7>"$HIVE_DIR/.usage-lock"
-  flock -w 150 7 || { echo "hive: accounts: another measurement holds the lock (150 s) — nothing measured" >&2; return 1; }
+  flock -w "$patience" 7 || { echo "hive: accounts: another measurement holds the lock ($patience s) — nothing measured" >&2; return 1; }
   # Decided under the lock: a measurement another process has just stored makes this one a no-op.
   names=$(accounts_py due "$mode") || { flock -u 7; return 1; }
   if [ -n "$names" ]; then
@@ -946,12 +996,8 @@ accounts_refresh() {
     echo "accounts: measuring $(echo $names) — /usage in a throwaway session each, up to ${timeout}s per step" >&2
     local -a pids=()
     for n in $names; do
-      # The session runs in $HOME, where no project hooks or MCP servers load. usage_capture
-      # pre-trusts it for a named account; the default account gets it here, the way a spawn
-      # without --cwd does — otherwise its measurement would stop on the trust dialog.
-      [ "$n" = default ] && ensure_trusted "$(cd "$HOME" && pwd)"
       # fd 7 is closed for the child — a tmux server born here would otherwise hold the lock for good.
-      ( usage_capture "$n" "$HOME" "$timeout" >"$tmp/$n.panel" 2>"$tmp/$n.err"; echo $? >"$tmp/$n.rc" ) 7>&- &
+      ( usage_capture "$n" "$timeout" >"$tmp/$n.panel" 2>"$tmp/$n.err"; echo $? >"$tmp/$n.rc" ) 7>&- &
       pids+=($!)
     done
     wait "${pids[@]}"
@@ -996,8 +1042,9 @@ account_pick() {
 }
 
 # auto_account — true when the account is hive's to choose: accounts.conf exists and HIVE_ACCOUNT
-# does not pin one. (--account is checked by the caller: it always wins.)
-auto_account() { [ -z "${HIVE_ACCOUNT:-}" ] && [ -f "$ACCOUNTS_CONF" ]; }
+# does not pin one. (--account is checked by the caller: it always wins.) Anything of that name
+# counts, not only a file: a directory there is a broken config to refuse, not a missing one.
+auto_account() { [ -z "${HIVE_ACCOUNT:-}" ] && [ -e "$ACCOUNTS_CONF" ]; }
 
 # --- commands -------------------------------------------------------------
 
@@ -1835,7 +1882,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
       # in the journal — also when no channel took it.
       coord_stranded_notice
       case $? in
-        0) echo "sweep: unwatched-mail alert (${#letters[@]} letters)" ;;
+        0) echo "sweep: unwatched-mail alert (${#letters[@]} letters) via $ALERT_VIA" ;;
         2) echo "sweep: unwatched-mail alert NOT delivered (${#letters[@]} letters) — the desktop notifier failed, or there is none and herdr showed nothing" ;;
       esac
     fi
@@ -1864,7 +1911,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
     if human_alert "Swarm mail unread for $((age/60)) min" \
          "${#letters[@]} letter(s) for coord — run hive inbox in the coordinator pane"; then
       : > "$mark"        # only an alert that went out starts the re-nag interval
-      echo "sweep: overdue mail reminder (${#letters[@]} letters, $((age/60)) min old)"
+      echo "sweep: overdue mail reminder (${#letters[@]} letters, $((age/60)) min old) via $ALERT_VIA"
     else
       echo "sweep: overdue mail reminder NOT delivered (${#letters[@]} letters, $((age/60)) min old) — the desktop notifier failed, or there is none and herdr showed nothing"
     fi
@@ -1966,11 +2013,13 @@ gate_queue_print() {
   done < "$qf"
 }
 
-cmd_usage() {  # usage [--cwd DIR] [--timeout SEC] — measures the account limits with a throwaway Claude session (/usage)
+cmd_usage() {  # usage [--account NAME] [--timeout SEC] [--cwd DIR] — measures the account limits with a throwaway Claude session (/usage)
   # The coordinator cannot see the usage counter from inside its own session, and a fleet of drones burns
-  # the weekly limit in hours. This starts a fresh `claude` in a tmux session (in a TRUSTED directory —
-  # the trust dialog is not answered on purpose), types /usage, captures the panel and kills the session.
-  local cwd="$PWD" timeout=45 account="${HIVE_ACCOUNT:-}"
+  # the weekly limit in hours. This starts a fresh `claude` in a tmux session, types /usage, captures
+  # the panel and kills the session. The session runs in hive's own measurement directory; --cwd
+  # runs it elsewhere, in a directory the account already trusts.
+  local cwd="" timeout account="${HIVE_ACCOUNT:-}"
+  timeout=$(secs HIVE_USAGE_TIMEOUT 45)
   while [ $# -gt 0 ]; do
     case "$1" in
       --cwd) cwd="${2:?--cwd needs a path}"; shift 2 ;;
@@ -1979,9 +2028,10 @@ cmd_usage() {  # usage [--cwd DIR] [--timeout SEC] — measures the account limi
       *) echo "hive: usage: unknown argument $1" >&2; return 2 ;;
     esac
   done
+  [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "hive: usage: --timeout takes whole seconds, not '$timeout'" >&2; return 2; }
   usage_precheck "$account" "$cwd" || return 1
   echo "account: $(account_label "$account")"
-  local out; out=$(usage_capture "$account" "$cwd" "$timeout") || return 1
+  local out; out=$(usage_capture "$account" "$timeout" "$cwd") || return 1
   # Print the panel compactly: the section label, its percentage and its reset time; strip the bars.
   printf '%s\n' "$out" | sed 's/[█▌▏▎▍▋▊▉ ]\{3,\}/ /g' | grep -E 'Current session|Current week|% used|Resets|promo' \
     | sed 's/^ *//' | uniq
@@ -2175,7 +2225,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300s)
   hive report <name>                 show a drone's report
   hive mute   <name> [--off]         silence automatic wake-ups (conversational drone)
-  hive usage  [--cwd DIR] [--account NAME]  measure the account limits (/usage in a throwaway session)
+  hive usage  [--account NAME]       measure the account limits (/usage in a throwaway session)
   hive accounts [--refresh] [--pick] accounts table: limits, resets, status, and the one a spawn takes
                                      (--refresh measures every enabled account; --pick prints the pick and why)
   hive peek   <name> [lines]         view of the drone's terminal
@@ -2192,8 +2242,9 @@ hive — command a swarm of Claude Code agents in herdr
 Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/
 Accounts: --account NAME runs on CLAUDE_CONFIG_DIR=~/.claude-NAME (logged in, onboarded);
           HIVE_ACCOUNT sets the default for spawn and usage; none/"default" = ~/.claude.
-          With ~/.herdr-hive/accounts.conf, spawn and revive without --account/HIVE_ACCOUNT take the
-          account 'hive accounts' marks SELECTED: lowest prio under its threshold, measured by /usage.
+          With ~/.herdr-hive/accounts.conf, spawn without --account/HIVE_ACCOUNT takes the account
+          'hive accounts' marks SELECTED: lowest prio under its threshold, measured by /usage.
+          revive keeps a drone on its account while that account has room.
 EOF
   ;;
 esac

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Stand-in for tmux in tests/accounts: no session ever starts, no Claude Code runs.
 # State lives in $FAKE_TMUX_DIR; every call is appended to $FAKE_TMUX_DIR/log.
-#   new-session    records which account the session belongs to (from the CLAUDE_CONFIG_DIR in the command)
+#   new-session    records which account the session belongs to (from the CLAUDE_CONFIG_DIR in the
+#                  command) and the directory it starts in (-c): "new <session> <account> <cwd>"
 #   send-keys      '/usage' followed by Enter opens the panel
 #   capture-pane   the prompt screen, then $FAKE_PANELS/<account>.txt once the panel is open
 #   kill-session   forgets the session
@@ -14,9 +15,12 @@
 set -u
 dir="${FAKE_TMUX_DIR:?}"; panels="${FAKE_PANELS:?}"
 sub="${1:-}"; shift || true
-target=""; args=("$@")
+target=""; cwd=""; args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
-  case "${args[i]}" in -t|-s) target="${args[i+1]}" ;; esac
+  case "${args[i]}" in
+    -t|-s) target="${args[i+1]}" ;;
+    -c)    cwd="${args[i+1]}" ;;
+  esac
 done
 ses="$target"
 if [ "$sub" != new-session ] && [ -n "$target" ]; then
@@ -35,7 +39,7 @@ case "$sub" in
     [[ "$cmd" =~ CLAUDE_CONFIG_DIR=[^[:space:]]*/\.claude-([a-z0-9_-]+) ]] && acc="${BASH_REMATCH[1]}"
     [ -f "$panels/$acc.nosession" ] && { sleep 1; exit 1; }
     echo "$acc" > "$dir/$ses.account"
-    echo "new $ses $acc" >> "$dir/log" ;;
+    echo "new $ses $acc $cwd" >> "$dir/log" ;;
   list-sessions)
     for f in "$dir"/*.account; do [ -f "$f" ] && basename "$f" .account; done ;;
   send-keys)
