@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stand-in for the desktop notifier: every alert lands in $FAKE_NOTIFY_LOG.
+printf '%s\n' "$*" >> "${FAKE_NOTIFY_LOG:-/dev/null}"
+exit 0

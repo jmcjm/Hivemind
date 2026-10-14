@@ -20,13 +20,15 @@ ls "$box"/*.json >/dev/null 2>&1 || exit 0          # no unread mail — nothing
 pane=$(cat "$HIVE_DIR/coord.pane" 2>/dev/null); [ -n "$pane" ] || exit 0
 command -v herdr >/dev/null 2>&1 || exit 0
 
-payload=$(cat 2>/dev/null || true)
+# The payload goes to Python on stdin, not as an argument: it carries the last assistant message,
+# and one over 128 KB (MAX_ARG_STRLEN) would not even start the interpreter.
 read -r sid loop <<<"$(python3 -c "
 import json,sys
-try: d=json.loads(sys.argv[1] or '{}')
+try: d=json.loads(sys.stdin.read() or '{}')
 except Exception: d={}
+if not isinstance(d,dict): d={}
 print(d.get('session_id') or '-', 1 if d.get('stop_hook_active') else 0)
-" "$payload" 2>/dev/null)" || true
+" 2>/dev/null)" || true
 # One nag per stop attempt, never a block loop: if we already blocked this stop and the
 # model still could not empty the mailbox, forcing it around again will not help.
 [ "${loop:-0}" = 1 ] && exit 0
@@ -40,7 +42,10 @@ p=d.get('result',d).get('pane') or {}
 print(((p.get('agent_session') or {}).get('value')) or '')" 2>/dev/null)
 [ "$sid" = "$pane_sid" ] || exit 0                  # not the registered coordinator
 
-n=$(ls "$box"/*.json 2>/dev/null | wc -l | tr -d ' ')
+# Only loud letters hold the turn (hive's mail_scan): a turn a drone ended without a report wakes
+# nobody, so it must not bounce the coordinator either. It waits for the next 'hive inbox'.
+n=$("$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/hive" _loud 2>/dev/null)
+[ "${n:-0}" -gt 0 ] 2>/dev/null || exit 0
 python3 - "$n" <<'PY'
 import json, sys
 n = sys.argv[1]

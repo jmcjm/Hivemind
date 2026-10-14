@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stand-in for herdr in tests/ctx. A pane exists when $FAKE_PANES/<pane>.status does; its content
+# is the agent status, <pane>.sid the session id herdr reports, <pane>.screen what 'pane read' shows.
+# FAKE_CURRENT_PANE is the pane 'pane current' answers with (none when unset).
+set -u
+printf '%s\n' "$*" >> "${FAKE_HERDR_LOG:-/dev/null}"
+case "${1:-} ${2:-}" in
+  "workspace list") echo '{"result":{"workspaces":[]}}' ;;
+  "pane get")
+    st=$(cat "${FAKE_PANES:?}/$3.status" 2>/dev/null) || exit 1
+    sid=$(cat "$FAKE_PANES/$3.sid" 2>/dev/null)
+    printf '{"result":{"pane":{"pane_id":"%s","agent":"claude","agent_status":"%s","agent_session":{"kind":"id","value":"%s"}}}}\n' "$3" "$st" "$sid" ;;
+  "pane read") cat "${FAKE_PANES:?}/$3.screen" 2>/dev/null ;;
+  "pane current")
+    [ -n "${FAKE_CURRENT_PANE:-}" ] || exit 1
+    printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$FAKE_CURRENT_PANE" ;;
+esac
+exit 0

@@ -7,10 +7,12 @@ When the user says "run the hivemind", "manage the swarm", "delegate this to the
 **I load the `hivemind` skill** (`~/.claude/skills/hivemind/SKILL.md`); the full doctrine and herdr traps live there.
 
 The tool: `~/.claude/skills/hivemind/hive` (a wrapper around `herdr`, it is in PATH) — `spawn`, `task`, `say`, `clear`,
-`send`, `inbox`, `watch`, `coord`, `status`, `wait`, `report`, `peek`, `kill`, `rename`, `revive`.
+`send`, `inbox`, `watch`, `coord`, `coord-start`, `status`, `wait`, `report`, `peek`, `kill`, `rename`, `revive`.
 Swarm data: `~/.herdr-hive/` (`drones/<name>/`, `mail/<recipient>/`).
 **When taking over a swarm I run `hive coord` and arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`** —
-the watcher is how I hear drones, and I re-arm it every time it expires.
+the watcher is how I hear drones, and I re-arm it every time it expires. My own session is best started with
+`hive coord-start` in a plain herdr pane: it runs in `~/.herdr-hive/coord/` with auto-compaction and a guard that
+asks me to save my state before the compaction comes.
 
 A session with `HIVE_DRONE` set (or `HERDR_HIVE_ROLE=drone`) is a **drone**, not a coordinator: it executes the brief,
 writes `report.md`, reports blockers via `hive send coord`, and does NOT spawn its own herdr sessions
@@ -29,3 +31,4 @@ Rules in short (details in the skill):
 - Drones also talk to each other (`hive send <drone>`); they get the protocol in their system prompt at spawn
 - **Never a blocking wait without a limit** — a drone can get stuck, and then I hang with it and the user loses the coordinator
 - CLAUDE.md rules bind the drones — a drone with bypass permissions will ask about nothing, so I write boundaries into the brief
+  (one `Rules: <blocks>` line pulls them from `~/.herdr-hive/rules/`; `hive task` refuses a brief without boundaries)

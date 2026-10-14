@@ -45,7 +45,8 @@ fi
 echo "== 2/9 Skill files =="
 mkdir -p "$SKILL_DST"
 for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-inject.sh \
-         coord-compact-brief.sh coord-creed.md drone-settings.json accounts.conf.example SKILL.md; do
+         coord-compact-brief.sh coord-context-guard.sh coord-creed.md drone-settings.json \
+         coord-settings.json coord-CLAUDE.md accounts.conf.example SKILL.md; do
   if [ -e "$SKILL_DST/$f" ] && ! cmp -s "$SRC/skill/$f" "$SKILL_DST/$f"; then
     cp "$SKILL_DST/$f" "$SKILL_DST/$f.bak-$STAMP"
     warn "existing $f archived as $f.bak-$STAMP"
@@ -53,7 +54,8 @@ for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-injec
   cp "$SRC/skill/$f" "$SKILL_DST/$f"
 done
 chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-check.sh" \
-         "$SKILL_DST/coord-creed-inject.sh" "$SKILL_DST/coord-compact-brief.sh"
+         "$SKILL_DST/coord-creed-inject.sh" "$SKILL_DST/coord-compact-brief.sh" \
+         "$SKILL_DST/coord-context-guard.sh"
 ok "skill in $SKILL_DST"
 
 echo "== 3/9 hive in PATH =="
@@ -189,11 +191,21 @@ bash -n "$SKILL_DST/coord-mail-check.sh"    || die "coord-mail-check.sh: syntax 
 bash -n "$SKILL_DST/coord-scope.sh"         || die "coord-scope.sh: syntax error"
 bash -n "$SKILL_DST/coord-creed-inject.sh"  || die "coord-creed-inject.sh: syntax error"
 bash -n "$SKILL_DST/coord-compact-brief.sh" || die "coord-compact-brief.sh: syntax error"
+bash -n "$SKILL_DST/coord-context-guard.sh" || die "coord-context-guard.sh: syntax error"
 python3 -c "import json;json.load(open('$SKILL_DST/drone-settings.json'))" || die "drone-settings.json: invalid JSON"
+python3 -c "import json;json.load(open('$SKILL_DST/coord-settings.json'))" || die "coord-settings.json: invalid JSON"
 "$SKILL_DST/hive" >/dev/null        || die "hive does not start"
 ok "syntax and JSON valid"
-mkdir -p "$HOME/.herdr-hive/drones" "$HOME/.herdr-hive/mail"
+mkdir -p "$HOME/.herdr-hive/drones" "$HOME/.herdr-hive/mail" "$HOME/.herdr-hive/rules" "$HOME/.herdr-hive/coord"
 ok "swarm directories ready"
+# The coordinator's own directory (hive coord-start) gets a short CLAUDE.md to start from — once:
+# after that the file is the user's.
+if [ -e "$HOME/.herdr-hive/coord/CLAUDE.md" ]; then
+  ok "coordinator CLAUDE.md already present — left as it is"
+else
+  cp "$SKILL_DST/coord-CLAUDE.md" "$HOME/.herdr-hive/coord/CLAUDE.md"
+  ok "coordinator CLAUDE.md template in $HOME/.herdr-hive/coord/"
+fi
 
 cat <<EOF
 
@@ -204,10 +216,15 @@ Installed. Smoke test (requires a running herdr server):
   hive spawn testdrone
   hive task testdrone - <<'BRIEF'
   # Brief: testdrone
-  Count the files in the home directory and report the number. Boundaries: read-only.
+  Count the files in the home directory and report the number.
+  ## Boundaries
+  Read-only: change nothing.
   BRIEF
   # do not poll — wait for the watcher's HIVE-MAIL notification, then:
   hive inbox && hive report testdrone && hive kill testdrone --purge
+
+For daily use start the coordinator itself with 'hive coord-start' in a plain herdr pane: its own
+directory, auto-compaction and the context guard (README, "The coordinator session").
 
 Full manual and traps: $SKILL_DST/SKILL.md
 EOF

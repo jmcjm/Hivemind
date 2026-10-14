@@ -139,21 +139,74 @@ human_alert() {  # human_alert <title> <body>
   ALERT_VIA='herdr toast (herdr says shown; nothing is displayed when [ui.toast] delivery is "off")'
 }
 
-# Computes the event line for a coord letter: sender, kind, subject — never the body. Control
-# characters are flattened, because every stdout line of the watcher is a separate notification.
-# The caller prints the line, so that a failed write can stop the watcher.
-watch_line() {
-  python3 - "$1" <<'PY' 2>/dev/null
+# mail_scan <letter.json>... — one line per letter: "L|Q<TAB>path<TAB>sender [kind] subject", never
+# the body. L = loud: the letter wakes the coordinator. Q = quiet: it waits in the mailbox for the
+# next 'hive inbox' and wakes nobody. Control characters are flattened, because every stdout line of
+# the watcher is a separate notification. A letter archived between the listing and this read is
+# skipped. A letter that is there but cannot be read (cut short on a full disk, dropped in by hand,
+# another format) is loud: skipping it would hide it from the watcher, the backstop, the sweep and
+# the reminder at once.
+# Quiet is a turn a drone ended without a report — almost always a drone waiting on its own
+# background work (tests, mutants, CI), 149 of 289 watcher events in one measured afternoon. A
+# drone that stays stuck that way is the sweep's to report, once (cmd_sweep). Everything else stays
+# loud: messages, questions, a turn ended with a report, sweep findings, mail from outside the swarm.
+# The subject is the one drone-ping.sh writes: "finished a turn (report: no report)".
+# HIVE_WATCH_ALL=1 makes every letter loud again.
+mail_scan() {
+  [ $# -gt 0 ] || return 0
+  python3 - "$@" <<'PY' 2>/dev/null
 import json,os,re,sys
-try:
-    e=json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)          # archived by 'hive inbox' between the listing and this read
+labels=json.loads(os.environ.get('MAIL_KIND_LABELS','{}'))
+every=os.environ.get('HIVE_WATCH_ALL')=='1'
 flat=lambda s: re.sub(r'[\x00-\x1f\x7f]+',' ',str(s or '')).strip()
-kind=json.loads(os.environ.get('MAIL_KIND_LABELS','{}')).get(e.get('kind'),'message')
-line=f"HIVE-MAIL {flat(e.get('from')) or '?'} [{kind}] {flat(e.get('subject'))}"
-print(line if len(line)<=120 else line[:117]+'...')
+for p in sys.argv[1:]:
+    try:
+        e=json.load(open(p))
+    except FileNotFoundError:
+        continue
+    except Exception:
+        e=None
+    if not isinstance(e,dict):
+        print(f"L\t{p}\t? [message] (unreadable letter: {os.path.basename(p)})")
+        continue
+    subject=flat(e.get('subject'))
+    quiet=(not every and e.get('kind')=='done'
+           and re.search(r'\(report: no report\b',subject) is not None)
+    item=f"{flat(e.get('from')) or '?'} [{labels.get(e.get('kind'),'message')}] {subject}"
+    print(f"{'Q' if quiet else 'L'}\t{p}\t{item}")
 PY
+}
+
+# loud_letters — the letters in the coordinator's mailbox that wake it, oldest first, one path per line.
+loud_letters() {
+  local -a all=()
+  local f
+  while IFS= read -r f; do all+=("$f"); done \
+    < <(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | sort)
+  [ ${#all[@]} -gt 0 ] || return 0
+  mail_scan "${all[@]}" | awk -F'\t' '$1=="L"{print $2}'
+}
+
+# watch_flush <item>... — prints the pending loud letters as ONE notification line: a burst of mail
+# (a review drone and its subject finishing together, a sweep reporting three drones) costs the
+# coordinator one turn, not one per letter. A single letter keeps the classic line.
+WATCH_LINE_MAX=300
+watch_flush() {
+  local line
+  if [ $# -eq 1 ]; then
+    line="HIVE-MAIL $1"
+    [ ${#line} -le 120 ] || line="${line:0:117}..."
+  else
+    local item rest=$# out=""
+    for item in "$@"; do
+      [ ${#item} -le 70 ] || item="${item:0:67}..."
+      if [ $(( ${#out} + ${#item} + 40 )) -gt "$WATCH_LINE_MAX" ]; then break; fi
+      out="${out:+$out | }$item"; rest=$((rest-1))
+    done
+    line="HIVE-MAIL $# letters: $out"
+    [ "$rest" -gt 0 ] && line="$line | +$rest more"
+  fi
+  printf '%s\n' "$line"
 }
 
 # --- swarm mail -----------------------------------------------------------
@@ -193,7 +246,7 @@ coord_stranded_notice() {
   # The marker goes down before the alert, so the rest of a burst finds it at once — and comes
   # off again when nothing was shown: an alert nobody saw must not silence the next 15 minutes.
   : > "$mark"
-  n=$(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+  n=$(loud_letters | wc -l)
   human_alert "Swarm mail: no coordinator is listening" \
     "$n letter(s) waiting. In the coordinator session: hive coord, then arm Monitor(hive watch)" \
     && return 0
@@ -217,8 +270,9 @@ wake_recipient() {
     # (cmd_send forwards over ssh; this path only runs when that forward failed).
     [ -n "$(coord_remote)" ] && return 0
     # A live watcher prints the letter within a second. The human hears of it only once nobody
-    # has listened for the grace period — never during a Monitor re-arm.
-    coord_unheard && coord_stranded_notice
+    # has listened for the grace period — never during a Monitor re-arm, and never for quiet
+    # letters alone (mail_scan): nobody is woken for those, the human least of all.
+    coord_unheard && [ -n "$(loud_letters | head -1)" ] && coord_stranded_notice
     return 0
   fi
   pane=$(pane_of "$who" 2>/dev/null)
@@ -1097,8 +1151,7 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # calling pane, so a remote coordinator's registration survives untouched.
   # The rm also clears a wake-up marker left by pre-watcher versions and resets the
   # unwatched-mail alert's rate limit for the new coordinator.
-  [ -n "$coord" ] && { echo "$coord" > "$HIVE_DIR/coord.pane"
-                       rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"; }
+  [ -n "$coord" ] && coord_register "$coord"
 
   # 1 workspace per drone, label = drone name. Swarm environment variables enter here —
   # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
@@ -1209,16 +1262,112 @@ EOF
   echo "sid=$sid"
 }
 
+# Boundary blocks live in files, not in every brief. A brief line 'Rules: repo review' is replaced
+# by the full text of the common block plus each named one, so the coordinator writes one line and
+# the drone still gets the whole text. For a name N the block is $HIVE_RULES_DIR/N.md; the common
+# block (common.md) always comes first. When the brief already has a boundaries heading, the blocks
+# go to the top of that section and the line disappears; otherwise the line becomes the heading and
+# the blocks.
+# Exit status: 0 expanded or nothing to do (a brief with its own boundaries section), 3 the brief
+# has no boundaries at all, 4 a named block does not exist. Lines inside ``` or ~~~ fences and
+# indented code (4+ spaces) are text, not directives — a brief may well describe this mechanism.
+# Every directive line counts: their names are merged, in order, and all of them go; a second
+# 'Rules: review' under 'Rules: repo' would otherwise stay in the brief as dead text. A boundaries
+# heading is the word alone, optionally with a parenthesis ('## Boundaries (absolute)') — not any
+# heading that starts with it ('### Rules of the game').
+HIVE_RULES_DIR="${HIVE_RULES_DIR:-$HIVE_DIR/rules}"
+rules_expand() {  # rules_expand <brief-file> — rewrites the file in place
+  python3 - "$1" "$HIVE_RULES_DIR" <<'PY'
+import os,re,sys,tempfile
+path,rdir=sys.argv[1:3]
+lines=open(path,encoding='utf-8-sig').read().split('\n')
+line_re=re.compile(r'^ {0,3}(?:[>*_-]+\s*)*(Rules)[*_]*\s*:[*_]*\s*(.*)$', re.I)
+head_re=re.compile(r'^#{1,6}\s*\W*\s*(Boundaries|Rules)\s*([:(–—-].*)?$', re.I)
+fence=None; at=[]; head=None
+for i,l in enumerate(lines):
+    m=re.match(r'^ {0,3}(`{3,}|~{3,})',l)
+    if m:
+        if fence is None: fence=m.group(1)[0]*3; continue
+        if m.group(1).startswith(fence): fence=None; continue
+    if fence: continue
+    if head is None and head_re.match(l): head=i
+    m=line_re.match(l)
+    if m and not head_re.match(l): at.append((i,m.group(1),m.group(2)))
+if not at:
+    sys.exit(0 if head is not None else 3)
+i,kw,_=at[0]
+names=[]
+for _,_,arg in at:
+    for n in re.split(r'[\s,;`]+',arg.strip(' *_`.')):
+        if n and n not in names: names.append(n)
+def block(name):
+    f=os.path.join(rdir,name+'.md')
+    return f if os.path.isfile(f) else None
+files=[]
+common=block('common')
+if common: files.append(common)
+missing=[]
+for n in names:
+    if n.lower()=='common': continue
+    f=block(n) if re.fullmatch(r'[A-Za-z0-9_-]+',n) else None
+    if f is None: missing.append(n)
+    elif f not in files: files.append(f)
+if missing:
+    have=sorted(os.path.splitext(x)[0] for x in os.listdir(rdir) if x.endswith('.md')) if os.path.isdir(rdir) else []
+    print(f"no boundary block for: {' '.join(missing)} (in {rdir}: {' '.join(have) or 'nothing'})", file=sys.stderr)
+    sys.exit(4)
+if not files:
+    print(f"'{kw}:' names no block and {rdir} has no common.md", file=sys.stderr); sys.exit(4)
+text=[]
+for f in files:
+    body=open(f,encoding='utf-8').read().strip('\n')
+    text+=body.split('\n')+['']
+for j,_,_ in reversed(at):
+    del lines[j]
+    if head is not None and head>j: head-=1
+if head is not None:
+    lines[head+1:head+1]=['']+text
+else:
+    lines[i:i]=([''] if i>0 and lines[i-1].strip() else [])+['## Boundaries (absolute)','']+text
+d=os.path.dirname(os.path.abspath(path))
+fd,tmp=tempfile.mkstemp(dir=d)
+with os.fdopen(fd,'w',encoding='utf-8') as f: f.write('\n'.join(lines))
+os.replace(tmp,path)
+print(' '.join(os.path.basename(f) for f in files))
+PY
+}
+
 cmd_task() {  # task <name> <brief-file>  |  task <name> - (brief from stdin)
   local name="${1:?usage: hive task <name> <file|->}"; local src="${2:?missing brief}"
   local dir; dir=$(drone_dir "$name")
   [ -f "$(drone_meta "$name")" ] || die "unknown drone: $name"
   local pane; pane=$(pane_of "$name")
 
-  if [ "$src" = "-" ]; then cat > "$dir/brief.md"; else cp "$src" "$dir/brief.md"; fi
+  # The brief is checked and expanded in a staging file and replaces brief.md only once it passed:
+  # a refused brief must not take the drone's current one with it — a drone still at work would
+  # lose its brief, and the sweep stops watching a drone without one.
+  local staged="$dir/.brief.staged"
+  if [ "$src" = "-" ]; then cat > "$staged"; else cp "$src" "$staged"; fi || { rm -f "$staged"; die "cannot read the brief: $src"; }
+
+  # Every brief states its boundaries: drones run with bypass permissions and ask about nothing.
+  # 'Rules: <blocks>' pulls them from $HIVE_RULES_DIR (rules_expand); a brief with neither the
+  # line nor a boundaries section is refused. HIVE_NO_RULES=1 lets one through on purpose.
+  local rules rc
+  rules=$(rules_expand "$staged" 2>"$dir/.rules-err"); rc=$?
+  case "$rc" in
+    0) [ -n "$rules" ] && echo "task: boundaries for $name from $rules" ;;
+    3) if [ "${HIVE_NO_RULES:-0}" != 1 ]; then
+         rm -f "$staged" "$dir/.rules-err"
+         die "brief has no boundaries — add a line 'Rules: <blocks>' (blocks in $HIVE_RULES_DIR: $(ls "$HIVE_RULES_DIR" 2>/dev/null | sed -E 's/\.md$//' | tr '\n' ' ')) or a '## Boundaries' section (HIVE_NO_RULES=1 to skip on purpose)"
+       fi ;;
+    *) local why; why=$(cat "$dir/.rules-err" 2>/dev/null)
+       rm -f "$staged" "$dir/.rules-err"
+       die "brief refused: ${why:-could not expand its boundaries}" ;;
+  esac
+  rm -f "$dir/.rules-err"
 
   # reporting protocol appended to every brief
-  cat >> "$dir/brief.md" <<EOF
+  cat >> "$staged" <<EOF
 
 ---
 ## Reporting protocol (mandatory)
@@ -1236,6 +1385,7 @@ The report is the only channel to the coordinator — nobody reads your terminal
 Without a written report the task counts as not done.
 If you get stuck or need something: write a report with STATUS: BLOCKED and describe what you need.
 EOF
+  mv -f "$staged" "$dir/brief.md" || die "cannot install the brief for $name"
 
   # The previous report is archived, not deleted: it is often the input to the next turn (the
   # drone's own plan), and deleting it cut the drone off from its own conclusions.
@@ -1341,16 +1491,26 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
   # stop leaves its time in WATCH_LAST, so coord_unheard tells a re-arm gap from a coordinator gone.
   trap '[ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] && { touch "$WATCH_LAST"; rm -f "$WATCH_BEAT"; }' EXIT
   trap 'exit 0' TERM INT HUP
-  local -A seen=()
-  local f m line n=0 last_beat=$SECONDS last_remind=$SECONDS oldest unread
+  # seen: every letter already classified. loud: the ones that woke (or will wake) the coordinator —
+  # quiet letters wait for the next 'hive inbox' and never count towards the backlog or the reminder.
+  local -A seen=() loud=()
+  local f m flag path item n=0 nq=0 last_beat=$SECONDS last_remind=$SECONDS oldest unread
   local remind; remind=$(secs HIVE_MAIL_REMIND 600)
-  for f in "$box"/*.json; do
-    [ -e "$f" ] || continue
-    seen[$f]=1; n=$((n+1))
-  done
+  # A burst is gathered until the mailbox has been still for HIVE_WATCH_COALESCE seconds, but never
+  # held longer than HIVE_WATCH_COALESCE_MAX: one notification per burst, not one per letter.
+  local coalesce coalesce_max; coalesce=$(secs HIVE_WATCH_COALESCE 3); coalesce_max=$(secs HIVE_WATCH_COALESCE_MAX 15)
+  local -a pend=() fresh=()
+  local pend_first=0 pend_last=0
+  for f in "$box"/*.json; do [ -e "$f" ] && fresh+=("$f"); done
+  while IFS=$'\t' read -r flag path item; do
+    seen[$path]=1
+    if [ "$flag" = L ]; then loud[$path]=1; n=$((n+1)); else nq=$((nq+1)); fi
+  done < <(mail_scan ${fresh[@]+"${fresh[@]}"})
   # Every line is written from here and every write is checked: a watcher nobody reads any more
   # must stop, not keep a fresh heartbeat while its lines go nowhere.
-  if [ "$n" -gt 0 ]; then printf '%s\n' "HIVE-MAIL backlog: $n unread — run hive inbox" || exit 0; fi
+  if [ "$n" -gt 0 ]; then
+    printf '%s\n' "HIVE-MAIL backlog: $n unread$([ "$nq" -gt 0 ] && echo " (+$nq quiet)") — run hive inbox" || exit 0
+  fi
   while :; do
     sleep 1
     # Orphaned: the process that started us (the Monitor's session) is gone. $PPID is fixed at
@@ -1359,24 +1519,40 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
     [ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] \
       || { echo "HIVE-WATCH: taken over by another watcher — stopping"; return 0; }
     local -A now=()
+    fresh=()
     for f in "$box"/*.json; do
       [ -e "$f" ] || continue
       now[$f]=1
-      [ -n "${seen[$f]:-}" ] && continue
-      line=$(watch_line "$f"); [ -z "$line" ] || printf '%s\n' "$line" || exit 0
+      [ -n "${seen[$f]:-}" ] || fresh+=("$f")
     done
-    # Forget letters 'hive inbox' archived, so the set never grows with the watcher's lifetime.
+    if [ ${#fresh[@]} -gt 0 ]; then
+      while IFS=$'\t' read -r flag path item; do
+        seen[$path]=1
+        [ "$flag" = L ] || continue
+        loud[$path]=1; pend+=("$item")
+        [ "$pend_first" -gt 0 ] || pend_first=$SECONDS
+        pend_last=$SECONDS
+      done < <(mail_scan "${fresh[@]}")
+    fi
+    if [ ${#pend[@]} -gt 0 ] && { [ $((SECONDS - pend_last)) -ge "$coalesce" ] \
+                                   || [ $((SECONDS - pend_first)) -ge "$coalesce_max" ]; }; then
+      watch_flush "${pend[@]}" || exit 0
+      pend=(); pend_first=0; pend_last=0
+    fi
+    # Forget letters 'hive inbox' archived, so the sets never grow with the watcher's lifetime.
     # The guarded expansion keeps an empty mailbox legal under set -u on bash < 4.4.
     seen=()
     for f in ${now[@]+"${!now[@]}"}; do seen[$f]=1; done
+    for f in ${loud[@]+"${!loud[@]}"}; do [ -n "${now[$f]:-}" ] || unset 'loud[$f]'; done
     [ $((SECONDS - last_beat)) -ge 10 ] || continue
     touch "$WATCH_BEAT"; last_beat=$SECONDS
-    # Mail the coordinator heard but never took with 'hive inbox' (a letter handled without it, a
-    # turn that ended first): remind it here, every HIVE_MAIL_REMIND, in its own session — long
-    # before the sweep takes unread mail to the human (HIVE_MAIL_OVERDUE).
+    # Loud mail the coordinator heard but never took with 'hive inbox' (a letter handled without it,
+    # a turn that ended first): remind it here, every HIVE_MAIL_REMIND, in its own session — long
+    # before the sweep takes unread mail to the human (HIVE_MAIL_OVERDUE). Quiet letters never
+    # remind: they would turn the filter's silence into a nag every ten minutes.
     [ $((SECONDS - last_remind)) -ge "$remind" ] || continue
     oldest=$(date +%s); unread=0
-    for f in ${now[@]+"${!now[@]}"}; do
+    for f in ${loud[@]+"${!loud[@]}"}; do
       m=$(stat -c %Y "$f" 2>/dev/null) || continue
       unread=$((unread+1)); [ "$m" -lt "$oldest" ] && oldest=$m
     done
@@ -1384,6 +1560,54 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
     printf '%s\n' "HIVE-MAIL reminder: $unread unread, oldest $(( ($(date +%s) - oldest) / 60 )) min — run hive inbox" || exit 0
     last_remind=$SECONDS
   done
+}
+
+# coord_register <pane> — makes <pane> the coordinator's. Clears what belonged to the previous one:
+# a remote registration, a wake-up marker of pre-watcher versions, the unwatched-mail alert's rate
+# limit, and a recorded session id (coord-scope.sh falls back to asking herdr which session owns
+# the pane, which also follows a /clear).
+coord_register() {
+  rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice" "$HIVE_DIR/coord.session"
+  printf '%s\n' "$1" > "$HIVE_DIR/coord.pane"
+}
+
+# The coordinator lives in its own directory, not in a project: Claude Code loads the CLAUDE.md of
+# the directory it runs in with every request, and a large project's (100+ KB is not rare) is
+# context the coordinator pays for on every turn and never uses. $HIVE_COORD_DIR holds a short
+# CLAUDE.md of its own; coord-settings.json gives the session what drones must not have —
+# auto-compaction with its window, and the context guard on Stop.
+HIVE_COORD_DIR="${HIVE_COORD_DIR:-$HIVE_DIR/coord}"
+cmd_coord_start() {  # coord-start [--dry-run] [-- <claude args>...] — the coordinator session, in this pane
+  [ -n "${HIVE_DRONE:-}" ] && die "coord-start starts the coordinator — not from inside drone $HIVE_DRONE"
+  local dry=0
+  local -a extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --) shift; extra=("$@"); break ;;
+      *) die "coord-start: unknown argument $1 (claude's own flags go after --)" ;;
+    esac
+  done
+  local settings="$SKILL_DIR/coord-settings.json"
+  [ -f "$settings" ] || die "coord-start: $settings is missing"
+  [ -f "$HIVE_COORD_DIR/CLAUDE.md" ] \
+    || echo "coord-start: warning — $HIVE_COORD_DIR/CLAUDE.md is missing; the session starts without its brief" >&2
+  local pane; pane=$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
+  [ -n "$pane" ] || die "coord-start: run it in the herdr pane that is to host the coordinator (no current pane)"
+  local -a argv=(claude --dangerously-skip-permissions --model "${HIVE_COORD_MODEL:-opus}"
+                 --settings "$settings" ${extra[@]+"${extra[@]}"})
+  if [ "$dry" = 1 ]; then
+    printf 'coord-start: would register %s and run in %s:\n ' "$pane" "$HIVE_COORD_DIR"
+    printf ' %q' "${argv[@]}"; printf '\n'
+    return 0
+  fi
+  mkdir -p "$HIVE_COORD_DIR"
+  ensure_trusted "$HIVE_COORD_DIR" "${CLAUDE_CONFIG_DIR:-}"
+  coord_register "$pane"
+  echo "coord: $pane — starting the coordinator in $HIVE_COORD_DIR"
+  echo "coord: in the new session, arm the mail watcher: $WATCH_ARM"
+  cd "$HIVE_COORD_DIR" || die "coord-start: cannot enter $HIVE_COORD_DIR"
+  exec "${argv[@]}"
 }
 
 cmd_status() {  # status [name...] — never blocks
@@ -1475,7 +1699,10 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
   fi
   [ ${#targets[@]} -eq 0 ] && { echo "send: no recipients"; return 0; }
 
-  local t remote lhost
+  # The exit status says whether every letter reached its mailbox: a caller that moves its own
+  # marker only after a delivered letter (an external watcher, a timer) would lose the message to a
+  # send that failed but exited 0.
+  local t remote lhost failed=0
   remote=$(coord_remote); lhost=$(hostname -s)
   for t in "${targets[@]}"; do
     # Remote coordinator (hive coord --remote): coord mail travels over ssh and lands in the
@@ -1492,10 +1719,12 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
         continue
       fi
     fi
-    mailbox_put "$from" "$t" "${KIND:-msg}" "$subject" "$body" || continue
+    mailbox_put "$from" "$t" "${KIND:-msg}" "$subject" "$body" \
+      || { echo "send: could not write the letter to $t's mailbox" >&2; failed=1; continue; }
     wake_recipient "$t"
     echo "send: $from -> $t: $subject"
   done
+  return "$failed"
 }
 
 cmd_inbox() {  # inbox [who] [--keep] — reads and consumes a mailbox (own by default)
@@ -1522,11 +1751,19 @@ cmd_inbox() {  # inbox [who] [--keep] — reads and consumes a mailbox (own by d
     echo "inbox ($who): empty"; rm -f "$HIVE_DIR/.wake-$who"; return 0
   fi
 
-  python3 -c "
+  # An unreadable letter is named with the path it will have after this read: the archive, or the
+  # mailbox itself with --keep.
+  local arch=""; [ "$keep" = 0 ] && arch="$MAIL_DIR/.archive"
+  HIVE_INBOX_ARCHIVE="$arch" python3 -c "
 import json,os,sys
+arch=os.environ.get('HIVE_INBOX_ARCHIVE','')
 for p in sys.argv[1:]:
     try: e=json.load(open(p))
-    except Exception: continue
+    except FileNotFoundError: continue
+    except Exception: e=None
+    if not isinstance(e,dict):
+        where=os.path.join(arch,os.path.basename(p)) if arch else p
+        print(f'── ?  unreadable letter: {os.path.basename(p)} — not a letter hive can read; look at the file itself: {where}'); continue
     kind=json.loads(os.environ.get('MAIL_KIND_LABELS','{}')).get(e.get('kind'),'message')
     print(f\"── {e.get('ts','?')}  from: {e.get('from','?')}  [{kind}]\")
     print(f\"   {e.get('subject','')}\")
@@ -1832,16 +2069,82 @@ cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its
 # Every alert is rate-limited: a sweep that nags every five minutes trains everyone
 # to ignore it, and then it protects nothing.
 
-sweep_alert() {  # sweep_alert <drone> <state> <subject> <body> — letter to coord, rate-limited
+# One letter per drone and state: the marker .sweep-<state> holds the alert until the drone leaves
+# that state (sweep_state clears it) or HIVE_SWEEP_RENOTIFY passes (default 60 min). Re-alerting a
+# drone that sits in the same state every half hour cost the coordinator a turn each time and told
+# it nothing new. The overdue-mail reminder to the human re-nags on the same interval.
+SWEEP_RENOTIFY_DEFAULT=3600
+sweep_alert() {  # sweep_alert <drone> <state> <subject> <body> — letter to coord, deduplicated
   local name="$1" state="$2" subject="$3" body="$4"
   local mark="$DRONES_DIR/$name/.sweep-$state" age
   if [ -f "$mark" ]; then
     age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
-    [ "$age" -lt "$(secs HIVE_SWEEP_RENOTIFY 1800)" ] && return 0
+    [ "$age" -lt "$(secs HIVE_SWEEP_RENOTIFY "$SWEEP_RENOTIFY_DEFAULT")" ] && return 0
   fi
   : > "$mark"
-  HIVE_DRONE=sweep KIND=sweep "$SKILL_DIR/hive" send coord "$subject" --body "$body" >/dev/null 2>&1
+  # An alert that did not reach the mailbox must not hold its marker: the next pass tries again
+  # instead of an hour later.
+  if ! HIVE_DRONE=sweep KIND=sweep "$SKILL_DIR/hive" send coord "$subject" --body "$body" >/dev/null 2>&1; then
+    rm -f "$mark"
+    echo "sweep: NOT delivered (coord mailbox not writable?) — $subject"
+    return 0
+  fi
   echo "sweep: $subject"
+}
+
+# sweep_state <drone> <state>... — records the state this pass saw: the markers of every state not
+# named go, so a drone that leaves a state and comes back to it is reported again.
+sweep_state() {
+  local name="$1" m s keep; shift
+  for m in "$DRONES_DIR/$name"/.sweep-*; do
+    [ -e "$m" ] || continue
+    keep=0
+    for s in "$@"; do [ "$m" = "$DRONES_DIR/$name/.sweep-$s" ] && keep=1; done
+    [ "$keep" = 1 ] || rm -f "$m"
+  done
+}
+
+# drone_bg_shells <drone> — how many background shells the drone's Claude Code still runs: its
+# Bash tool shells (the command line names Claude Code's shell snapshot) that are its direct
+# children. Once the turn has ended these can only be run_in_background commands or monitors — the
+# drone is waiting on its own tests, mutants or CI and will be woken when they finish. Prints 0 when
+# the drone's process cannot be found (no /proc, a drone on another machine): a drone with nothing
+# running. Prints '?' when the scan itself failed — the caller must not read that as 0, or one crash
+# turns a drone waiting on its tests into a false stall and restarts its bgstall clock.
+# /proc changes under the scan: a process that exits between the listing and the read of its
+# cmdline leaves an empty argv — the norm, not an accident, while drones build and test.
+drone_bg_shells() {
+  [ -d /proc/self ] || { echo 0; return 0; }
+  local n
+  n=$(python3 - "$(meta_get "$1" session_id 2>/dev/null)" "$1" <<'PY' 2>/dev/null
+import os,sys
+sid,name=sys.argv[1].encode(),sys.argv[2].encode()
+def argv(p):
+    try:
+        with open(f'/proc/{p}/cmdline','rb') as f: return f.read().split(b'\0')
+    except OSError: return []
+pids=[p for p in os.listdir('/proc') if p.isdigit()]
+claudes=[p for p in pids if os.path.basename((argv(p) or [b''])[0]) == b'claude']
+owner=None
+if sid:   # spawn and revive pass the session id on the command line
+    owner=next((p for p in claudes if sid in argv(p)), None)
+if owner is None:   # an adopted drone: its environment names it once revive gave it the swarm env
+    for p in claudes:
+        try:
+            with open(f'/proc/{p}/environ','rb') as f: env=f.read().split(b'\0')
+        except OSError: continue
+        if b'HIVE_DRONE='+name in env: owner=p; break
+if owner is None: print(0); sys.exit(0)
+n=0
+for p in pids:
+    try:
+        with open(f'/proc/{p}/stat') as f: ppid=f.read().rsplit(')',1)[1].split()[1]
+    except (OSError,IndexError): continue
+    if ppid==owner and b'/shell-snapshots/snapshot-' in b' '.join(argv(p)): n+=1
+print(n)
+PY
+)
+  case "$n" in ''|*[!0-9]*) echo '?' ;; *) echo "$n" ;; esac
 }
 
 cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet when all is well
@@ -1858,8 +2161,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
   local f
   while IFS= read -r f; do letters+=("$f"); done \
     < <(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | sort)
-  if [ ${#letters[@]} -gt 0 ]; then
-    if [ -n "$remote" ]; then
+  if [ ${#letters[@]} -gt 0 ] && [ -n "$remote" ]; then
       local lfrom lkind lsubj lhost; lhost=$(hostname -s)
       for f in "${letters[@]}"; do
         lfrom=$(jqf "$f" from | head -1); lkind=$(jqf "$f" kind | head -1)
@@ -1874,18 +2176,19 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
           echo "sweep: forwarded stranded letter to coord@$remote ($lsubj)"
         fi
       done
-      letters=()
-      while IFS= read -r f; do letters+=("$f"); done \
-        < <(find "$MAIL_DIR/coord" -maxdepth 1 -name '*.json' 2>/dev/null | sort)
-    elif coord_unheard; then
-      # The alert of the send path (wake_recipient), raised from here so that it leaves a line
-      # in the journal — also when no channel took it.
-      coord_stranded_notice
-      case $? in
-        0) echo "sweep: unwatched-mail alert (${#letters[@]} letters) via $ALERT_VIA" ;;
-        2) echo "sweep: unwatched-mail alert NOT delivered (${#letters[@]} letters) — the desktop notifier failed, or there is none and herdr showed nothing" ;;
-      esac
-    fi
+  fi
+  # From here on only loud letters count (mail_scan): a quiet one wakes nobody, so it is neither
+  # stranded nor overdue — it waits for the next 'hive inbox' the loud mail brings about.
+  letters=()
+  while IFS= read -r f; do letters+=("$f"); done < <(loud_letters)
+  if [ ${#letters[@]} -gt 0 ] && [ -z "$remote" ] && coord_unheard; then
+    # The alert of the send path (wake_recipient), raised from here so that it leaves a line
+    # in the journal — also when no channel took it.
+    coord_stranded_notice
+    case $? in
+      0) echo "sweep: unwatched-mail alert (${#letters[@]} letters) via $ALERT_VIA" ;;
+      2) echo "sweep: unwatched-mail alert NOT delivered (${#letters[@]} letters) — the desktop notifier failed, or there is none and herdr showed nothing" ;;
+    esac
   fi
   # Overdue reminder: mail nobody took with 'hive inbox' for HIVE_MAIL_OVERDUE — tell the human
   # on the desktop, re-nag at most every HIVE_SWEEP_RENOTIFY. A local coordinator keeps it quiet
@@ -1905,7 +2208,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
     elif coord_busy && [ "$age" -lt "$(secs HIVE_MAIL_OVERDUE_BUSY 7200)" ]; then due=0; fi
   fi
   if [ "$due" = 1 ] && [ -f "$mark" ]; then
-    [ $(( now - $(stat -c %Y "$mark" 2>/dev/null || echo 0) )) -lt "$(secs HIVE_SWEEP_RENOTIFY 1800)" ] && due=0
+    [ $(( now - $(stat -c %Y "$mark" 2>/dev/null || echo 0) )) -lt "$(secs HIVE_SWEEP_RENOTIFY "$SWEEP_RENOTIFY_DEFAULT")" ] && due=0
   fi
   if [ "$due" = 1 ]; then
     if human_alert "Swarm mail unread for $((age/60)) min" \
@@ -1948,6 +2251,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
     local dlg=""
     case "$st" in blocked|idle|done|unknown) dlg=$(pane_dialog "$(pane_of "$name")" 2>/dev/null) || dlg="" ;; esac
     if [ "$dlg" = resume ]; then
+      sweep_state "$name" resume
       if [ "${HIVE_SWEEP_AUTOUNBLOCK:-0}" = 1 ]; then
         cmd_unblock "$name" >/dev/null 2>&1 \
           && { echo "sweep: answered the resume dialog for $name"; continue; }
@@ -1956,6 +2260,45 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
         "Its context ran out and the session asks how to resume. Answer it: hive unblock $name"
       continue
     fi
+    # A turn ended without a report is a stall only when nothing of the drone's still runs. A drone
+    # waiting on its own background shells (tests, mutants, CI) is woken by Claude Code when they
+    # finish; it is reported only once it has waited HIVE_SWEEP_BGWAIT (default 2 h), in case a
+    # shell hangs. The bgwait marker keeps the moment the wait was first seen.
+    # A failed scan ('?') is asked once more — the failures seen were races with /proc — and when it
+    # fails again the drone is left as it is for this pass: no alert, no marker touched, so neither a
+    # false stall nor a restarted bgwait clock. The journal keeps the line. A scan that keeps failing
+    # (not a race: another /proc layout, a Claude Code that starts its shells differently) would
+    # silence the drone's idle alert for good, so the passes in a row are counted, and after
+    # HIVE_SWEEP_NOSCAN of them (default 6: half an hour of 5-minute sweeps) the coordinator hears it,
+    # once. The count goes with the other markers as soon as a scan works again (sweep_state).
+    local bg=""
+    case "$st" in idle|done) bg=$(drone_bg_shells "$name")
+                             [ "$bg" = '?' ] && bg=$(drone_bg_shells "$name") ;; esac
+    if [ "$bg" = '?' ]; then
+      local unk lim="${HIVE_SWEEP_NOSCAN:-6}"
+      case "$lim" in ''|*[!0-9]*) lim=6 ;; esac
+      unk=$(cat "$d/.sweep-bgunknown" 2>/dev/null); case "$unk" in ''|*[!0-9]*) unk=0 ;; esac
+      unk=$((unk + 1)); printf '%s\n' "$unk" > "$d/.sweep-bgunknown"
+      echo "sweep: $name background shells unknown (the /proc scan failed, $unk pass(es) in a row) — state kept, checked next pass"
+      if [ "$unk" -ge "$lim" ]; then
+        sweep_alert "$name" noscan "SWEEP: cannot scan /proc for drone $name ($unk passes in a row)" \
+          "The sweep cannot tell whether $name waits on background shells, so it never reports it idle. Look yourself: hive peek $name; the sweep journal says why the scan fails."
+      fi
+      continue
+    fi
+    if [ "${bg:-0}" -gt 0 ] 2>/dev/null; then
+      sweep_state "$name" bgwait bgstall
+      local bgm="$d/.sweep-bgwait" bgsince
+      [ -f "$bgm" ] || { : > "$bgm"; echo "sweep: $name waits on $bg background shell(s) — not reported"; }
+      bgsince=$(stat -c %Y "$bgm" 2>/dev/null || echo "$now")
+      if [ $(( now - bgsince )) -ge "$(secs HIVE_SWEEP_BGWAIT 7200)" ]; then
+        sweep_alert "$name" bgstall "SWEEP: drone $name idle $(( (now - bgsince) / 60 )) min on $bg background shell(s), no report" \
+          "Its turn ended long ago and its background shells still run. A hung test or watcher? Check hive peek $name"
+      fi
+      continue
+    fi
+    case "$st" in working) sweep_state "$name" working ;; dead|blocked) sweep_state "$name" "$st" ;;
+                  idle|done) sweep_state "$name" idle ;; *) sweep_state "$name" "$st" ;; esac
     case "$st" in
       dead)
         sweep_alert "$name" dead "SWEEP: drone $name is dead, task unfinished" \
@@ -2180,8 +2523,7 @@ case "${1:-}" in
             rm -f "$HIVE_DIR/coord.pane" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"
             echo "coord: remote at $2 — coord mail is forwarded over ssh"
           else
-            rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"
-            herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])" > "$HIVE_DIR/coord.pane"
+            coord_register "$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")"
             echo "coord: $(coord_pane)"
             # Always, even with a fresh heartbeat: that proves some watcher lives, not that this
             # session has one — and re-arming is harmless, the last armed watcher wins.
@@ -2191,6 +2533,8 @@ case "${1:-}" in
           if [ "$backlog" -gt 0 ]; then
             echo "coord: $backlog unread letter(s) waiting — run: hive inbox"
           fi ;;
+  coord-start) shift; cmd_coord_start "$@" ;;
+  _loud)   loud_letters | wc -l | tr -d ' ' ;;                 # internal, for coord-mail-check.sh
   _pending) shift; prompt_pending "${1:?missing pane}" ;;   # internal, for drone-ping.sh
   _watched) coord_watched ;;                                   # internal, for coord-creed-inject.sh
   status) shift; cmd_status "$@" ;;
@@ -2213,14 +2557,19 @@ case "${1:-}" in
 hive — command a swarm of Claude Code agents in herdr
 
   hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, skip-permissions, own workspace)
-  hive task   <name> <file|->        send a brief (file or stdin) + report protocol
+  hive task   <name> <file|->        send a brief (file or stdin) + report protocol; the brief needs
+                                     a 'Rules: <blocks>' line (expanded from ~/.herdr-hive/rules)
+                                     or a '## Boundaries' section
   hive say    <name> <text>          ad-hoc message to a drone
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
   hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + drone wake-up / watcher notice (coord)
   hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
-  hive watch                         coordinator's mail watcher — arm it as a Monitor (one line per new letter)
+  hive watch                         coordinator's mail watcher — arm it as a Monitor (one line per burst of
+                                     letters; a turn ended without a report stays quiet, HIVE_WATCH_ALL=1 shows all)
   hive coord                         register the current pane as the coordinator pane
   hive coord --remote <ssh-host>     coordinator lives on another machine — forward coord mail over ssh
+  hive coord-start [--dry-run] [-- ARGS]  start the coordinator session in THIS pane: its own directory
+                                     (~/.herdr-hive/coord), coord-settings.json (auto-compact + context guard)
   hive status [name]                 swarm state table (never blocks)
   hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300s)
   hive report <name>                 show a drone's report
