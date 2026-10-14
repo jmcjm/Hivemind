@@ -42,7 +42,9 @@ hive coord                      # -> coord: wN:pM
 hive spawn testdrone            # -> spawn: testdrone  ws=.. pane=.. model=opus
 hive task testdrone - <<'BRIEF'
 # Brief: testdrone
-Count the files in the home directory and report the number. Boundaries: read-only.
+Count the files in the home directory and report the number.
+## Boundaries
+Read-only: change nothing.
 BRIEF
                                 # -> task: testdrone <- ... (attempt 1)   <= MUST say "attempt 1"
 ```
@@ -66,17 +68,23 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.claude/skills/hivemind/SKILL.md` | doctrine for the coordinator, loaded automatically |
 | `~/.claude/skills/hivemind/hive` | swarm CLI (a wrapper around `herdr`) |
 | `~/.claude/skills/hivemind/drone-ping.sh` | drone hook: reports end of turn / needed decision |
-| `~/.claude/skills/hivemind/coord-creed.md` | the nine coordinator rules — single source of truth |
+| `~/.claude/skills/hivemind/coord-creed.md` | the eleven coordinator rules — single source of truth |
 | `~/.claude/skills/hivemind/coord-creed-inject.sh` | `SessionStart` hook: after a compaction, re-injects the creed + the live board |
 | `~/.claude/skills/hivemind/coord-compact-brief.sh` | `PreCompact` hook: tells the summarizer which coordination state must survive |
 | `~/.claude/skills/hivemind/coord-scope.sh` | shared scoping helper — the coordinator hooks fire in one session only |
-| `~/.claude/skills/hivemind/drone-settings.json` | `Stop`/`Notification` hooks **for drones only** |
+| `~/.claude/skills/hivemind/drone-settings.json` | `Stop`/`Notification` hooks **for drones only**; auto-compaction off |
+| `~/.claude/skills/hivemind/coord-settings.json` | loaded by `hive coord-start` only: auto-compaction with a 400k window, the context guard |
+| `~/.claude/skills/hivemind/coord-context-guard.sh` | coordinator `Stop` hook: asks to save the state once the context nears compaction |
+| `~/.claude/skills/hivemind/coord-CLAUDE.md` | the template `install.sh` copies to `~/.herdr-hive/coord/CLAUDE.md` |
 | `~/.claude/skills/hivemind/accounts.conf.example` | commented example of the accounts file — never read by `hive` |
 | `~/.local/bin/hive` | symlink so drones have `hive` in PATH |
 | `~/.claude/CLAUDE.md` | the "Hivemind" section — the coordinator's identity |
 | `~/.claude/hooks/herdr-agent-state.sh` | installed by `herdr integration install claude` |
 | `~/.herdr-hive/drones/<name>/` | `meta.json`, `brief.md`, `report.md` |
 | `~/.herdr-hive/mail/<recipient>/` | mailboxes (file = message) |
+| `~/.herdr-hive/coord/` | the coordinator's working directory (`hive coord-start`) with its own short `CLAUDE.md` |
+| `~/.herdr-hive/rules/` | boundary blocks for the `Rules:` line of a brief (`common.md` + one file per block) |
+| `~/.herdr-hive/.context-guard` | the context guard's state: which session was warned in this epoch |
 | `~/.herdr-hive/.watch-coord`, `.watch-coord.pid`, `.watch-coord.last` | the mail watcher's heartbeat, owner, and the moment the last one stopped |
 | `~/.herdr-hive/accounts.conf` | optional, written by you: the accounts drones may take, their order and thresholds |
 | `~/.herdr-hive/usage-cache.json` | the last `/usage` measurement of each listed account |
@@ -96,7 +104,8 @@ The TUI is read (`hive peek`) strictly for diagnosis.
 
 **Drones call the coordinator, not the other way around.** The `Stop` and `Notification` hooks mail
 the `coord` mailbox. The coordinator keeps `hive watch` armed as a Claude Code `Monitor`, which turns
-every new letter into a one-line `HIVE-MAIL` notification in its session. Nothing is typed into the
+every new letter (or burst of letters) into a one-line `HIVE-MAIL` notification in its session; a
+turn a drone ended without a report stays quiet (see "The coordinator session"). Nothing is typed into the
 coordinator's prompt, so the human can keep talking to it while drones report in — and zero polling
 on the coordinator's side.
 
@@ -193,6 +202,98 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
   after work finished outside UI focus — CLI reads do not clear it.
 - The official API cheat sheet: `herdr --skill`.
 
+## The coordinator session
+
+The coordinator's context is what runs out first: every notification, every report and every
+`CLAUDE.md` it carries costs it on each turn. Measured on one swarm it grew by ~90k tokens per hour.
+Three things keep it small.
+
+**Quiet mail.** A turn a drone ended without a report — almost always a drone waiting on its own
+tests or CI — still lands in the mailbox and shows in `hive inbox`, but wakes nobody: the watcher
+prints nothing for it, the Stop backstop and the reminders do not count it. A drone that stays stuck
+that way is the sweep's to report, once. Letters that arrive within a few seconds of each other share
+one notification line, and the sweep sends one alert per drone and state instead of one every half
+hour. A drone whose Claude Code still runs background shells (found through `/proc`, Linux only) is
+waiting, not stalled.
+
+**Its own directory.** `hive coord-start`, run in a plain herdr shell pane, registers that pane as the
+coordinator's, enters `~/.herdr-hive/coord/` and starts Claude Code there with
+`--settings ~/.claude/skills/hivemind/coord-settings.json`. Claude Code sends the `CLAUDE.md` of its
+working directory with every request; a project's can be 100 KB the coordinator never needs.
+`install.sh` puts a short template there once — edit it, it is yours. Restart the same way:
+`hive coord-start -- --continue` (anything after `--` goes to `claude`). `--dry-run` prints the command.
+
+**Auto-compaction for the coordinator only.** Drones keep it off: `drone-settings.json` says
+`"autoCompactEnabled": false` itself, whatever the user's settings say. `coord-settings.json`
+turns it on for the coordinator with a 400k window and wires a Stop hook, `coord-context-guard.sh`.
+Once the last call's input passes `HIVE_COORD_WARN_TOKENS` (330k) the guard holds ONE end of turn and
+asks the coordinator to save its state — drones in flight, what each was told, decisions pending —
+before the compaction summarises it away. It warns once per epoch; the epoch ends when the context
+falls under the threshold again.
+
+> **The window is set in the `env` block, not only as a key.** A `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+> variable in the environment beats the `autoCompactWindow` key of any settings file, and herdr panes
+> inherit the environment of the shell that started the herdr server. The `env` block of a
+> `--settings` file beats the inherited variable, so `coord-settings.json` sets
+> `CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000` there. Idle compaction comes with auto-compaction;
+> `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=330000` keeps it from compacting an idle session before the
+> guard asked for the save.
+
+Moving a running coordinator: save its state, let it end its turn, run `hive coord-start` in a new
+pane (the registration moves at once), read the state back there, then `/exit` the old session.
+
+## Boundaries in files
+
+Drones run with bypass permissions and ask about nothing, so every brief needs its boundaries — and
+retyping the same block into every brief wastes the coordinator's context. Keep the blocks in
+`~/.herdr-hive/rules/` and write one line:
+
+```markdown
+# Brief: fix the flaky export test
+Rules: repo review
+...
+```
+
+`hive task` replaces the line with a `## Boundaries (absolute)` section holding `common.md` (always,
+first), then `repo.md` and `review.md`. If the brief has its own `## Boundaries` section, the blocks
+go to the top of it. A brief with neither the line nor such a section is refused, so is one naming a
+block that does not exist; `HIVE_NO_RULES=1` lets a brief through on purpose. A refused brief never
+replaces the drone's current one. Lines in code fences are text, not directives. An example
+`common.md`:
+
+```markdown
+- Work only in your own clone or worktree; other repositories and other drones' directories are read-only.
+- Commits on your branch only. No push, PR, merge or tag unless this brief says so.
+- No writes to production, no production credentials.
+- Delete only literal paths or "${VAR:?}", never a bare variable.
+- Never quote passwords, tokens or keys in a report.
+```
+
+## Watching outside sources
+
+A coordinator that polls something outside the swarm from a session cron — a chat, a ticket
+tracker, a CI dashboard — pays a turn for every check, and nearly every check finds nothing. Move
+the polling out of the session: a systemd user timer runs a script, and the script writes to the
+coordinator only when something happened:
+
+```bash
+hive send coord "CHAT: <who> <first words>" --body "<full text, where it came from>" </dev/null \
+  && <move the script's own "seen up to" marker>
+```
+
+hivemind ships no such script — what to read and how is specific to each source — but the ones that
+work share a shape:
+
+- **Mail only on an event, never "nothing new".** The letter is loud and wakes the coordinator; a
+  silent run costs nothing.
+- **Move your marker only after a delivered letter.** `hive send` exits non-zero when the letter did
+  not reach the mailbox; a script that ignores that loses the message.
+- **Count failures, mail the outage once.** After N failed runs in a row send one `<SOURCE> DOWN:
+  <first error>` and keep a marker so it is not repeated; the first good run sends `<SOURCE> OK again`
+  and clears it. An expired login otherwise looks exactly like a quiet day.
+- **Run it read-only.** A headless `claude -p` reader gets an allow-list of read tools, everything else
+  denied, and the script refuses to start when inherited settings allow more.
+
 ## Several Claude Code accounts
 
 A fleet burns one subscription's limits in hours. `hive` can run drones on other Claude Code logins
@@ -254,6 +355,9 @@ drone lands on" in `skill/SKILL.md`.
 | unwatched-mail alert never shows | no desktop notifier (`notify-send` / `osascript`), so the alert is a herdr toast that herdr drops or keeps inside the terminal; or the notifier cannot reach a desktop session | install `libnotify` (`notify-send`); the alert also waits `HIVE_UNWATCHED_GRACE` (5 min) before it fires. `journalctl --user -u hive-sweep` shows each alert the sweep raised and its channel, `NOT delivered` when the notifier failed. A sweep run from cron has no session bus: give it `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` |
 | a desktop ping for every drone turn | herdr's own toasts or sounds for background agents | `[ui.toast] delivery = "off"` and `[ui.sound] enabled = false` in `~/.config/herdr/config.toml`, then `herdr server reload-config` — a running server keeps the config it started with |
 | `hive task` says the drone did not start | drone hanging on a dialog | `hive peek <drone>` |
+| `hive task` refuses: `brief has no boundaries` / `no boundary block for` | no `Rules:` line and no `## Boundaries` section, or a block missing in `~/.herdr-hive/rules/` | add the line or the section; the message lists the blocks there. `HIVE_NO_RULES=1` skips the check on purpose |
+| the coordinator does not compact at its 400k window, or the guard never warns | started without `coord-settings.json` (a bare `claude --resume`) | restart with `hive coord-start -- --continue` |
+| a drone waiting on its tests is reported as idle | its background shells were not found (no `/proc`, or another Claude Code process layout) | `journalctl --user -u hive-sweep` says `waits on N background shell(s)` when they are found |
 | drone `idle`, no report | considered the task done without writing | `hive say <drone> "write the report to <path>"` |
 | status `dead` | drone killed or crashed | `hive revive <drone>` — conversation history survives |
 | drone stuck at a dialog (`blocked`) | trust/consent dialog, or its context ran out | `hive unblock <drone>` |
@@ -272,8 +376,19 @@ drone lands on" in `skill/SKILL.md`.
 - Limit measurement: `HIVE_USAGE_TIMEOUT=<seconds>` bounds each step of a `/usage` measurement,
   for `hive usage` and `hive accounts` alike (default 45).
 - Swarm directory: `HIVE_DIR=/other/path` (consistently for all invocations).
+- Mail watcher: `HIVE_WATCH_ALL=1` makes quiet letters loud again; `HIVE_WATCH_COALESCE` (3 s of quiet)
+  and `HIVE_WATCH_COALESCE_MAX` (15 s) bound how long a burst is gathered into one line.
+- Sweep: `HIVE_SWEEP_RENOTIFY` (3600 s) before the same alert comes again, `HIVE_SWEEP_BGWAIT` (7200 s)
+  before a drone waiting on background shells is reported, `HIVE_SWEEP_NOSCAN` (6) failed `/proc`
+  scans in a row before the coordinator hears that the sweep cannot tell.
+- Boundaries: `HIVE_RULES_DIR` (default `~/.herdr-hive/rules`).
+- Coordinator session: `HIVE_COORD_DIR` (default `~/.herdr-hive/coord`), `HIVE_COORD_MODEL` (default
+  `opus`); in `coord-settings.json` the window, `HIVE_COORD_WARN_TOKENS`, and `HIVE_COORD_GUARD_MSG` for
+  the guard's text (`{k}` = context in thousands) — name the place you keep the coordinator state there.
 - Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
   `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.
 - Tests: `tests/run.sh` — hermetic tests of the coordinator mail path and of account handling against a fake herdr;
   `tests/accounts/test-accounts.sh` — the accounts table, the selection and the `/usage` parser against a
-  fake tmux and captured panels. Neither starts a real session.
+  fake tmux and captured panels; `tests/ctx/test-ctx.sh` — quiet mail and coalescing, sweep
+  deduplication and background shells, `Rules:` expansion, `coord-start`, the context guard and the
+  backstop. None starts a real session.

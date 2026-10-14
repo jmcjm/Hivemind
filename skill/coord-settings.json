@@ -1,0 +1,23 @@
+{
+  "autoCompactEnabled": true,
+  "autoCompactWindow": 400000,
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "400000",
+    "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "330000",
+    "HIVE_COORD_WARN_TOKENS": "330000"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 15,
+            "command": "bash \"$HOME/.claude/skills/hivemind/coord-context-guard.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

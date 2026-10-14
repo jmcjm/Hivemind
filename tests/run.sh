@@ -18,7 +18,10 @@ setup() {
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
   unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
         HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE HIVE_MAIL_OVERDUE_BUSY \
-        HIVE_SWEEP_RENOTIFY
+        HIVE_SWEEP_RENOTIFY HIVE_WATCH_ALL HIVE_WATCH_COALESCE_MAX
+  # The watcher prints what each one-second pass found, without waiting for a burst to settle:
+  # the tests below read one letter at a time. Coalescing has its own test.
+  export HIVE_WATCH_COALESCE=0
   mkdir -p "$HIVE_DIR"
   : > "$FAKE_HERDR_LOG"
   echo "w1:p1" > "$HIVE_DIR/coord.pane"
@@ -96,17 +99,29 @@ t_watch_prints_pointer_not_body() {
   assert_not_contains "$T/out" "SECRET-BODY"
 }
 
-t_watch_one_line_per_letter_and_inbox_consumes() {
+t_watch_burst_is_one_line_and_inbox_consumes() {
+  export HIVE_WATCH_COALESCE=2
   start_watch "$T/out"
   local i; for i in 1 2 3 4 5; do send_coord "d$i" decision "question $i"; done
-  sleep 2
-  assert_count "$T/out" "HIVE-MAIL d" 5
-  assert_contains "$T/out" "HIVE-MAIL d3 [DECISION] question 3"
+  sleep 4
+  assert_count "$T/out" "HIVE-MAIL" 1
+  assert_contains "$T/out" "HIVE-MAIL 5 letters: d1 [DECISION] question 1 | d2 [DECISION] question 2 |"
+  assert_contains "$T/out" "d3 [DECISION] question 3"
   "$HIVE" inbox > "$T/inbox"
   assert_count "$T/inbox" "question" 5
   [ "$(letters)" = 0 ] || fail "inbox left $(letters) letter(s)"
   sleep 2
-  assert_count "$T/out" "HIVE-MAIL" 5
+  assert_count "$T/out" "HIVE-MAIL" 1
+}
+
+t_watch_turn_without_report_is_quiet() {
+  start_watch "$T/out"
+  send_coord kafka done "finished a turn (report: no report)"
+  sleep 2
+  assert_not_contains "$T/out" "HIVE-MAIL"
+  [ "$(letters)" = 1 ] || fail "the quiet letter is not in the mailbox"
+  "$HIVE" inbox > "$T/inbox"
+  assert_contains "$T/inbox" "finished a turn (report: no report)"
 }
 
 t_watch_backlog_is_one_line() {
@@ -501,7 +516,7 @@ t_sweep_overdue_renags_once_per_interval() {
   FAKE_AGENT_STATUS=blocked "$HIVE" sweep > "$T/second"
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread" 1
   [ ! -s "$T/second" ] || fail "the sweep reported a reminder it held back: $(cat "$T/second")"
-  touch -d '-31 minutes' "$HIVE_DIR/.overdue-notice"      # HIVE_SWEEP_RENOTIFY (30 min) has passed
+  touch -d '-61 minutes' "$HIVE_DIR/.overdue-notice"      # HIVE_SWEEP_RENOTIFY (60 min) has passed
   FAKE_AGENT_STATUS=blocked "$HIVE" sweep >/dev/null
   assert_count "$FAKE_HERDR_LOG" "notify-send -a hive Swarm mail unread" 2
   "$HIVE" inbox >/dev/null                                # the mail is read: the next overdue letter is a new matter
@@ -575,7 +590,8 @@ t_drone_ping_reports_only_to_coordinator() {
   sleep 2
   [ "$(letters)" = 2 ] || fail "expected 2 letters, found $(letters)"
   assert_contains "$T/out" "HIVE-MAIL kafka [DECISION] needs a decision"
-  assert_contains "$T/out" "HIVE-MAIL kafka [finished] finished a turn (report: no report)"
+  # A turn ended without a report is a quiet letter: in the mailbox, never a notification.
+  assert_not_contains "$T/out" "finished a turn (report: no report)"
   [ "$(alerts)" = 0 ] || fail "a drone hook alerted the human while the coordinator listens"
 }
 

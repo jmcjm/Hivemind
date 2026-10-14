@@ -16,14 +16,16 @@ it handles every trap described below. Add it to PATH or call it by full path.
 
 ```
 hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, --dangerously-skip-permissions, own workspace)
-hive task   <name> <file|->        brief from file/stdin + appended reporting protocol
+hive task   <name> <file|->        brief from file/stdin + appended reporting protocol; needs a
+                                   'Rules: <blocks>' line or a '## Boundaries' section
 hive say    <name> <text>          ad-hoc message
 hive clear  <name>                 clear the drone's input field
 hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + drone wake-up / watcher notice (coord)
 hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
-hive watch                         the mail watcher — arm it as a Monitor; one line per new letter
+hive watch                         the mail watcher — arm it as a Monitor; one line per burst of letters
 hive coord                         register the current pane as the coordinator pane
 hive coord --remote <ssh-host>     the coordinator lives on another machine — forward coord mail over ssh
+hive coord-start [--dry-run] [-- ARGS]  start the coordinator in THIS pane: own directory, auto-compaction
 hive status [names]                swarm state table — NEVER blocks
 hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300 s)
 hive report <name>                 a drone's report
@@ -76,7 +78,16 @@ Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)
 ```
 
 Every new letter becomes one notification: `HIVE-MAIL <from> [<kind>] <subject>` — a pointer, never
-the body. **Nothing is ever typed into your prompt**: it belongs to the user, who keeps talking to you
+the body. Letters that land within a few seconds of each other (`HIVE_WATCH_COALESCE`, default 3 s,
+held at most `HIVE_WATCH_COALESCE_MAX`, 15 s) share ONE line: `HIVE-MAIL 3 letters: a [..] .. | b [..] ..`.
+**Quiet letters wake nobody:** a turn a drone ended without a report (`finished a turn (report: no
+report)`, almost always a drone waiting on its own tests, mutants or CI) still lands in the mailbox and
+shows in `hive inbox`, but the watcher prints nothing for it, the reminder and the backstop do not count
+it, and the user is never pinged about it. A drone that stays stuck that way is the sweep's to report,
+once. Everything else is loud: messages, decisions, a turn ended with a report, `SWEEP:` findings,
+mail from outside the swarm. `HIVE_WATCH_ALL=1` turns the filter off. A letter hive cannot read (cut
+short, another format) is loud too, and `hive inbox` shows it as `unreadable letter` instead of skipping
+it. **Nothing is ever typed into your prompt**: it belongs to the user, who keeps talking to you
 while drones report in. A monitor lives at most 30 minutes; when its expiry notice arrives, re-arm it
 at once. The last armed watcher wins — a second arm, or a new coordinator session, retires the old one
 (`HIVE-WATCH: taken over`).
@@ -109,7 +120,7 @@ Four safeguards guard that, all in `wake_recipient`:
 The watcher can be gone — the monitor expired and was not re-armed, the session restarted. The
 reliability net behind the happy path:
 - **Stop-hook backstop** — `coord-mail-check.sh` (installed globally by `install.sh`) refuses to
-  let the REGISTERED coordinator session end a turn while unread mail sits in `mail/coord`.
+  let the REGISTERED coordinator session end a turn while unread LOUD mail sits in `mail/coord`.
   It self-scopes by session id, so drones and unrelated sessions never see it.
 - **Unwatched-mail alert** — coord mail when nobody has listened for `HIVE_UNWATCHED_GRACE`
   (default 300 s, counted from the last live heartbeat, the last watcher's stop, or `hive coord`
@@ -134,9 +145,17 @@ reliability net behind the happy path:
   forwards to a remote coordinator, raises a desktop reminder when coord mail sits unread past
   `HIVE_MAIL_OVERDUE` (default 30 min) while a watcher lives and the coordinator is not working
   (idle, blocked on a dialog), and mails coord about drones silent with a task in flight —
-  dead, blocked, idle without a report, or working past `HIVE_WORKING_WARN` (default 60 min). Alerts
-  re-fire at most every `HIVE_SWEEP_RENOTIFY` (default 30 min); `hive kill` marks the drone concluded
-  so its corpse stops alarming, and a new spawn/task resets the verdicts.
+  dead, blocked, idle without a report, or working past `HIVE_WORKING_WARN` (default 60 min). One
+  alert per drone and state: it comes again only when the drone left the state and came back, or after
+  `HIVE_SWEEP_RENOTIFY` (default 60 min; the overdue reminder to the user re-nags on the same
+  interval). An idle drone whose Claude Code still runs background shells
+  (its Bash tool shells, children of its `claude` process — found in `/proc`) is waiting, not stalled:
+  it is reported only after `HIVE_SWEEP_BGWAIT` (default 2 h) of that. A `/proc` scan that fails twice
+  in a pass leaves the drone as it was (no alert, no marker touched) and logs `background shells
+  unknown` in the sweep journal; after `HIVE_SWEEP_NOSCAN` such passes in a row (default 6) you get
+  one `SWEEP: cannot scan /proc for drone <name>`. An alert that could not be written to the mailbox
+  keeps no marker, so the next pass tries again. `hive kill` marks the drone
+  concluded so its corpse stops alarming, and a new spawn/task resets the verdicts.
   A coordinator mid-turn keeps the overdue reminder quiet only until the oldest letter is
   `HIVE_MAIL_OVERDUE_BUSY` old (default 7200 s): a pane that reports `working` for two hours over
   waiting mail is stuck — a hung tool call, a retry loop — and nothing else would tell the user.
@@ -350,6 +369,59 @@ as real failures. `hive gate` is a flock-backed exclusive window over `~/.herdr-
 Every brief that includes a full gate must carry: "full gates ONLY via hive gate enter/release;
 targeted test runs with a small filter need no slot."
 
+## Coordinator context — its own directory, auto-compaction, no session crons
+
+Measured on one swarm: the coordinator's context grew by ~90k per hour of swarm work. The causes and
+what replaced each:
+
+| Cause | Now |
+|---|---|
+| 289 watcher events in 4 h, 149 of them `finished a turn (report: no report)`; the sweep repeating the same stall every 30 min | quiet letters, bursts in one line, one sweep alert per drone and state, background shells checked (above) |
+| Session crons polling an outside source (a chat, a tracker) — nearly always to find nothing | a systemd user timer outside the session that mails coord only when something happened (README, "Watching outside sources") |
+| The project's `CLAUDE.md` (100+ KB in the measured case) loaded with every request | the coordinator runs in `~/.herdr-hive/coord/` with a short `CLAUDE.md` of its own |
+| The boundaries block rewritten in every brief | `Rules: <blocks>` (see "Writing a brief") |
+
+**`hive coord-start [--dry-run] [-- <claude args>]`** — run it in a plain shell pane of herdr. It
+registers that pane as the coordinator's (like `hive coord`), enters `$HIVE_COORD_DIR`
+(`~/.herdr-hive/coord`) and execs `claude --dangerously-skip-permissions --model opus --settings
+~/.claude/skills/hivemind/coord-settings.json` (`HIVE_COORD_MODEL` picks another model). In the new
+session: arm the watcher, read back your saved state, `hive status`, `hive inbox`.
+**Restarting the coordinator goes through `coord-start` too**: `hive coord-start -- --continue` (or
+`-- --resume <session id>`). A bare `claude --resume` in `~/.herdr-hive/coord` comes back without
+`coord-settings.json` — whatever window the environment carries, no auto-compaction, no context guard.
+`install.sh` puts a short `CLAUDE.md` template into `~/.herdr-hive/coord/` (never over an existing one);
+make it yours — where you keep the coordinator state, which accounts and repos exist.
+
+**`coord-settings.json`** is loaded only by that session (drones have `drone-settings.json`, which says
+`"autoCompactEnabled": false` itself):
+- `"autoCompactEnabled": true` — overrides a `false` in `~/.claude/settings.json` (`--settings` sits
+  above user settings; verified: same threshold, compaction with the override, none without).
+- The window, 400k, is set in its `env` block as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, not only as the
+  `autoCompactWindow` key: a `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in the shell environment (a herdr server
+  started from such a shell passes it to every pane) beats the key (verified). The settings `env` block
+  beats the inherited variable (verified).
+- `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=330000`: idle compaction (on with auto-compaction; ~54 min idle,
+  default from 200k) waits for the guard's threshold, so a session is never compacted idle before its
+  state was saved.
+- **Context guard** (`coord-context-guard.sh`, Stop hook): once the last main-thread call's input
+  (`input + cache_read + cache_creation`) passes `HIVE_COORD_WARN_TOKENS` (330k: the 400k window
+  compacts below its effective 380k, and compaction strikes mid-turn, so the warning keeps a large turn
+  of margin), it blocks ONE end of turn per epoch asking to save the coordinator state; the epoch ends
+  when the context falls back under the threshold (after the compaction). `HIVE_COORD_GUARD_MSG`
+  replaces the text (`{k}` = the context in thousands) — name the place you keep the state there.
+  State: `~/.herdr-hive/.context-guard`.
+- The PreCompact (`coord-compact-brief.sh`) and SessionStart:compact (`coord-creed-inject.sh`) hooks stay
+  in `~/.claude/settings.json`: they scope themselves to the registered coordinator, and Claude Code
+  runs an identical handler from two settings files once, so nothing would double if they were copied.
+
+**Moving a running coordinator** (the user does this; nobody kills the old session for them):
+1. In the old session: save the coordinator state, let it finish its turn.
+2. Open a new herdr pane (plain shell) and run `hive coord-start`. The pane is registered at once;
+   the old session's hooks stop treating it as the coordinator.
+3. In the new session: arm the watcher, read the saved state back, `hive status`, `hive inbox`, then
+   delete any session crons it recreated from memory whose work a timer now does.
+4. Close the old session when its last turn is over (`/exit`). Its own crons die with it.
+
 ## Surviving a compaction
 
 The rules below are read once. When the conversation is compacted they are replaced by a summary
@@ -361,7 +433,7 @@ self-scoped to the registered coordinator session:
 
 | File | Hook | What it does |
 |---|---|---|
-| `coord-creed.md` | — | the nine rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
+| `coord-creed.md` | — | the eleven rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
 | `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, whether the mail watcher is live, drones with a task in flight and their live pane state, how crowded the swarm directory is |
 | `coord-compact-brief.sh` | `PreCompact` | tells the summarizer what must survive — who is spawned and what they were told, unanswered drone questions, decisions pending for the user |
 
@@ -407,6 +479,13 @@ The brief is a contract. The drone knows nothing of your conversation with the u
 
 - **Goal and completion criterion** — how to tell it is done.
 - **Boundaries** — what NOT to touch. Without this a drone with bypass permissions goes too far.
+  Write one line, `Rules: repo review`: `hive task` replaces it with a `## Boundaries (absolute)`
+  section holding the full text of `~/.herdr-hive/rules/common.md` plus `repo.md` and `review.md`
+  (`$HIVE_RULES_DIR`; the common block always comes first). Task-specific bounds go in a
+  `## Boundaries` section of the brief — with the line too, the blocks land at the top of it. A brief
+  with neither the line nor such a section is refused, and so is one that names a block that does not
+  exist; a refused brief never replaces the drone's current one. `HIVE_NO_RULES=1` lets a brief without
+  boundaries through on purpose. Lines in code fences are text, not directives.
 - **Concrete paths, repos, tables** — not "fix the service", but the full path.
 - **Required evidence** — test output, query results. Otherwise you get an optimistic
   "done" with nothing behind it.
