@@ -1446,9 +1446,12 @@ Report questions and blockers via 'hive send coord' — do not wait idly, nobody
   # herdr 0.8: agent start targets an EXISTING pane (no splits, no orphaned shells)
   # and waits for agent readiness itself. On a startup dialog it returns agent_not_ready,
   # but the agent name stays live — the dialog is handled below.
-  local start_out ready=0
-  start_out=$(herdr agent start "$name" --kind claude --pane "$pane" --timeout 60000 \
-                -- "${argv[@]}" 2>&1) && ready=1
+  local start_out ready=0 attempt
+  for attempt in $(seq 1 10); do   # a fresh pane's shell may still be initialising (slow prompt in a big git worktree)
+    start_out=$(herdr agent start "$name" --kind claude --pane "$pane" --timeout 60000 \
+                  -- "${argv[@]}" 2>&1) && { ready=1; break; }
+    case "$start_out" in *agent_pane_busy*) sleep "${HIVE_SPAWN_RETRY_SLEEP:-2}" ;; *) break ;; esac
+  done
   if [ "$ready" != 1 ]; then
     case "$start_out" in
       *agent_not_ready*) : ;;   # startup dialog — handled in the bootstrap below

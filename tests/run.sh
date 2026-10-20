@@ -16,7 +16,7 @@ setup() {
   T=$(mktemp -d)
   export HIVE_DIR="$T/hive" FAKE_HERDR_LOG="$T/herdr.log"
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
-  unset HIVE_DRONE HIVE_FRONT HERDR_PANE_ID KIND FAKE_HERDR_DOWN FAKE_NO_CURRENT_PANE FAKE_WORKSPACE_CREATE_FAIL FAKE_TAB_CREATE_FAIL FAKE_AGENT_START_FAIL FAKE_WORKSPACE_PANES FAKE_WORKSPACE_TABS FAKE_TAB_PANES FAKE_WORKSPACE_GET_FAIL FAKE_DEAD_PANES FAKE_PANE_TABS HIVE_DRONE_LAYOUT FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
+  unset HIVE_DRONE HIVE_FRONT HERDR_PANE_ID KIND FAKE_HERDR_DOWN FAKE_NO_CURRENT_PANE FAKE_WORKSPACE_CREATE_FAIL FAKE_TAB_CREATE_FAIL FAKE_AGENT_START_FAIL FAKE_AGENT_START_BUSY FAKE_WORKSPACE_PANES FAKE_WORKSPACE_TABS FAKE_TAB_PANES FAKE_WORKSPACE_GET_FAIL FAKE_DEAD_PANES FAKE_PANE_TABS HIVE_DRONE_LAYOUT FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
         HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE HIVE_MAIL_OVERDUE_BUSY \
         HIVE_SWEEP_RENOTIFY HIVE_WATCH_ALL HIVE_WATCH_COALESCE_MAX
   # The watcher prints what each one-second pass found, without waiting for a burst to settle:
@@ -1317,6 +1317,21 @@ t_failed_start_closes_only_its_tab() {
   assert_contains "$T/out" "failed to start the agent"
   assert_contains "$FAKE_HERDR_LOG" "tab close w1:t9"
   assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
+}
+
+t_spawn_retries_while_the_pane_initialises() {
+  # agent_pane_busy means the fresh pane's shell is still starting (a slow prompt in a big git
+  # worktree): spawn waits and retries instead of dying, and only a busy that outlasts the
+  # retries closes the tab.
+  HIVE_SPAWN_RETRY_SLEEP=0 FAKE_AGENT_START_BUSY=3 spawn_home kafka > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  assert_count "$FAKE_HERDR_LOG" "agent start kafka" 4
+  assert_not_contains "$FAKE_HERDR_LOG" "tab close"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
+  [ -f "$HIVE_DIR/drones/kafka/meta.json" ] || fail "no drone after the retries"
+  HIVE_SPAWN_RETRY_SLEEP=0 FAKE_AGENT_START_BUSY=99 spawn_home sql > "$T/out" 2>&1 && fail "an endless busy reported success"
+  assert_contains "$T/out" "failed to start the agent"
+  assert_count "$FAKE_HERDR_LOG" "agent start sql" 10
+  assert_contains "$FAKE_HERDR_LOG" "tab close"
 }
 
 t_rename_renames_the_tab() {

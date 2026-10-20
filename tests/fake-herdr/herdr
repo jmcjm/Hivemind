@@ -43,6 +43,15 @@ case "$1 ${2:-}" in
   "agent start")       if [ "${FAKE_AGENT_START_FAIL:-0}" = 1 ]; then
                          echo '{"error":{"code":"spawn_failed","message":"fake launch failure"}}' >&2; exit 1
                        fi
+                       # The first FAKE_AGENT_START_BUSY calls answer agent_pane_busy: a fresh pane's
+                       # shell that has not finished initialising yet (a slow prompt in a big worktree).
+                       # Counted off the log (already written above), so the counter survives the
+                       # process boundary: the call this one is in is the nth 'agent start' line.
+                       if [ "${FAKE_AGENT_START_BUSY:-0}" -gt 0 ] 2>/dev/null; then
+                         n=$(grep -c '^agent start' "$FAKE_HERDR_LOG" 2>/dev/null) || n=0
+                         [ "$n" -le "${FAKE_AGENT_START_BUSY}" ] && {
+                           echo '{"error":{"code":"agent_pane_busy","message":"pane is not an available shell yet"}}' >&2; exit 1; }
+                       fi
                        echo '{"result":{"type":"ok"}}' ;;
   "pane current")      [ "${FAKE_NO_CURRENT_PANE:-0}" = 1 ] && exit 1
                        echo '{"result":{"pane":{"pane_id":"w1:p1"}}}' ;;
