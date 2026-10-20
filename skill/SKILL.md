@@ -641,8 +641,8 @@ adds all of that; it refuses to run when herdr reported no session id, because t
 history to resume. Before
 `revive` check `hive peek` — if the agent asked a question and waits, answer it after the revival,
 otherwise it picks the topic up its own way. `revive` closes what the drone owns: an agent alone in
-its workspace owns the workspace; one in a shared workspace (a coordinator's, yours) owns only its tab,
-and `adopt` warns when that tab holds other panes too.
+its workspace owns the workspace; one in a shared workspace (a coordinator's, yours) owns its tab when
+it is alone there, and only its pane when it shares the tab (`adopt` says so).
 
 **A long session resumes from a summary.** Reviving a session of several hours, Claude Code asks
 whether to resume from a summary or in full. `hive` takes the summary (cheaper) and warns loudly.

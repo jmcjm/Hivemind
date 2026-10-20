@@ -442,10 +442,11 @@ pane_of() { meta_get "$1" pane_id; }
 # closing (drone_close), against herdr as it is then: a coordinator registered later inside a
 # drone's workspace, a pane split into a drone's tab, must not go down with the drone.
 
-HIVE_DRONE_LAYOUTS="tab workspace"
 check_layout() {  # dies on a HIVE_DRONE_LAYOUT spawn could not honour — before anything is closed
-  case " $HIVE_DRONE_LAYOUTS " in *" ${HIVE_DRONE_LAYOUT:-tab} "*) ;; *)
-    die "HIVE_DRONE_LAYOUT='$HIVE_DRONE_LAYOUT' — tab or workspace" ;; esac
+  case "${HIVE_DRONE_LAYOUT:-tab}" in
+    tab|workspace) ;;
+    *) die "HIVE_DRONE_LAYOUT='$HIVE_DRONE_LAYOUT' — tab or workspace" ;;
+  esac
 }
 
 # drone_home — the workspace a new drone opens a tab in; fails when it gets a workspace of its own.
@@ -467,52 +468,58 @@ coordinator_panes() {
   done
 }
 
+# coordinator_homes <field> — the workspace_id or tab_id of every front's coordinator pane, asked
+# of herdr (not read off the pane id: a pane can move). A pane herdr cannot find is no home.
+coordinator_homes() {
+  local c
+  while IFS= read -r c; do
+    herdr pane get "$c" 2>/dev/null | jqp "print(r['pane'].get('$1') or '')"
+  done < <(coordinator_panes)
+}
+
 # workspace_exclusive <ws> — true only when herdr confirms the workspace holds one tab with one pane
 # and no front's coordinator: then it is a drone's own and may be closed. Unknown means no.
 workspace_exclusive() {
-  local info counts c
+  local info counts
   info=$(herdr workspace get "$1" 2>/dev/null) || return 1
   counts=$(jqp "w=r['workspace']; print(int(w.get('pane_count') or 0), int(w.get('tab_count') or 1))" <<<"$info") || return 1
   [ "$counts" = "1 1" ] || return 1
-  while IFS= read -r c; do [ "${c%%:*}" = "$1" ] && return 1; done < <(coordinator_panes)
-  return 0
+  ! coordinator_homes workspace_id | grep -qxF -- "$1"
 }
 
 # tab_exclusive <tab> — the same for a tab: one pane, and not the tab of any front's coordinator.
 tab_exclusive() {
-  local info n c ctab
+  local info n
   info=$(herdr tab get "$1" 2>/dev/null) || return 1
   n=$(jqp "print(int(r['tab'].get('pane_count') or 0))" <<<"$info") || return 1
   [ "$n" = 1 ] || return 1
-  while IFS= read -r c; do
-    ctab=$(herdr pane get "$c" 2>/dev/null | jqp "print(r['pane'].get('tab_id') or '')") || ctab=""
-    [ "$ctab" = "$1" ] && return 1
-  done < <(coordinator_panes)
-  return 0
+  ! coordinator_homes tab_id | grep -qxF -- "$1"
 }
 
-# drone_close <name> — ends the drone's place in herdr: the tab or workspace it owns when herdr
-# confirms it still owns it alone, else only its own pane. Prints what it closed ("tab <id>",
-# "workspace <id>", "pane <id>"), nothing when there was nothing to close.
+# drone_close <name> — ends the drone's place in herdr: the tab or workspace it owns, when herdr
+# confirms the drone's pane is still in it and alone there; else only its own pane. A drone whose
+# pane is gone has nothing left to close — whatever now sits in its old tab or workspace is not its.
+# Prints what it closed ("tab <id>", "workspace <id>", "pane <id>"), nothing when nothing was.
 drone_close() {
-  local tab ws pane t
+  local tab ws pane info ptab pws
   tab=$(meta_get "$1" tab_id 2>/dev/null) || tab=""
   ws=$(meta_get "$1" workspace_id 2>/dev/null) || ws=""
   pane=$(meta_get "$1" pane_id 2>/dev/null) || pane=""
-  if [ -n "$tab" ] && tab_exclusive "$tab"; then
+  [ -n "$pane" ] || return 0
+  info=$(herdr pane get "$pane" 2>/dev/null) || return 0
+  ptab=$(jqp "print(r['pane'].get('tab_id') or '')" <<<"$info") || ptab=""
+  pws=$(jqp "print(r['pane'].get('workspace_id') or '')" <<<"$info") || pws=""
+  if [ -n "$tab" ] && [ "$ptab" = "$tab" ] && tab_exclusive "$tab"; then
     herdr tab close "$tab" >/dev/null 2>&1 && echo "tab $tab"; return 0
   fi
-  if [ -z "$tab" ] && [ -n "$ws" ]; then
-    if workspace_exclusive "$ws"; then
-      herdr workspace close "$ws" >/dev/null 2>&1 && echo "workspace $ws"; return 0
-    fi
-    # Its workspace is shared now: its own tab, when it is alone there.
-    t=$(herdr pane get "$pane" 2>/dev/null | jqp "print(r['pane'].get('tab_id') or '')") || t=""
-    if [ -n "$t" ] && tab_exclusive "$t"; then
-      herdr tab close "$t" >/dev/null 2>&1 && echo "tab $t"; return 0
-    fi
+  if [ -z "$tab" ] && [ -n "$ws" ] && [ "$pws" = "$ws" ] && workspace_exclusive "$ws"; then
+    herdr workspace close "$ws" >/dev/null 2>&1 && echo "workspace $ws"; return 0
   fi
-  [ -n "$pane" ] && herdr pane close "$pane" >/dev/null 2>&1 && echo "pane $pane"
+  # A drone that owns a tab or a workspace owns at least the tab its pane is alone in.
+  if { [ -n "$tab" ] || [ -n "$ws" ]; } && [ -n "$ptab" ] && tab_exclusive "$ptab"; then
+    herdr tab close "$ptab" >/dev/null 2>&1 && echo "tab $ptab"; return 0
+  fi
+  herdr pane close "$pane" >/dev/null 2>&1 && echo "pane $pane"
   return 0
 }
 
@@ -2214,8 +2221,9 @@ cmd_rename() {  # rename <old> <new>
   local ws pane tab; ws=$(meta_get "$old" workspace_id) || unknown_drone "$old"
   pane=$(pane_of "$old"); tab=$(meta_get "$old" tab_id)
   # A drone in a tab renames its tab: the workspace is its coordinator's.
+  # A workspace's label follows the drone only while the workspace is still its own alone.
   if [ -n "$tab" ]; then herdr tab rename "$tab" "$new" >/dev/null 2>&1
-  else herdr workspace rename "$ws" "$new" >/dev/null 2>&1; fi
+  elif [ -n "$ws" ] && workspace_exclusive "$ws"; then herdr workspace rename "$ws" "$new" >/dev/null 2>&1; fi
   herdr agent rename "$pane" "$new" >/dev/null 2>&1
   mv "$(drone_dir "$old")" "$(drone_dir "$new")"
   python3 -c "

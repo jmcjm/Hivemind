@@ -834,8 +834,9 @@ fake_drone() {  # fake_drone <front|default> <name> [pane] — a drone with a ta
   local d="$HIVE_DIR/fronts/$1/drones/$2"
   [ "$1" = default ] && d="$HIVE_DIR/drones/$2"
   mkdir -p "$d"
-  printf '{"name":"%s","workspace_id":"w7","pane_id":"%s","session_id":"5e55e55e-0000-4000-8000-%012d","cwd":"%s","account":""}\n' \
-    "$2" "${3:-w7:p1}" "$RANDOM" "$T" > "$d/meta.json"
+  local pane="${3:-w7:p1}"                        # a drone from before tabs: the pane's workspace is its own
+  printf '{"name":"%s","workspace_id":"%s","pane_id":"%s","session_id":"5e55e55e-0000-4000-8000-%012d","cwd":"%s","account":""}\n' \
+    "$2" "${pane%%:*}" "$pane" "$RANDOM" "$T" > "$d/meta.json"
   printf '# Brief: %s\nWrite the report to %s/report.md\n' "$2" "$d" > "$d/brief.md"
 }
 
@@ -1037,7 +1038,7 @@ t_move_a_living_drone_resumes_it_in_the_new_front() {
   local sid; sid=$(drone_meta_field live session_id)
   mkdir -p "$T/home"; echo '{}' > "$T/home/.claude.json"
   HOME="$T/home" "$HIVE" move live wms > "$T/out" 2>&1 || fail "move failed: $(cat "$T/out")"
-  assert_contains "$FAKE_HERDR_LOG" "workspace close w7"
+  assert_contains "$FAKE_HERDR_LOG" "workspace close w5"
   assert_contains "$FAKE_HERDR_LOG" "--env HIVE_FRONT=wms"
   assert_contains "$FAKE_HERDR_LOG" "--resume $sid"
   assert_contains "$FAKE_HERDR_LOG" "agent prompt live hive: you were moved to front 'wms'"
@@ -1131,7 +1132,7 @@ t_move_takes_force_anywhere_and_names_the_way_back() {
   mkdir -p "$T/home"; echo '{}' > "$T/home/.claude.json"
   FAKE_AGENT_STATUS=working FAKE_WORKSPACE_CREATE_FAIL=1 HOME="$T/home" "$HIVE" move --force busy wms > "$T/out" 2>&1 \
     && fail "a failed restart reported success"
-  assert_contains "$FAKE_HERDR_LOG" "workspace close w7"
+  assert_contains "$FAKE_HERDR_LOG" "workspace close w5"
   assert_contains "$T/out" "hive --front wms revive busy"
   [ -f "$HIVE_DIR/fronts/wms/drones/busy/meta.json" ] || fail "the drone is not in wms"
   "$HIVE" move busy wms extra > /dev/null 2>&1 && fail "a third argument was accepted"
@@ -1348,7 +1349,7 @@ t_move_lands_in_the_new_coordinators_workspace() {
   fake_drone default live w5:p1
   mkdir -p "$T/home"; echo '{}' > "$T/home/.claude.json"
   HOME="$T/home" "$HIVE" move live wms > "$T/out" 2>&1 || fail "move failed: $(cat "$T/out")"
-  assert_contains "$FAKE_HERDR_LOG" "workspace close w7"           # its own workspace, from before tabs
+  assert_contains "$FAKE_HERDR_LOG" "workspace close w5"           # its own workspace, from before tabs
   assert_contains "$FAKE_HERDR_LOG" "tab create --workspace w3 --label live"
   [ "$(python3 -c "import json;print(json.load(open('$HIVE_DIR/fronts/wms/drones/live/meta.json')).get('tab_id',''))")" = "w3:t9" ] \
     || fail "the moved drone did not record its new tab"
@@ -1427,6 +1428,26 @@ t_move_a_tab_drone_closes_its_source_tab() {
   assert_contains "$FAKE_HERDR_LOG" "tab close w1:t9"
   assert_contains "$FAKE_HERDR_LOG" "tab create --workspace w3 --label kafka"
   assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
+}
+
+t_a_drone_whose_pane_is_gone_closes_nothing() {
+  spawn_home kafka > /dev/null 2>&1 || fail "spawn failed"
+  fake_drone default old w7:p1
+  : > "$FAKE_HERDR_LOG"
+  # Its tab, or its old workspace, may hold somebody else's pane by now.
+  FAKE_DEAD_PANES="w1:p9 w7:p1" "$HIVE" kill kafka > "$T/out" 2>&1 || fail "kill failed"
+  FAKE_DEAD_PANES="w1:p9 w7:p1" "$HIVE" kill old > /dev/null 2>&1
+  assert_not_contains "$FAKE_HERDR_LOG" "close"
+}
+
+t_rename_leaves_a_workspace_the_drone_does_not_own() {
+  fake_drone default old w7:p1
+  echo "w7:p2" > "$HIVE_DIR/coord.pane"           # the coordinator moved into the old drone's workspace
+  "$HIVE" rename old older > /dev/null 2>&1 || fail "rename failed"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace rename"
+  assert_contains "$FAKE_HERDR_LOG" "agent rename w7:p1 older"
+  HIVE_DRONE_LAYOUT="tab workspace" spawn_home odd > "$T/bad" 2>&1 && fail "a layout with a space was accepted"
+  assert_contains "$T/bad" "tab or workspace"
 }
 
 # --- main --------------------------------------------------------------------
