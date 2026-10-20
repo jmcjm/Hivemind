@@ -31,7 +31,7 @@ export TZ=UTC
 export HOME="$T/home" HIVE_DIR="$T/hive" FAKE_PANES="$T/panes" FAKE_HERDR_LOG="$T/herdr.log" FAKE_NOTIFY_LOG="$T/notify.log"
 export HIVE_RULES_DIR="$T/rules" HIVE_COORD_DIR="$T/coord"
 export PATH="$HERE/fake-bin:$PATH"
-unset HIVE_DRONE HERDR_HIVE_ROLE HIVE_COORD_PANE HIVE_ACCOUNT CLAUDE_CONFIG_DIR FAKE_CURRENT_PANE HIVE_WATCH_ALL KIND
+unset HIVE_DRONE HIVE_FRONT HERDR_PANE_ID HERDR_HIVE_ROLE HIVE_COORD_PANE HIVE_ACCOUNT CLAUDE_CONFIG_DIR FAKE_CURRENT_PANE HIVE_WATCH_ALL KIND
 mkdir -p "$HOME" "$HIVE_DIR" "$FAKE_PANES" "$HIVE_RULES_DIR"
 echo '{}' > "$HOME/.claude.json"
 
@@ -398,6 +398,11 @@ has "the next epoch warns again" '"decision": "block"' "$(guard)"
 usage_line false 2 360000 1000 >> "$TR"
 has "the reason text can be set (HIVE_COORD_GUARD_MSG)" "Save to STATE.md, context ~361k" \
   "$(printf '{"session_id":"s2","transcript_path":"%s"}' "$TR" | HIVE_COORD_GUARD_NOTIFY=0 HIVE_COORD_GUARD_MSG='Save to STATE.md, context ~{k}k' bash "$SK/coord-context-guard.sh")"
+has "the reason text names the session's front ({front})" "Save the state of front wms" \
+  "$(printf '{"session_id":"s4","transcript_path":"%s"}' "$TR" | HIVE_FRONT=wms HIVE_COORD_GUARD_NOTIFY=0 HIVE_COORD_GUARD_MSG='Save the state of front {front}' bash "$SK/coord-context-guard.sh")"
+has "a session without a front is the default front's" "Save the state of front default" \
+  "$(printf '{"session_id":"s5","transcript_path":"%s"}' "$TR" | HIVE_COORD_GUARD_NOTIFY=0 HIVE_COORD_GUARD_MSG='Save the state of front {front}' bash "$SK/coord-context-guard.sh")"
+eq "no temporary file is left behind" "" "$(ls -A "$HIVE_DIR" | grep '^\.context-guard\.' || true)"
 run env HIVE_DRONE=x bash -c "printf '{\"session_id\":\"s3\",\"transcript_path\":\"$TR\"}' | bash '$SK/coord-context-guard.sh'"
 eq "a drone is never guarded" "" "$OUT"
 rm -f "$HIVE_DIR/.context-guard"

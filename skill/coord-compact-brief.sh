@@ -10,7 +10,7 @@
 # conversation: which drone was told what, which question is still open, what the user is waiting
 # on. That is what this asks the summarizer to keep.
 #
-# Scoping: fires ONLY in the registered coordinator session (see coord-scope.sh). Drones,
+# Scoping: fires ONLY in a registered coordinator session (see coord-scope.sh). Drones,
 # subagents and unrelated sessions print nothing.
 set -uo pipefail
 
@@ -25,6 +25,11 @@ agent_type=$(sed -n 2p <<<"$fields")
 [ -n "${agent_type:-}" ] && exit 0
 hive_is_coordinator_session "${sid:-}" || exit 0
 
+if [ "$HIVE_SESSION_FRONT" != default ]; then
+  echo "This session coordinates front '$HIVE_SESSION_FRONT' of a hive with several fronts. Name the"
+  echo "front in the summary: its drones and its mail are that front's, the other fronts are not its own."
+  echo
+fi
 cat <<'EOF'
 This session coordinates a swarm of agents (hivemind). Preserve the following in the summary,
 even at the cost of detail elsewhere — it is coordination state, and losing it stalls drones:

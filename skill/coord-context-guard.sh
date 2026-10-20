@@ -21,14 +21,15 @@
 # the guard only at the end of one — so the warning sits a whole large turn (~40-50k) under it.
 #
 # Settings: HIVE_COORD_WARN_TOKENS (threshold), HIVE_COORD_GUARD_NOTIFY=0 (no desktop notification),
-# HIVE_COORD_GUARD_MSG (the reason text; {k} is replaced by the context size in thousands).
+# HIVE_COORD_GUARD_MSG (the reason text; {k} is replaced by the context size in thousands, {front} by
+# the session's front — HIVE_FRONT, which coord-start sets — or 'default').
 set -uo pipefail
 
 [ -n "${HIVE_DRONE:-}" ] && exit 0                 # never in a drone, whatever loaded this file
 HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
 STATE="$HIVE_DIR/.context-guard"
 python3 - "$STATE" "${HIVE_COORD_WARN_TOKENS:-330000}" 3<&0 <<'PY'
-import json, os, subprocess, sys
+import json, os, subprocess, sys, tempfile
 state, warn = sys.argv[1], sys.argv[2]
 try:
     with os.fdopen(3) as f:
@@ -76,6 +77,19 @@ def last_context(path):
             return best
     return None
 
+def save(st):
+    """Atomic for several coordinators (one per front) ending turns at the same moment: each writes its
+    own temporary file, where a shared 'state.tmp' could be replaced under another and fail the hook.
+    Two read-modify-writes in the same instant can still drop the other's entry; that costs at most
+    one repeated warning."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state) or '.', prefix='.context-guard.')
+    try:
+        with os.fdopen(fd, 'w') as f: json.dump(st, f)
+        os.replace(tmp, state)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+
 tokens = last_context(path)
 if tokens is None:
     sys.exit(0)
@@ -88,20 +102,20 @@ if tokens < warn:
     # Under the threshold: a new epoch (after a compaction, or a fresh session) — arm again.
     if st.get(sid):
         st.pop(sid, None)
-        with open(state + '.tmp', 'w') as f: json.dump(st, f)
-        os.replace(state + '.tmp', state)
+        save(st)
     sys.exit(0)
 if st.get(sid):                        # already warned in this epoch
     sys.exit(0)
 st[sid] = tokens
-with open(state + '.tmp', 'w') as f: json.dump(st, f)
-os.replace(state + '.tmp', state)
+save(st)
 k = f"{tokens // 1000}"
 msg = os.environ.get('HIVE_COORD_GUARD_MSG') or (
     "Context ~{k}k — auto-compaction is close. Save the coordinator state now (drones in flight, "
     "what each was told, open questions, decisions pending from the owner) wherever you keep it, "
     "and only then end the turn.")
-print(json.dumps({"decision": "block", "reason": msg.replace('{k}', k)}, ensure_ascii=False))
+front = os.environ.get('HIVE_FRONT') or 'default'
+print(json.dumps({"decision": "block", "reason": msg.replace('{k}', k).replace('{front}', front)},
+                 ensure_ascii=False))
 if os.environ.get('HIVE_COORD_GUARD_NOTIFY', '1') != '0':
     try:
         subprocess.run(['notify-send', '-a', 'hive', f'Coordinator context ~{k}k',

@@ -16,16 +16,20 @@ KIND_ARG="${1:-done}"
 HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
 HIVE_BIN="$HOME/.claude/skills/hivemind/hive"
 [ -x "$HIVE_BIN" ] || exit 0
+# The drone's own front (spawn sets HIVE_FRONT; a drone from before fronts has none: the default).
+# shellcheck source=coord-scope.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/coord-scope.sh" 2>/dev/null || exit 0
+FRONT_DIR=$(hive_front_dir "${HIVE_FRONT:-}")
 
 # A conversational drone (a human sits in its panel) ends a turn after EVERY utterance,
 # so automatic wake-ups are pure noise for the coordinator. The marker silences them;
 # an explicit 'hive send coord' from inside the drone still works.
-[ -f "$HIVE_DIR/drones/$HIVE_DRONE/.mute" ] && exit 0
+[ -f "$FRONT_DIR/drones/$HIVE_DRONE/.mute" ] && exit 0
 
 payload=$(cat 2>/dev/null || true)          # hook JSON on stdin (Notification carries .message)
 
 # Status from the drone's report, if it managed to write one
-report="$HIVE_DIR/drones/$HIVE_DRONE/report.md"
+report="$FRONT_DIR/drones/$HIVE_DRONE/report.md"
 status="no report"
 [ -f "$report" ] && status=$(grep -m1 -oE 'DONE|BLOCKED|FAILED' "$report" 2>/dev/null || echo "written")
 

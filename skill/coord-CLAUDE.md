@@ -38,3 +38,9 @@ compaction.
 
 `~/.herdr-hive/`: `drones/<name>/` (brief, report), `mail/<recipient>/`, `rules/` (boundary blocks for
 the `Rules:` line of a brief).
+
+## Fronts
+
+With several fronts (`hive fronts`), each front's coordinator runs in `coord/<front>/` below this
+directory and reads this file as well as its own `CLAUDE.md`: keep here what every coordinator shares,
+and what one front is about in its own file. Keep the running state per front too.
