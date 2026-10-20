@@ -1,6 +1,6 @@
 ---
 name: hivemind
-description: Use when the user wants you to run a swarm of Claude Code agents in herdr — phrases like "run the hivemind", "manage the swarm", "spawn agents", "delegate this to the drones", "what are the agents doing", "collect the reports". Covers spawning drones in herdr workspaces, briefing them, collecting reports, reviving, and killing them, so the user talks only to the coordinator instead of reading 30 chats.
+description: Use when the user wants you to run a swarm of Claude Code agents in herdr — phrases like "run the hivemind", "manage the swarm", "spawn agents", "delegate this to the drones", "what are the agents doing", "collect the reports". Covers spawning drones as tabs of the coordinator's herdr workspace, briefing them, collecting reports, reviving, and killing them, so the user talks only to the coordinator instead of reading 30 chats.
 ---
 
 # Hivemind — commanding a swarm of agents in herdr
@@ -59,9 +59,12 @@ moment and take over.
 
 - A front without a living local coordinator (none registered, a remote one, its pane gone) gives a
   new drone a workspace of its own, as `HIVE_DRONE_LAYOUT=workspace` does for every spawn.
-- A drone in a tab records `tab_id` in its `meta.json`; `kill`, `revive`, `move` and a failed start
-  close that tab and never the workspace — the workspace is the coordinator's. A drone without
-  `tab_id` (its own workspace, or one spawned before tabs) is closed with its workspace.
+- `meta.json` says what a drone owns: `tab_id` (its tab; the workspace is `home_workspace_id`, never
+  `workspace_id`, which older versions of hive close outright), `workspace_id` (a workspace of its
+  own — drones from before tabs), or neither (an adopted agent that shares its tab). `kill`,
+  `revive`, `move` and a failed start close what it owns only after herdr confirms, at that moment,
+  that it is alone there and no coordinator is; otherwise only the drone's pane goes. A coordinator
+  later started inside an old drone's workspace, or a shell split into a drone's tab, survives.
 - **Never close the coordinator's workspace while it holds drones**: that ends every one of them
   (`hive revive` brings each back, in the workspace of whoever coordinates the front then). Moving
   the coordinator elsewhere, close its own tab, not the workspace.
@@ -627,7 +630,7 @@ When a Claude Code started by hand (not through `hive`) already runs in herdr, d
 blind — it sits on context that exists nowhere else. The order:
 
 ```bash
-hive adopt <name> <pane_id>   # registers it in the swarm, records its session_id, renames the workspace
+hive adopt <name> <pane_id>   # registers it in the swarm, records its session_id and what it owns, renames its workspace or tab
 hive revive <name>            # restart with --resume: history stays; hooks, env and mail protocol arrive
 ```
 
@@ -683,7 +686,7 @@ needs `meta.json`. It stops being useful once hundreds of corpses bury the livin
 - `hive prune --purge` — the same, without the archive. Nothing to restore afterwards.
 - `hive prune <names...>` — restrict it to the drones you name (still dead-only).
 - `hive kill <dead-drone>` cleans up the same way instead of leaving a ghost behind: it archives
-  and removes. Killing a **living** drone still only closes the workspace and keeps the report,
+  and removes. Killing a **living** drone still only closes its tab (or own workspace) and keeps the report,
   because that report is usually the reason you are killing it.
 
 The sweep and prune are the two halves of the same job: the sweep **detects** — it mails
@@ -702,8 +705,11 @@ about whether the work succeeded.
   The name must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents —
   `hive spawn`/`rename` validate this.
 - `herdr agent start <name> --kind claude --pane <id>` starts the agent in an **existing**
-  shell pane — zero splits. `hive spawn` uses the root pane from `workspace create`.
-  Environment variables enter via `workspace create --env` (`agent start` has no `--env`).
+  shell pane — zero splits. `hive spawn` uses the root pane from `tab create` (or `workspace create`).
+  Environment variables enter via their `--env` (`agent start` has no `--env`).
+- `workspace get` reports `pane_count` and `tab_count`, `tab get` the tab's `pane_count`, `pane get` the
+  pane's `workspace_id` and `tab_id`. hive closes a drone's workspace or tab only after these confirm
+  the drone is alone there and no coordinator is (`drone_close`); otherwise `pane close` takes its pane.
 - `herdr agent prompt <drone> "<text>"` appends Enter **atomically** (honors bracketed-paste)
   and returns immediately; an agent stuck at a dialog is rejected with `agent_blocked` —
   nothing gets sent. With `--wait` it waits for a settled state (`--timeout` works only with

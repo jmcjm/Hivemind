@@ -16,7 +16,7 @@ setup() {
   T=$(mktemp -d)
   export HIVE_DIR="$T/hive" FAKE_HERDR_LOG="$T/herdr.log"
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
-  unset HIVE_DRONE HIVE_FRONT HERDR_PANE_ID KIND FAKE_HERDR_DOWN FAKE_NO_CURRENT_PANE FAKE_WORKSPACE_CREATE_FAIL FAKE_TAB_CREATE_FAIL FAKE_AGENT_START_FAIL FAKE_WORKSPACE_PANES FAKE_TAB_PANES HIVE_DRONE_LAYOUT FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
+  unset HIVE_DRONE HIVE_FRONT HERDR_PANE_ID KIND FAKE_HERDR_DOWN FAKE_NO_CURRENT_PANE FAKE_WORKSPACE_CREATE_FAIL FAKE_TAB_CREATE_FAIL FAKE_AGENT_START_FAIL FAKE_WORKSPACE_PANES FAKE_WORKSPACE_TABS FAKE_TAB_PANES FAKE_WORKSPACE_GET_FAIL FAKE_DEAD_PANES FAKE_PANE_TABS HIVE_DRONE_LAYOUT FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
         HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE HIVE_MAIL_OVERDUE_BUSY \
         HIVE_SWEEP_RENOTIFY HIVE_WATCH_ALL HIVE_WATCH_COALESCE_MAX
   # The watcher prints what each one-second pass found, without waiting for a burst to settle:
@@ -1267,7 +1267,9 @@ t_spawn_opens_a_tab_in_the_coordinators_workspace() {
   assert_not_contains "$FAKE_HERDR_LOG" "workspace create"
   assert_contains "$T/out" "ws=w1 tab=w1:t9 pane=w1:p9"
   [ "$(drone_meta_field kafka tab_id)" = "w1:t9" ] || fail "meta tab_id: $(drone_meta_field kafka tab_id)"
-  [ "$(drone_meta_field kafka workspace_id)" = "w1" ] || fail "meta workspace_id: $(drone_meta_field kafka workspace_id)"
+  [ "$(drone_meta_field kafka home_workspace_id)" = "w1" ] || fail "meta home_workspace_id: $(drone_meta_field kafka home_workspace_id)"
+  # Older hive closes workspace_id outright: a drone in a tab must never carry the coordinator's.
+  [ -z "$(drone_meta_field kafka workspace_id)" ] || fail "a drone in a tab carries workspace_id $(drone_meta_field kafka workspace_id)"
 }
 
 t_spawn_without_a_living_coordinator_opens_a_workspace() {
@@ -1325,12 +1327,13 @@ t_rename_renames_the_tab() {
 
 t_adopt_in_a_shared_workspace_owns_only_its_tab() {
   FAKE_WORKSPACE_PANES=3 "$HIVE" adopt guest w5:p2 > "$T/out" 2>&1 || fail "adopt failed: $(cat "$T/out")"
-  [ "$(drone_meta_field guest tab_id)" = "w5:t1" ] || fail "meta tab_id: $(drone_meta_field guest tab_id)"
-  assert_contains "$FAKE_HERDR_LOG" "tab rename w5:t1 guest"
+  [ "$(drone_meta_field guest tab_id)" = "w5:t2" ] || fail "meta tab_id: $(drone_meta_field guest tab_id)"
+  [ -z "$(drone_meta_field guest workspace_id)" ] || fail "an agent in a shared workspace recorded workspace_id"
+  assert_contains "$FAKE_HERDR_LOG" "tab rename w5:t2 guest"
   assert_not_contains "$FAKE_HERDR_LOG" "workspace rename"
   : > "$FAKE_HERDR_LOG"
   "$HIVE" kill guest > /dev/null 2>&1
-  assert_contains "$FAKE_HERDR_LOG" "tab close w5:t1"
+  assert_contains "$FAKE_HERDR_LOG" "tab close w5:t2"
   assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
   # Alone in its workspace, an adopted agent owns the workspace, as before.
   : > "$FAKE_HERDR_LOG"
@@ -1349,6 +1352,81 @@ t_move_lands_in_the_new_coordinators_workspace() {
   assert_contains "$FAKE_HERDR_LOG" "tab create --workspace w3 --label live"
   [ "$(python3 -c "import json;print(json.load(open('$HIVE_DIR/fronts/wms/drones/live/meta.json')).get('tab_id',''))")" = "w3:t9" ] \
     || fail "the moved drone did not record its new tab"
+}
+
+t_a_coordinator_inside_an_old_drones_workspace_survives_its_kill() {
+  fake_drone default old w7:p1                    # its own workspace w7, from before tabs
+  echo "w7:p2" > "$HIVE_DIR/coord.pane"           # the coordinator was started in that workspace
+  "$HIVE" kill old > "$T/out" 2>&1 || fail "kill failed: $(cat "$T/out")"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
+  assert_contains "$FAKE_HERDR_LOG" "tab close w7:t1"
+  assert_not_contains "$FAKE_HERDR_LOG" "tab close w7:t2"
+}
+
+t_a_split_tab_loses_only_the_drones_pane() {
+  spawn_home kafka > /dev/null 2>&1 || fail "spawn failed"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_TAB_PANES=2 "$HIVE" kill kafka > "$T/out" 2>&1 || fail "kill failed"
+  assert_contains "$FAKE_HERDR_LOG" "pane close w1:p9"
+  assert_not_contains "$FAKE_HERDR_LOG" "tab close"
+  assert_contains "$T/out" "kill: kafka (pane w1:p9 closed, report kept)"
+}
+
+t_adopt_a_split_of_the_coordinators_tab_owns_only_its_pane() {
+  FAKE_WORKSPACE_PANES=2 FAKE_PANE_TABS="w1:p2=w1:t1" "$HIVE" adopt split w1:p2 > "$T/out" 2>&1 \
+    || fail "adopt failed: $(cat "$T/out")"
+  assert_contains "$T/out" "the drone owns only its pane"
+  [ -z "$(drone_meta_field split tab_id)$(drone_meta_field split workspace_id)" ] || fail "the split claimed a tab or a workspace"
+  assert_not_contains "$FAKE_HERDR_LOG" "tab rename"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace rename"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_PANE_TABS="w1:p2=w1:t1" "$HIVE" kill split > /dev/null 2>&1
+  assert_contains "$FAKE_HERDR_LOG" "pane close w1:p2"
+  assert_not_contains "$FAKE_HERDR_LOG" "tab close"
+}
+
+t_adopt_refuses_when_herdr_cannot_describe_the_workspace() {
+  FAKE_WORKSPACE_GET_FAIL=1 "$HIVE" adopt guest w5:p2 > "$T/out" 2>&1 && fail "adopt went ahead blind"
+  assert_contains "$T/out" "nothing adopted"
+  assert_not_contains "$FAKE_HERDR_LOG" "agent rename"
+  [ -e "$HIVE_DIR/drones/guest" ] && fail "the refused adopt left a drone"
+}
+
+t_a_bad_layout_closes_nothing() {
+  spawn_home kafka > /dev/null 2>&1 || fail "spawn failed"
+  front_add wms
+  : > "$FAKE_HERDR_LOG"
+  HIVE_DRONE_LAYOUT=grid HOME="$T/home" "$HIVE" revive kafka > "$T/out" 2>&1 && fail "revive accepted a bad layout"
+  HIVE_DRONE_LAYOUT=grid HOME="$T/home" "$HIVE" move kafka wms > "$T/out2" 2>&1 && fail "move accepted a bad layout"
+  assert_not_contains "$FAKE_HERDR_LOG" "close"
+  [ -d "$HIVE_DIR/drones/kafka" ] || fail "the refused move moved the drone"
+}
+
+t_spawn_falls_back_to_a_workspace_of_its_own() {
+  FAKE_TAB_CREATE_FAIL=1 spawn_home kafka > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  assert_contains "$T/out" "kafka gets a workspace of its own"
+  assert_contains "$FAKE_HERDR_LOG" "workspace create --label kafka"
+  [ "$(drone_meta_field kafka workspace_id)" = "w9" ] || fail "meta workspace_id: $(drone_meta_field kafka workspace_id)"
+  # A coordinator whose pane is gone, or one on another machine, has no workspace to share.
+  rm -f "$HIVE_DIR/coord.pane"; echo "w4:p1" > "$HIVE_DIR/coord.pane"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_NO_CURRENT_PANE=1 FAKE_DEAD_PANES="w4:p1" spawn_home ghostly > /dev/null 2>&1 || fail "spawn with a dead coordinator failed"
+  assert_contains "$FAKE_HERDR_LOG" "workspace create --label ghostly"
+  echo "coordhost" > "$HIVE_DIR/coord.remote"
+  : > "$FAKE_HERDR_LOG"
+  FAKE_NO_CURRENT_PANE=1 spawn_home faraway > /dev/null 2>&1 || fail "spawn with a remote coordinator failed"
+  assert_contains "$FAKE_HERDR_LOG" "workspace create --label faraway"
+}
+
+t_move_a_tab_drone_closes_its_source_tab() {
+  spawn_home kafka > /dev/null 2>&1 || fail "spawn failed"
+  front_add wms
+  echo "w3:p1" > "$HIVE_DIR/fronts/wms/coord.pane"
+  : > "$FAKE_HERDR_LOG"
+  HOME="$T/home" "$HIVE" move kafka wms > "$T/out" 2>&1 || fail "move failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "tab close w1:t9"
+  assert_contains "$FAKE_HERDR_LOG" "tab create --workspace w3 --label kafka"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
 }
 
 # --- main --------------------------------------------------------------------

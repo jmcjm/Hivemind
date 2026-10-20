@@ -152,8 +152,8 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
    it and the human loses their only interface. `hive wait` has a hard timeout and also ends on `blocked`/`dead`.
 3. **The completion signal is `report.md`, not the agent status.** `idle` means only "not generating
    tokens right now" — a drone hanging on a dialog is `idle` too.
-4. **Swarm variables go through `workspace create --env`**, because `agent start` (0.8) starts the
-   agent in the existing root pane and has no `--env` of its own. That is how drones learn `HIVE_DRONE`.
+4. **Swarm variables go through `tab create --env`** (or `workspace create --env`), because `agent
+   start` (0.8) starts the agent in the existing root pane and has no `--env` of its own. That is how drones learn `HIVE_DRONE`.
 5. **A fresh drone loses its first input** — `SessionStart` hooks clear the prompt, and `herdr agent
    prompt` without `--wait` does not confirm receipt. `hive task` confirms delivery (the status must
    jump to `working`) and retries up to 3 times.
@@ -180,7 +180,7 @@ Each of these points comes from a burnt drone or a hung coordinator. Do not "sim
 - `herdr agent *` commands are addressed by **agent name** (= drone name) or pane ID.
   Name: `[a-z][a-z0-9_-]{0,31}`, unique among live agents.
 - `herdr agent start <name> --kind claude --pane <id>` starts in an **existing** shell pane —
-  zero splits. Drone env enters via `workspace create --env`.
+  zero splits. Drone env enters via `tab create --env` / `workspace create --env`.
 - `herdr agent prompt` appends Enter atomically and returns immediately; an agent at a dialog →
   `agent_blocked`, nothing gets sent. `--timeout` works only with `--wait`.
   The old `agent send` and top-level `wait` are gone since 0.7.5.
