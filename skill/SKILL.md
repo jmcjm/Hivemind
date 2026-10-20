@@ -269,8 +269,9 @@ written there, once.
   coordinates another front`), so the front left without a coordinator is alerted about like any other.
   A session `coord-start` pinned to one front refuses `hive --front <other> coord`: its environment, and
   so its hooks, would stay on the first front — start the other front's coordinator in a pane of its own.
-  `spawn`, `revive` and `move` never take a pane away from another front, and `hive --front <f> spawn`
-  from a pane that coordinates nothing leaves front `<f>`'s living coordinator registered.
+  `spawn`, `revive` and `move` never take a pane away from another front, and a spawn into a named
+  front from a pane that coordinates nothing leaves that front's living coordinator registered. A
+  drone that spawns, and a session pinned to another front, never register their pane.
 - The Stop backstop, the SessionStart board and the PreCompact brief find which front the session
   coordinates and look at that front only.
 - The sweep timer covers every front, each alert to its own coordinator; a named front's journal lines
@@ -653,7 +654,7 @@ switches it to `--dangerously-skip-permissions`, so the boundaries must be hard 
 | no `HIVE-MAIL` notifications at all | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
 | the user gets a desktop ping for every drone turn | herdr's own toasts or sounds for background agents (`[ui.toast] delivery` on, `[ui.sound]` on) — herdr cannot limit them to your pane | tell the user: `delivery = "off"` and `[ui.sound] enabled = false` in the herdr config silence them, after `herdr server reload-config` when the server is running; hive's own alerts use the desktop notifier and do not need them |
 | `HIVE-WATCH: taken over by another watcher` | armed twice, or another session took the watch | nothing to do if that was you; otherwise `hive coord` + re-arm in the session that should coordinate |
-| a front's coordinator sees another front's drones, or `hive status` says `front: default` | the session carries no `HIVE_FRONT` and its pane is not registered for its front | `hive --front <front> coord` and re-arm the watcher it prints; for good: restart it with `hive --front <front> coord-start -- --resume <session id>` (`--continue` looks in the front's home, where this session never ran) |
+| a front's coordinator sees another front's drones, or `hive status` says `front: default` | the session carries no `HIVE_FRONT` and its pane is not registered for its front | `hive --front <front> coord` in that session and re-arm the watcher it prints. A conversation cannot move into the front's home (`--continue`/`--resume` look in the directory a session ran in): for the auto-compaction settings, save the state and start a fresh `hive --front <front> coord-start` |
 | `drone X belongs to front Y` on spawn | drone names are unique across fronts (herdr agent names are machine-wide) | another name, or `hive move X <front>` |
 
 ## Corpses and cleanup

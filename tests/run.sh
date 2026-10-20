@@ -1173,6 +1173,28 @@ t_spawn_with_front_flag_keeps_a_living_coordinator() {
   [ "$(cat "$HIVE_DIR/fronts/wms/coord.pane")" = "w3:p1" ] || fail "wms's living coordinator was replaced"
 }
 
+t_spawn_never_registers_a_drone_or_a_session_pinned_elsewhere() {
+  front_add wms
+  rm -f "$HIVE_DIR/coord.pane"                    # the calling pane, w1:p1, coordinates nothing
+  mkdir -p "$T/home/work"; echo '{}' > "$T/home/.claude.json"
+  echo "w3:p1" > "$HIVE_DIR/fronts/wms/coord.pane"
+  HIVE_FRONT=wms HOME="$T/home" "$HIVE" spawn one --cwd "$T/home/work" > /dev/null 2>&1 || fail "spawn one failed"
+  [ "$(cat "$HIVE_DIR/fronts/wms/coord.pane")" = "w3:p1" ] || fail "HIVE_FRONT=wms spawn replaced wms's living coordinator"
+  HIVE_DRONE=kafka HOME="$T/home" "$HIVE" spawn two --cwd "$T/home/work" > /dev/null 2>&1 || fail "spawn two failed"
+  [ -e "$HIVE_DIR/coord.pane" ] && fail "a drone's spawn registered its pane as the coordinator"
+  rm -f "$HIVE_DIR/fronts/wms/coord.pane"
+  HIVE_FRONT=default HOME="$T/home" "$HIVE" --front wms spawn three --cwd "$T/home/work" > /dev/null 2>&1 || fail "spawn three failed"
+  [ -e "$HIVE_DIR/fronts/wms/coord.pane" ] && fail "a session pinned to default registered its pane for wms"
+}
+
+t_front_rm_refuses_while_herdr_is_unreachable() {
+  front_add wms
+  echo "w3:p1" > "$HIVE_DIR/fronts/wms/coord.pane"
+  FAKE_HERDR_DOWN=1 "$HIVE" front rm wms > "$T/out" 2>&1 && fail "a front was removed without herdr"
+  assert_contains "$T/out" "herdr is unreachable — nothing removed"
+  [ -d "$HIVE_DIR/fronts/wms" ] || fail "the front is gone"
+}
+
 t_send_explicit_front_must_hold_the_drone() {
   front_add wms; front_add shp
   fake_drone shp sql w5:p1

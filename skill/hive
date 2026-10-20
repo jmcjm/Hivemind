@@ -1269,14 +1269,17 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # A pane that coordinates another front stays there: its coordinator spawning a drone into this
   # front (hive --front <name> spawn, hive move) hands the drone over, it does not change fronts.
   # A move (SPAWN_KEEPS_COORD) never registers anybody: whoever runs it, the front it lands in keeps
-  # the coordinator it has. Nor does a spawn into a front named with --front from a pane that
-  # coordinates nothing, while that front's coordinator is alive elsewhere.
+  # the coordinator it has. Nor does a drone that spawns, nor a session coord-start pinned to another
+  # front (its hooks would stay there), nor a spawn into a named front from a pane that coordinates
+  # nothing while that front's coordinator is alive elsewhere.
   local owner current keep=0
   owner=$(front_of_pane "$coord") || owner=""
   current=$(coord_pane)
   [ "${SPAWN_KEEPS_COORD:-0}" = 1 ] && keep=1
+  [ -n "${HIVE_DRONE:-}" ] && keep=1
+  [ "$FRONT_ENV" != - ] && [ "$(front_label "$FRONT_ENV")" != "$(front_label "$HIVE_FRONT")" ] && keep=1
   [ -n "$owner" ] && [ "$owner" != "$(front_label "$HIVE_FRONT")" ] && keep=1
-  [ "$FRONT_FLAG" = 1 ] && [ -z "$owner" ] && [ -n "$current" ] && [ "$(pane_status "$current")" != dead ] && keep=1
+  [ "$FRONT_NAMED" = 1 ] && [ -z "$owner" ] && [ -n "$current" ] && [ "$(pane_status "$current")" != dead ] && keep=1
   if [ "$keep" = 1 ]; then
     coord="$current"
   elif [ -n "$coord" ]; then
@@ -2316,7 +2319,8 @@ cmd_move() {  # move <drone> <front> [--force]
 
   [ "$live" = 1 ] && [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
   mkdir -p "$dfront/drones" "$dfront/mail"
-  mv "$src" "$dst" || die "move: could not move $src to $dst${ws:+ — its workspace is closed already: hive --front $from revive $name}"
+  local closed=""; [ "$live" = 1 ] && closed=" — its workspace is closed already: hive --front $from revive $name"
+  mv "$src" "$dst" || die "move: could not move $src to $dst$closed"
   # The mailbox may exist in the new front already (an 'inbox' or a letter sent there first): its
   # letters are merged into it, never nested under it where nobody reads.
   local smail="$MAIL_DIR/$name" dmail="$dfront/mail/$name"
@@ -2413,6 +2417,9 @@ cmd_front() {  # front add <name> [description] | describe <name> <description> 
       # A coordinator whose Monitor merely expired is still there: every hive call of its session
       # would fail on the front gone under it.
       local cpane; cpane=$(cat "$FRONTS_DIR/$name/coord.pane" 2>/dev/null)
+      # Without herdr every pane reads as dead, a living coordinator's too.
+      [ -n "$cpane" ] && ! herdr_reachable \
+        && die "front $name has a coordinator registered in pane $cpane and herdr is unreachable — nothing removed"
       [ -n "$cpane" ] && [ "$(pane_status "$cpane")" != dead ] \
         && die "front $name still has its coordinator in pane $cpane — end that session first"
       # Its read mail and archives are evidence: packed before the directory goes.
