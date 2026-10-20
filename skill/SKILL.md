@@ -15,7 +15,7 @@ on them, collect the results, and give the user **one condensed answer**.
 it handles every trap described below. Add it to PATH or call it by full path.
 
 ```
-hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, --dangerously-skip-permissions, own workspace)
+hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, --dangerously-skip-permissions), a tab in its coordinator's workspace
 hive task   <name> <file|->        brief from file/stdin + appended reporting protocol; needs a
                                    'Rules: <blocks>' line or a '## Boundaries' section
 hive say    <name> <text>          ad-hoc message
@@ -33,7 +33,7 @@ hive peek   <name> [lines]         view of the drone's terminal
 hive kill   <name> [--purge]       kill a drone; an already dead one is archived and removed
                                    (--purge deletes without an archive)
 hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives them, then removes
-hive rename <old> <new>            rename a drone and its workspace
+hive rename <old> <new>            rename a drone and its tab (or its own workspace)
 hive revive <name> [--account NAME]  resurrection with full conversation history (--resume); --account moves it
 hive adopt  <name> <pane_id> [--account NAME]  pull a Claude Code started outside hive into the swarm
 hive accounts [--refresh] [--pick] accounts table: limits, resets, status, and the account a spawn takes
@@ -52,9 +52,19 @@ Model: `opus` (overridable via `HIVE_MODEL`).
 
 ## Architecture
 
-One drone = one **herdr workspace** = one pane with an interactive Claude Code.
-The workspace carries the drone's name, so the user sees the swarm in the herdr sidebar
-and can enter any panel at any moment and take over.
+One drone = one **tab in its coordinator's workspace** = one pane with an interactive Claude Code.
+A front is then one workspace in the herdr sidebar: the coordinator's tab and a tab per drone, each
+labelled with the drone's name, so the user sees who works for whom and can enter any panel at any
+moment and take over.
+
+- A front without a living local coordinator (none registered, a remote one, its pane gone) gives a
+  new drone a workspace of its own, as `HIVE_DRONE_LAYOUT=workspace` does for every spawn.
+- A drone in a tab records `tab_id` in its `meta.json`; `kill`, `revive`, `move` and a failed start
+  close that tab and never the workspace — the workspace is the coordinator's. A drone without
+  `tab_id` (its own workspace, or one spawned before tabs) is closed with its workspace.
+- **Never close the coordinator's workspace while it holds drones**: that ends every one of them
+  (`hive revive` brings each back, in the workspace of whoever coordinates the front then). Moving
+  the coordinator elsewhere, close its own tab, not the workspace.
 
 **Communication goes through files, not the terminal.** The brief lands in `brief.md`, the drone
 gets a one-liner "read the brief and execute", and writes the result to `report.md`.
@@ -502,7 +512,9 @@ make it yours — where you keep the coordinator state, which accounts and repos
    the old session's hooks stop treating it as the coordinator.
 3. In the new session: arm the watcher, read the saved state back, `hive status`, `hive inbox`, then
    delete any session crons it recreated from memory whose work a timer now does.
-4. Close the old session when its last turn is over (`/exit`). Its own crons die with it.
+4. Close the old session when its last turn is over (`/exit`). Its own crons die with it. Leave its
+   workspace open while drones live in its tabs — closing it would end them all; close the old
+   coordinator's tab only. New drones open in the new coordinator's workspace.
 
 ## Surviving a compaction
 
@@ -625,8 +637,9 @@ wake-ups either — without `HIVE_DRONE` its `hive inbox` would read the coordin
 adds all of that; it refuses to run when herdr reported no session id, because there would be no
 history to resume. Before
 `revive` check `hive peek` — if the agent asked a question and waits, answer it after the revival,
-otherwise it picks the topic up its own way. `revive` closes the drone's whole workspace; `adopt`
-warns when that workspace holds other panes too.
+otherwise it picks the topic up its own way. `revive` closes what the drone owns: an agent alone in
+its workspace owns the workspace; one in a shared workspace (a coordinator's, yours) owns only its tab,
+and `adopt` warns when that tab holds other panes too.
 
 **A long session resumes from a summary.** Reviving a session of several hours, Claude Code asks
 whether to resume from a summary or in full. `hive` takes the summary (cheaper) and warns loudly.

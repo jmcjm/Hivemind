@@ -6,6 +6,11 @@
 #   FAKE_AGENT_STATUS=<s> the agent status 'pane get' reports (default idle)
 #   FAKE_NO_CURRENT_PANE=1  'pane current' fails, as outside a herdr pane
 #   FAKE_WORKSPACE_CREATE_FAIL=1  'workspace create' fails
+#   FAKE_TAB_CREATE_FAIL=1  'tab create' fails
+#   FAKE_AGENT_START_FAIL=1  'agent start' fails the way a broken launch does (not agent_not_ready)
+#   FAKE_WORKSPACE_PANES=<n> / FAKE_TAB_PANES=<n>  the pane_count 'workspace get' / 'tab get' report (1)
+# 'pane get <ws>:<p>' reports workspace <ws> and tab <ws>:t1; 'tab create --workspace <ws>' answers
+# tab <ws>:t9 with root pane <ws>:p9.
 #   FAKE_TOAST_SHOWN=0    'notification show' answers like herdr with no client attached (not
 #                         shown); by default it answers "shown", as herdr does once it has handed
 #                         the notification to a client — whether or not that client displays it
@@ -18,8 +23,18 @@ case "$1 ${2:-}" in
   "workspace list")    echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
   "workspace create")  [ "${FAKE_WORKSPACE_CREATE_FAIL:-0}" = 1 ] && exit 1
                        echo '{"result":{"workspace":{"workspace_id":"w9"},"root_pane":{"pane_id":"w9:p1"}}}' ;;
-  "pane get")          printf '{"result":{"pane":{"pane_id":"%s","agent":"claude","agent_status":"%s","agent_session":{"kind":"id","value":"%s"}}}}\n' \
-                         "${3:-}" "${FAKE_AGENT_STATUS:-idle}" "${FAKE_SESSION_ID:-}" ;;
+  "pane get")          printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"%s","tab_id":"%s:t1","agent":"claude","agent_status":"%s","agent_session":{"kind":"id","value":"%s"}}}}\n' \
+                         "${3:-}" "${3%%:*}" "${3%%:*}" "${FAKE_AGENT_STATUS:-idle}" "${FAKE_SESSION_ID:-}" ;;
+  "tab create")        [ "${FAKE_TAB_CREATE_FAIL:-0}" = 1 ] && exit 1
+                       ws=""; prev=""
+                       for a in "$@"; do [ "$prev" = --workspace ] && ws="$a"; prev="$a"; done
+                       printf '{"result":{"tab":{"tab_id":"%s:t9"},"root_pane":{"pane_id":"%s:p9"}}}\n' "$ws" "$ws" ;;
+  "workspace get")     printf '{"result":{"workspace":{"workspace_id":"%s","pane_count":%s}}}\n' "${3:-}" "${FAKE_WORKSPACE_PANES:-1}" ;;
+  "tab get")           printf '{"result":{"tab":{"tab_id":"%s","pane_count":%s}}}\n' "${3:-}" "${FAKE_TAB_PANES:-1}" ;;
+  "agent start")       if [ "${FAKE_AGENT_START_FAIL:-0}" = 1 ]; then
+                         echo '{"error":{"code":"spawn_failed","message":"fake launch failure"}}' >&2; exit 1
+                       fi
+                       echo '{"result":{"type":"ok"}}' ;;
   "pane current")      [ "${FAKE_NO_CURRENT_PANE:-0}" = 1 ] && exit 1
                        echo '{"result":{"pane":{"pane_id":"w1:p1"}}}' ;;
   "pane read")         : ;;

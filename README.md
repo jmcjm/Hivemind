@@ -96,8 +96,11 @@ ride on the drones' `--settings`, so the human's session is untouched.
 
 ## Architecture
 
-**Drone = herdr workspace = a panel with an interactive Claude Code on opus.** The workspace carries
-the drone's name, so the human sees the swarm in the sidebar and can take over any panel at any time.
+**Drone = a tab in its coordinator's workspace = a panel with an interactive Claude Code on opus.**
+Each front is one workspace in herdr's sidebar — the coordinator and a tab per drone, named after it —
+so the human sees who works for whom and can take over any panel at any time. Without a living local
+coordinator, or with `HIVE_DRONE_LAYOUT=workspace`, a drone gets a workspace of its own. Closing a
+drone closes its tab, never the coordinator's workspace.
 
 **Communication goes through files, not the terminal.** Brief → `brief.md`, result → `report.md`.
 The TUI is read (`hive peek`) strictly for diagnosis.
@@ -240,7 +243,8 @@ falls under the threshold again.
 > guard asked for the save.
 
 Moving a running coordinator: save its state, let it end its turn, run `hive coord-start` in a new
-pane (the registration moves at once), read the state back there, then `/exit` the old session.
+pane (the registration moves at once), read the state back there, then `/exit` the old session —
+and keep its workspace open while its tabs hold drones.
 
 ## Fronts: several coordinators on one machine
 
