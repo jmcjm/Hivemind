@@ -4,6 +4,8 @@
 #   FAKE_HERDR_DOWN=1     every call fails the way an unreachable server does
 #   FAKE_SESSION_ID=<id>  the agent session id 'pane get' reports (hook scoping)
 #   FAKE_AGENT_STATUS=<s> the agent status 'pane get' reports (default idle)
+#   FAKE_NO_CURRENT_PANE=1  'pane current' fails, as outside a herdr pane
+#   FAKE_WORKSPACE_CREATE_FAIL=1  'workspace create' fails
 #   FAKE_TOAST_SHOWN=0    'notification show' answers like herdr with no client attached (not
 #                         shown); by default it answers "shown", as herdr does once it has handed
 #                         the notification to a client — whether or not that client displays it
@@ -14,10 +16,12 @@ if [ "${FAKE_HERDR_DOWN:-0}" = 1 ]; then
 fi
 case "$1 ${2:-}" in
   "workspace list")    echo '{"result":{"type":"workspace_list","workspaces":[]}}' ;;
-  "workspace create")  echo '{"result":{"workspace":{"workspace_id":"w9"},"root_pane":{"pane_id":"w9:p1"}}}' ;;
+  "workspace create")  [ "${FAKE_WORKSPACE_CREATE_FAIL:-0}" = 1 ] && exit 1
+                       echo '{"result":{"workspace":{"workspace_id":"w9"},"root_pane":{"pane_id":"w9:p1"}}}' ;;
   "pane get")          printf '{"result":{"pane":{"pane_id":"%s","agent":"claude","agent_status":"%s","agent_session":{"kind":"id","value":"%s"}}}}\n' \
                          "${3:-}" "${FAKE_AGENT_STATUS:-idle}" "${FAKE_SESSION_ID:-}" ;;
-  "pane current")      echo '{"result":{"pane":{"pane_id":"w1:p1"}}}' ;;
+  "pane current")      [ "${FAKE_NO_CURRENT_PANE:-0}" = 1 ] && exit 1
+                       echo '{"result":{"pane":{"pane_id":"w1:p1"}}}' ;;
   "pane read")         : ;;
   "notification show") if [ "${FAKE_TOAST_SHOWN:-1}" = 0 ]; then
                          echo '{"result":{"type":"notification_show","shown":false,"reason":"disabled"}}'

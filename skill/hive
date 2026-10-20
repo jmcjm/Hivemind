@@ -30,10 +30,13 @@ FRONTS_DIR="$HIVE_DIR/fronts"
 front_dir()   { case "${1:-}" in ''|default) printf '%s\n' "$HIVE_DIR" ;; *) printf '%s\n' "$FRONTS_DIR/$1" ;; esac; }
 front_label() { case "${1:-}" in ''|default) echo default ;; *) echo "$1" ;; esac; }
 front_valid() { [[ "$1" =~ ^[a-z][a-z0-9_-]{0,15}$ ]] && [ "$1" != default ]; }
-front_names() {  # every front, the default one first
+front_names() {  # every front, the default one first; a directory no front could be named is not one
   echo default
-  local d
-  for d in "$FRONTS_DIR"/*/; do [ -d "$d" ] && basename "$d"; done
+  local d n
+  for d in "$FRONTS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d"); front_valid "$n" && echo "$n"
+  done
 }
 
 # front_of_pane <pane> — the front whose coordinator is registered in <pane>; fails when none is.
@@ -53,6 +56,14 @@ drone_front() {
     [ -d "$(front_dir "$f")/drones/$1" ] && { echo "$f"; return 0; }
   done
   return 1
+}
+
+# unknown_drone <name> — dies for a drone this front does not have. With several fronts the likely
+# reason is that it lives in another one, and the message says which and how to reach it.
+unknown_drone() {
+  local f; f=$(drone_front "$1") || die "unknown drone: $1"
+  [ "$f" = "$(front_label "$HIVE_FRONT")" ] && die "unknown drone: $1"
+  die "unknown drone in front $(front_label "$HIVE_FRONT"): $1 — it belongs to front $f (hive --front $f <command> $1)"
 }
 
 # name_free_elsewhere <name> — dies when another front already has a drone of that name: herdr's
@@ -84,11 +95,13 @@ front_use() {
 }
 
 # FRONT_NAMED: the front was named (--front, HIVE_FRONT), not found through the calling pane. A
-# sweep nobody pointed at a front covers them all.
-FRONT_NAMED=0
+# sweep nobody pointed at a front covers them all. FRONT_FLAG: named by --front on this command
+# line. FRONT_ENV: the HIVE_FRONT this process inherited ('-' when none) — a session coord-start
+# pinned to one front cannot be moved to another by a command it runs.
+FRONT_NAMED=0 FRONT_FLAG=0 FRONT_ENV="${HIVE_FRONT--}"
 if [ "${1:-}" = --front ]; then
   [ -n "${2:-}" ] || die "usage: hive --front <name> <command> ..."
-  HIVE_FRONT="$2"; shift 2
+  HIVE_FRONT="$2"; FRONT_FLAG=1; shift 2
 fi
 if [ -n "${HIVE_FRONT+x}" ]; then
   FRONT_NAMED=1
@@ -1256,10 +1269,16 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # A pane that coordinates another front stays there: its coordinator spawning a drone into this
   # front (hive --front <name> spawn, hive move) hands the drone over, it does not change fronts.
   # A move (SPAWN_KEEPS_COORD) never registers anybody: whoever runs it, the front it lands in keeps
-  # the coordinator it has.
-  local owner; owner=$(front_of_pane "$coord") || owner=""
-  if [ "${SPAWN_KEEPS_COORD:-0}" = 1 ] || { [ -n "$owner" ] && [ "$owner" != "$(front_label "$HIVE_FRONT")" ]; }; then
-    coord=$(coord_pane)
+  # the coordinator it has. Nor does a spawn into a front named with --front from a pane that
+  # coordinates nothing, while that front's coordinator is alive elsewhere.
+  local owner current keep=0
+  owner=$(front_of_pane "$coord") || owner=""
+  current=$(coord_pane)
+  [ "${SPAWN_KEEPS_COORD:-0}" = 1 ] && keep=1
+  [ -n "$owner" ] && [ "$owner" != "$(front_label "$HIVE_FRONT")" ] && keep=1
+  [ "$FRONT_FLAG" = 1 ] && [ -z "$owner" ] && [ -n "$current" ] && [ "$(pane_status "$current")" != dead ] && keep=1
+  if [ "$keep" = 1 ]; then
+    coord="$current"
   elif [ -n "$coord" ]; then
     coord_register "$coord"
   fi
@@ -1455,7 +1474,7 @@ PY
 cmd_task() {  # task <name> <brief-file>  |  task <name> - (brief from stdin)
   local name="${1:?usage: hive task <name> <file|->}"; local src="${2:?missing brief}"
   local dir; dir=$(drone_dir "$name")
-  [ -f "$(drone_meta "$name")" ] || die "unknown drone: $name"
+  [ -f "$(drone_meta "$name")" ] || unknown_drone "$name"
   local pane; pane=$(pane_of "$name")
 
   # The brief is checked and expanded in a staging file and replaces brief.md only once it passed:
@@ -1557,7 +1576,7 @@ Not sending — Enter would send THAT, not my task. Sort the prompt out (hive cl
 
 cmd_clear() {  # clear <name> — clears the drone's input field (ctrl+u)
   local name="${1:?usage: hive clear <name>}"
-  local pane; pane=$(pane_of "$name") || die "unknown drone: $name"
+  local pane; pane=$(pane_of "$name") || unknown_drone "$name"
   local pending; pending=$(prompt_pending "$pane")
   [ -z "$pending" ] && { echo "clear: $name — prompt already clean"; return 0; }
   echo "clear: $name — removing from the prompt: \"$pending\""
@@ -1570,7 +1589,7 @@ cmd_clear() {  # clear <name> — clears the drone's input field (ctrl+u)
 
 cmd_say() {  # say <name> <text>  |  say <name> - (text from stdin, like task)
   local name="${1:?usage: hive say <name> <text|->}"; shift
-  local pane; pane=$(pane_of "$name") || die "unknown drone: $name"
+  local pane; pane=$(pane_of "$name") || unknown_drone "$name"
   local pending; pending=$(prompt_pending "$pane")
   [ -n "$pending" ] && die "drone $name has unsent text in its prompt: \"$pending\"
 Not sending — Enter would send THAT. Sort the prompt out (hive clear $name) and retry."
@@ -1631,8 +1650,16 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
     # Orphaned: the process that started us (the Monitor's session) is gone. $PPID is fixed at
     # start, so this holds even after the orphan was reparented.
     kill -0 "$PPID" 2>/dev/null || exit 0
-    [ "$(cat "$WATCH_OWNER" 2>/dev/null)" = "$$" ] \
-      || { echo "HIVE-WATCH: taken over by another watcher — stopping"; return 0; }
+    local owner; owner=$(cat "$WATCH_OWNER" 2>/dev/null)
+    if [ "$owner" != "$$" ]; then
+      # No owner at all: coord_register took this front's pane for another front and retired us.
+      if [ -z "$owner" ]; then
+        echo "HIVE-WATCH: the pane of front $(front_label "$HIVE_FRONT") now coordinates another front — stopping"
+      else
+        echo "HIVE-WATCH: taken over by another watcher — stopping"
+      fi
+      return 0
+    fi
     local -A now=()
     fresh=()
     for f in "$box"/*.json; do
@@ -1682,14 +1709,17 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
 # limit, and a recorded session id (coord-scope.sh falls back to asking herdr which session owns
 # the pane, which also follows a /clear).
 # One pane coordinates one front: a pane registered for another front leaves that front, which is
-# said out loud — its drones have nobody listening until it gets a coordinator again.
+# said out loud — its drones have nobody listening until it gets a coordinator again. That front's
+# watcher, armed in this pane, is retired with it (its owner mark goes): left running it would keep
+# a live heartbeat, so nobody would be alerted that the front's mail goes unheard.
 coord_register() {
+  [ -n "${1:-}" ] || die "coord: no herdr pane to register — run it inside the herdr pane of the coordinator"
   local f d
   for f in $(front_names); do
     d=$(front_dir "$f")
     [ "$d" = "$FRONT_DIR" ] && continue
     if [ "$(cat "$d/coord.pane" 2>/dev/null)" = "$1" ]; then
-      rm -f "$d/coord.pane" "$d/coord.session"
+      rm -f "$d/coord.pane" "$d/coord.session" "$d/.watch-coord.pid"
       echo "coord: pane $1 leaves front $f — front $f has no coordinator now" >&2
     fi
   done
@@ -1859,6 +1889,15 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
     if [[ "$t" == *:* ]]; then
       tfront="${t%%:*}"; t="${t#*:}"
       [ "$t" = all ] && { echo "send: a broadcast stays within its front — not sent to $tfront:all" >&2; failed=1; continue; }
+      if [ "$tfront" != default ] && ! { front_valid "$tfront" && [ -d "$FRONTS_DIR/$tfront" ]; }; then
+        echo "send: unknown front '$tfront' — not sent to $tfront:$t" >&2; failed=1; continue
+      fi
+      # An address names a front and a drone in it; a drone that lives elsewhere is a wrong address,
+      # not one to reroute quietly.
+      if [ "$t" != coord ] && [ ! -d "$(front_dir "$tfront")/drones/$t" ]; then
+        local where; where=$(drone_front "$t") && where=" (it belongs to front $where)" || where=""
+        echo "send: front $tfront has no drone $t$where — not sent" >&2; failed=1; continue
+      fi
     elif [ "$t" != coord ] && [ "$t" != all ] && [ ! -d "$DRONES_DIR/$t" ]; then
       tfront=$(drone_front "$t") || tfront=""
     fi
@@ -1957,7 +1996,7 @@ cmd_report() {  # report <name>
 
 cmd_peek() {  # peek <name> [lines] — view of the drone's terminal
   local name="${1:?usage: hive peek <name> [lines]}"; local lines="${2:-40}"
-  local pane; pane=$(pane_of "$name") || die "unknown drone: $name"
+  local pane; pane=$(pane_of "$name") || unknown_drone "$name"
   herdr pane read "$pane" --source visible --lines "$lines" 2>/dev/null \
     || die "failed to read the pane"
 }
@@ -1965,7 +2004,7 @@ cmd_peek() {  # peek <name> [lines] — view of the drone's terminal
 cmd_mute() {  # mute <name> [--off] — silences the drone's automatic wake-ups
   local name="${1:?usage: hive mute <name> [--off]}"
   local dir; dir=$(drone_dir "$name")
-  [ -d "$dir" ] || die "unknown drone: $name"
+  [ -d "$dir" ] || unknown_drone "$name"
   if [ "${2:-}" = "--off" ]; then
     rm -f "$dir/.mute"; echo "mute: $name — wake-ups enabled again"
   else
@@ -1978,7 +2017,7 @@ cmd_mute() {  # mute <name> [--off] — silences the drone's automatic wake-ups
 cmd_kill() {  # kill <name> [--purge]
   local name="${1:?usage: hive kill <name> [--purge]}"; local purge="${2:-}"
   local dir; dir=$(drone_dir "$name")
-  [ -d "$dir" ] || die "unknown drone: $name"
+  [ -d "$dir" ] || unknown_drone "$name"
   # The state is read BEFORE the workspace is closed — afterwards every drone looks dead,
   # and the difference between "killed just now" and "was already a corpse" would be lost.
   local state; state=$(drone_state "$name")
@@ -2060,7 +2099,7 @@ cmd_rename() {  # rename <old> <new>
     || die "name '$new' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   [ -e "$(drone_dir "$new")" ] && die "drone $new already exists — pick another name"
   name_free_elsewhere "$new"
-  local ws pane; ws=$(meta_get "$old" workspace_id) || die "unknown drone: $old"
+  local ws pane; ws=$(meta_get "$old" workspace_id) || unknown_drone "$old"
   pane=$(pane_of "$old")
   herdr workspace rename "$ws" "$new" >/dev/null 2>&1
   herdr agent rename "$pane" "$new" >/dev/null 2>&1
@@ -2074,7 +2113,7 @@ d=json.load(open(p)); d['name']='$new'; json.dump(d,open(p,'w'),indent=1)"
 
 cmd_unblock() {  # unblock <name> — answers the dialog a drone is stuck on
   local name="${1:?usage: hive unblock <name>}"
-  local pane; pane=$(pane_of "$name") || die "unknown drone: $name"
+  local pane; pane=$(pane_of "$name") || unknown_drone "$name"
   local dlg; dlg=$(pane_dialog "$pane" 2>/dev/null) || dlg=""
   case "$dlg" in
     resume)
@@ -2196,7 +2235,7 @@ EOF
 
 cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its conversation history intact
   local name="${1:?usage: hive revive <name> [--account NAME]}"; shift
-  local cwd; cwd=$(meta_get "$name" cwd) || die "unknown drone: $name"
+  local cwd; cwd=$(meta_get "$name" cwd) || unknown_drone "$name"
   # A drone comes back on the account it ran on. --account moves it; without it the drone moves
   # only when its account has no room left (over its threshold, full, unusable, disabled) — then to
   # the account 'hive accounts' selects. With HIVE_ACCOUNT pinned or no accounts.conf it never moves.
@@ -2239,10 +2278,18 @@ cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its
 # environment names its front, and a running process cannot be given another environment. Its
 # conversation survives the restart; only the paths it was told change, and it is told the new ones.
 cmd_move() {  # move <drone> <front> [--force]
-  local name="${1:?usage: hive move <drone> <front> [--force]}" to="${2:?usage: hive move <drone> <front> [--force]}"
-  local force=0; [ "${3:-}" = --force ] && force=1
+  local force=0 a
+  local -a pos=()
+  for a in "$@"; do
+    case "$a" in --force) force=1 ;; -*) die "move: unknown argument $a" ;; *) pos+=("$a") ;; esac
+  done
+  [ ${#pos[@]} = 2 ] || die "usage: hive move <drone> <front> [--force]"
+  local name="${pos[0]}" to="${pos[1]}"
   [ "$to" = default ] || { front_valid "$to" && [ -d "$FRONTS_DIR/$to" ]; } \
     || die "move: unknown front '$to' — hive fronts lists them"
+  # An unreachable server makes every living drone read as dead, and a living drone moved as a dead
+  # one keeps running with its old front and paths.
+  herdr_reachable || die "move: herdr server unreachable (down, or older than this client) — every drone would read as dead; nothing moved"
   to=$(front_label "$to")
   local from; from=$(drone_front "$name") || die "move: unknown drone: $name"
   [ "$from" = "$to" ] && die "move: $name already belongs to front $to"
@@ -2269,10 +2316,22 @@ cmd_move() {  # move <drone> <front> [--force]
 
   [ "$live" = 1 ] && [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
   mkdir -p "$dfront/drones" "$dfront/mail"
-  mv "$src" "$dst" || die "move: could not move $src to $dst"
-  if [ -d "$MAIL_DIR/$name" ]; then
-    mv "$MAIL_DIR/$name" "$dfront/mail/$name" \
-      || echo "move: warning — the mailbox stayed behind in $MAIL_DIR/$name" >&2
+  mv "$src" "$dst" || die "move: could not move $src to $dst${ws:+ — its workspace is closed already: hive --front $from revive $name}"
+  # The mailbox may exist in the new front already (an 'inbox' or a letter sent there first): its
+  # letters are merged into it, never nested under it where nobody reads.
+  local smail="$MAIL_DIR/$name" dmail="$dfront/mail/$name"
+  if [ -d "$smail" ]; then
+    if [ -e "$dmail" ]; then
+      local -a lts=()
+      local l
+      for l in "$smail"/*.json; do [ -e "$l" ] && lts+=("$l"); done
+      # rmdir, not rm -r: a letter still being written (.tmp.*) keeps the old mailbox, and is named.
+      if { [ ${#lts[@]} = 0 ] || mv "${lts[@]}" "$dmail/"; } && rmdir "$smail" 2>/dev/null; then :; else
+        echo "move: warning — letters stayed behind in $smail" >&2
+      fi
+    else
+      mv "$smail" "$dmail" || echo "move: warning — the mailbox stayed behind in $smail" >&2
+    fi
   fi
   rm -f "$FRONT_DIR/.wake-$name" "$dst"/.sweep-*
   # The brief tells the drone where its report goes; hive wrote that path, so hive moves it.
@@ -2292,7 +2351,10 @@ PY
     echo "move: $name was not running — bring it back in its new front: hive --front $to revive $name"
     return 0
   fi
-  SPAWN_KEEPS_COORD=1 cmd_spawn "$name" --cwd "$cwd" --account "$(account_label "$account")" --resume
+  # A subshell, so a spawn that dies still leaves the way back on the screen: the drone sits closed
+  # in its new front with its session intact.
+  ( SPAWN_KEEPS_COORD=1 cmd_spawn "$name" --cwd "$cwd" --account "$(account_label "$account")" --resume ) \
+    || die "move: $name moved to front $to but did not start there — resume it: hive --front $to revive $name"
   # Its conversation still names the old paths; one line puts it right.
   ( cmd_say "$name" "hive: you were moved to front '$to' — 'coord' is now that front's coordinator. Your files moved with you: the brief is $dst/brief.md, the report goes to $dst/report.md (the old paths are gone). Nothing else changed." ) >/dev/null \
     || echo "move: could not tell $name its new paths — tell it: report to $dst/report.md" >&2
@@ -2344,10 +2406,15 @@ cmd_front() {  # front add <name> [description] | describe <name> <description> 
       name="${1:?usage: hive front rm <name>}"
       front_valid "$name" && [ -d "$FRONTS_DIR/$name" ] || die "unknown front: $name"
       [ -n "$(ls -A "$FRONTS_DIR/$name/drones" 2>/dev/null)" ] \
-        && die "front $name still has drones — move them (hive move <drone> <front>) or prune them first"
+        && die "front $name still has drones — move them (hive move <drone> <front>) or prune them first (hive --front $name prune)"
       [ -n "$(find "$FRONTS_DIR/$name/mail" -path '*/.archive' -prune -o -name '*.json' -print 2>/dev/null | head -1)" ] \
         && die "front $name has unread mail — read it first: hive --front $name inbox"
       ( front_use "$name"; coord_watched ) && die "front $name still has a live watcher — end its coordinator session first"
+      # A coordinator whose Monitor merely expired is still there: every hive call of its session
+      # would fail on the front gone under it.
+      local cpane; cpane=$(cat "$FRONTS_DIR/$name/coord.pane" 2>/dev/null)
+      [ -n "$cpane" ] && [ "$(pane_status "$cpane")" != dead ] \
+        && die "front $name still has its coordinator in pane $cpane — end that session first"
       # Its read mail and archives are evidence: packed before the directory goes.
       local adir="$HIVE_DIR/archive" out
       mkdir -p "$adir" || die "cannot create $adir"
@@ -2759,6 +2826,12 @@ cmd_gate() {  # gate enter|release|status|queue|force-release [description]
     # live WHERE PEOPLE LOOK — not in someone else's mailbox (two collisions in one day taught this).
     queue)
       local qf="$HIVE_DIR/gate.queue" sub2="${1:-list}"; shift || true
+      # One queue for the machine, like the gate: with several fronts their coordinators share it,
+      # so a change to it takes the gate's lock.
+      case "$sub2" in set|pop|clear)
+        exec 8>"$HIVE_DIR/.gate-lock"
+        flock -w 10 8 || { echo "gate: cannot take the gate lock (10 s) — try again." >&2; return 5; } ;;
+      esac
       case "$sub2" in
         set)   printf '%s\n' "$@" | tr ' ' '\n' | grep -v '^$' > "$qf"; echo "queue set:"; gate_queue_print "$qf" ;;
         pop)   if [ -s "$qf" ]; then h=$(head -1 "$qf"); tail -n +2 "$qf" > "$qf.tmp" && mv "$qf.tmp" "$qf"; echo "popped: $h"; else echo "queue empty"; fi ;;
@@ -2866,6 +2939,11 @@ case "${1:-}" in
             rm -f "$FRONT_DIR/coord.pane" "$FRONT_DIR/.wake-coord" "$FRONT_DIR/.stranded-notice"
             echo "coord: remote at $2 — coord mail is forwarded over ssh"
           else
+            # A session coord-start started carries its front in its environment, and so do its hooks:
+            # registered for another front, its Stop backstop and board would keep reading the old one.
+            if [ "$FRONT_ENV" != - ] && [ "$(front_label "$FRONT_ENV")" != "$(front_label "$HIVE_FRONT")" ]; then
+              die "coord: this session carries HIVE_FRONT=$(front_label "$FRONT_ENV") — coord-start pinned it to that front, and a running session cannot change its environment (its hooks would keep watching front $(front_label "$FRONT_ENV")). To coordinate front $(front_label "$HIVE_FRONT"), start its coordinator in a pane of its own: hive --front $(front_label "$HIVE_FRONT") coord-start"
+            fi
             coord_register "$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")"
             echo "coord: $(coord_pane)${HIVE_FRONT:+ — front $HIVE_FRONT}"
             # Always, even with a fresh heartbeat: that proves some watcher lives, not that this

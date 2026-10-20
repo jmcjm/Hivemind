@@ -20,7 +20,7 @@ hive task   <name> <file|->        brief from file/stdin + appended reporting pr
                                    'Rules: <blocks>' line or a '## Boundaries' section
 hive say    <name> <text>          ad-hoc message
 hive clear  <name>                 clear the drone's input field
-hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all | <front>:coord) + drone wake-up / watcher notice (coord)
+hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all | <front>:coord | <front>:<drone>) + drone wake-up / watcher notice (coord)
 hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
 hive watch                         the mail watcher — arm it as a Monitor; one line per burst of letters
 hive coord                         register the current pane as the coordinator pane
@@ -236,7 +236,8 @@ existing swarm becomes the default front without any migration. `default` names 
 asked for.
 
 **Which front a command acts on:** `hive --front <front> <command>`, else `HIVE_FRONT`, else the front
-whose coordinator is registered in the calling pane (herdr's `HERDR_PANE_ID`), else the default front.
+whose coordinator is registered in the calling pane (herdr's `HERDR_PANE_ID`, set in every pane by
+herdr 0.9; without it, name the front), else the default front.
 `coord-start` exports `HIVE_FRONT` into the coordinator session, so its commands, its hooks and its
 Monitor stay on its front; `spawn` gives every drone its front the same way. A coordinator registered
 by hand (`hive --front wms coord`) is found through its pane. A front that does not exist is refused
@@ -254,18 +255,28 @@ written there, once.
 - `hive move <drone> <front>` hands a drone over: its directory, reports and mailbox move, and a living
   drone is closed and resumed in the new front with its conversation (`--resume`), then told its new
   paths in one `hive say`. A working drone is refused (`--force` cuts its turn off); a dead one only
-  moves — revive it there.
+  moves — revive it there. Letters already waiting in the new front's mailbox for it are merged, and
+  with the herdr server unreachable nothing moves (every drone would read as dead). If the restart
+  fails, the drone stays in its new front, closed: `hive --front <front> revive <drone>`.
+- A command naming a drone of another front fails with where it is: `unknown drone in front wms:
+  picker — it belongs to front shp (hive --front shp <command> picker)`. `<front>:<drone>` must name a
+  drone of that front; a bare name is looked up in every front.
 - `hive fronts` is the table of all fronts; `hive status --all` lists every front's drones.
 
 **What keeps them apart:**
 - One pane coordinates one front. `hive coord` or `coord-start` in a pane registered for another front
-  takes the pane over and says so; `spawn`, `revive` and `move` never take a pane away from another front.
+  takes the pane over, says so, and retires that front's watcher (`HIVE-WATCH: the pane of front <f> now
+  coordinates another front`), so the front left without a coordinator is alerted about like any other.
+  A session `coord-start` pinned to one front refuses `hive --front <other> coord`: its environment, and
+  so its hooks, would stay on the first front — start the other front's coordinator in a pane of its own.
+  `spawn`, `revive` and `move` never take a pane away from another front, and `hive --front <f> spawn`
+  from a pane that coordinates nothing leaves front `<f>`'s living coordinator registered.
 - The Stop backstop, the SessionStart board and the PreCompact brief find which front the session
   coordinates and look at that front only.
 - The sweep timer covers every front, each alert to its own coordinator; a named front's journal lines
   read `sweep [<front>]: ...`. `hive --front <front> sweep` sweeps one.
 - A front coordinator's gate windows are logged as `<front>:coord`, so two coordinators never release
-  each other's window.
+  each other's window. The gate queue is the machine's too: one order for every front.
 - A remote fleet's forward of a named front's mail carries `HIVE_FRONT`, so it lands in the same front
   on the coordinator's machine — which has to have that front.
 
@@ -642,7 +653,7 @@ switches it to `--dangerously-skip-permissions`, so the boundaries must be hard 
 | no `HIVE-MAIL` notifications at all | watcher not armed or expired | `hive status` → `watch: NOT ARMED`; arm `Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)`, then `hive inbox` |
 | the user gets a desktop ping for every drone turn | herdr's own toasts or sounds for background agents (`[ui.toast] delivery` on, `[ui.sound]` on) — herdr cannot limit them to your pane | tell the user: `delivery = "off"` and `[ui.sound] enabled = false` in the herdr config silence them, after `herdr server reload-config` when the server is running; hive's own alerts use the desktop notifier and do not need them |
 | `HIVE-WATCH: taken over by another watcher` | armed twice, or another session took the watch | nothing to do if that was you; otherwise `hive coord` + re-arm in the session that should coordinate |
-| a front's coordinator sees another front's drones, or `hive status` says `front: default` | the session carries no `HIVE_FRONT` and its pane is not registered for its front | `hive --front <front> coord` and re-arm the watcher it prints; for good: restart it with `hive --front <front> coord-start -- --continue` |
+| a front's coordinator sees another front's drones, or `hive status` says `front: default` | the session carries no `HIVE_FRONT` and its pane is not registered for its front | `hive --front <front> coord` and re-arm the watcher it prints; for good: restart it with `hive --front <front> coord-start -- --resume <session id>` (`--continue` looks in the front's home, where this session never ran) |
 | `drone X belongs to front Y` on spawn | drone names are unique across fronts (herdr agent names are machine-wide) | another name, or `hive move X <front>` |
 
 ## Corpses and cleanup
