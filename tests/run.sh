@@ -16,7 +16,7 @@ setup() {
   T=$(mktemp -d)
   export HIVE_DIR="$T/hive" FAKE_HERDR_LOG="$T/herdr.log"
   export PATH="$ROOT/tests/fake-herdr:$ORIG_PATH"
-  unset HIVE_DRONE KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
+  unset HIVE_DRONE HIVE_FRONT HERDR_PANE_ID KIND FAKE_HERDR_DOWN FAKE_AGENT_STATUS FAKE_SESSION_ID FAKE_TOAST_SHOWN FAKE_NOTIFY_FAIL \
         HIVE_UNWATCHED_GRACE HIVE_MAIL_REMIND HIVE_MAIL_OVERDUE HIVE_MAIL_OVERDUE_BUSY \
         HIVE_SWEEP_RENOTIFY HIVE_WATCH_ALL HIVE_WATCH_COALESCE_MAX
   # The watcher prints what each one-second pass found, without waiting for a burst to settle:
@@ -819,6 +819,289 @@ t_board_reports_watcher_state() {
   echo '{"session_id":"S1","source":"compact"}' \
     | FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-creed-inject.sh" > "$T/on"
   assert_contains "$T/on" "Mail watcher: a watcher is live — if this session has no hive watch monitor, arm one: $ARM."
+}
+
+# --- fronts --------------------------------------------------------------------
+# Several independent swarms, one coordinator each. The default front is $HIVE_DIR itself.
+
+front_add() { "$HIVE" front add "$@" > /dev/null || fail "front add $1 failed"; }
+
+front_letters() {  # front_letters <front> [mailbox] — unread letters in that front's mailbox (default: coord)
+  find "$HIVE_DIR/fronts/$1/mail/${2:-coord}" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+}
+
+fake_drone() {  # fake_drone <front|default> <name> [pane] — a drone with a task in flight: a brief, no report
+  local d="$HIVE_DIR/fronts/$1/drones/$2"
+  [ "$1" = default ] && d="$HIVE_DIR/drones/$2"
+  mkdir -p "$d"
+  printf '{"name":"%s","workspace_id":"w7","pane_id":"%s","session_id":"5e55e55e-0000-4000-8000-%012d","cwd":"%s","account":""}\n' \
+    "$2" "${3:-w7:p1}" "$RANDOM" "$T" > "$d/meta.json"
+  printf '# Brief: %s\nWrite the report to %s/report.md\n' "$2" "$d" > "$d/brief.md"
+}
+
+start_watch_front() {  # start_watch_front <front> <outfile>
+  HIVE_FRONT="$1" "$HIVE" watch > "$2" 2>&1 &
+  WATCH_PIDS+=($!)
+  sleep 1.5
+}
+
+t_front_add_creates_front_and_home() {
+  "$HIVE" front add wms "Warehouse: scanners, receiving, put-away" > "$T/out" || fail "front add failed: $(cat "$T/out")"
+  [ -d "$HIVE_DIR/fronts/wms/drones" ] && [ -d "$HIVE_DIR/fronts/wms/mail" ] || fail "front directories missing"
+  assert_contains "$HIVE_DIR/fronts/wms/description" "Warehouse: scanners, receiving, put-away"
+  assert_contains "$HIVE_DIR/coord/wms/CLAUDE.md" "# Front: wms"
+  assert_contains "$HIVE_DIR/coord/wms/CLAUDE.md" 'Monitor(command: "hive --front wms watch", description: "swarm mail (wms)", timeout_ms: 1800000)'
+  assert_contains "$T/out" "hive --front wms coord-start"
+  "$HIVE" front add wms > /dev/null 2>&1 && fail "a second 'front add wms' was accepted"
+  "$HIVE" front add default > /dev/null 2>&1 && fail "'default' was accepted as a front name"
+  "$HIVE" front add Bad > /dev/null 2>&1 && fail "'Bad' was accepted as a front name"
+  "$HIVE" front describe wms "WMS only" > /dev/null || fail "front describe failed"
+  assert_contains "$HIVE_DIR/fronts/wms/description" "WMS only"
+}
+
+t_front_unknown_is_refused_and_not_created() {
+  front_add wms
+  "$HIVE" --front nope status > "$T/out" 2>&1 && fail "an unknown front was accepted"
+  assert_contains "$T/out" "unknown front 'nope' — create it: hive front add nope"
+  HIVE_FRONT=nope "$HIVE" send coord hi > /dev/null 2>&1 && fail "HIVE_FRONT=nope was accepted"
+  [ -e "$HIVE_DIR/fronts/nope" ] && fail "a typo made a front"
+  "$HIVE" --front default status > /dev/null || fail "'--front default' refused"
+}
+
+t_front_mail_stays_in_its_front() {
+  front_add wms
+  start_watch "$T/default"
+  start_watch_front wms "$T/wms"
+  HIVE_FRONT=wms HIVE_DRONE=kafka KIND=decision "$HIVE" send coord "which bin?" > /dev/null
+  sleep 2
+  [ "$(front_letters wms)" = 1 ] || fail "wms coord mailbox holds $(front_letters wms) letter(s)"
+  [ "$(letters)" = 0 ] || fail "the default coordinator got the wms letter"
+  assert_contains "$T/wms" "HIVE-MAIL kafka [DECISION] which bin?"
+  assert_not_contains "$T/default" "which bin?"
+  # Two watchers of two fronts are two listeners, not a takeover.
+  assert_not_contains "$T/default" "taken over"
+  assert_not_contains "$T/wms" "taken over"
+  "$HIVE" _watched || fail "the default front's watcher is not live"
+  HIVE_FRONT=wms "$HIVE" _watched || fail "the wms front's watcher is not live"
+  HIVE_FRONT=wms "$HIVE" inbox > "$T/inbox"
+  assert_contains "$T/inbox" "which bin?"
+  [ "$(front_letters wms)" = 0 ] || fail "inbox of wms left its letter"
+}
+
+t_front_found_from_the_coordinator_pane() {
+  front_add wms
+  echo "w3:p1" > "$HIVE_DIR/fronts/wms/coord.pane"
+  HERDR_PANE_ID=w3:p1 "$HIVE" status > "$T/mine"
+  assert_contains "$T/mine" "front: wms"
+  HERDR_PANE_ID=w9:p9 "$HIVE" status > "$T/other"
+  assert_contains "$T/other" "front: default"
+  # A named front wins over the pane.
+  HERDR_PANE_ID=w3:p1 HIVE_FRONT=default "$HIVE" status > "$T/named"
+  assert_contains "$T/named" "front: default"
+}
+
+t_coord_register_takes_the_pane_from_another_front() {
+  front_add wms                                   # setup registered w1:p1 for the default front
+  HIVE_FRONT=wms "$HIVE" coord > "$T/out" 2> "$T/err"
+  [ "$(cat "$HIVE_DIR/fronts/wms/coord.pane" 2>/dev/null)" = "w1:p1" ] || fail "wms did not get the pane"
+  [ -e "$HIVE_DIR/coord.pane" ] && fail "the pane still coordinates the default front too"
+  assert_contains "$T/err" "coord: pane w1:p1 leaves front default — front default has no coordinator now"
+  assert_contains "$T/out" 'coord: arm the mail watcher — Monitor(command: "hive --front wms watch", description: "swarm mail (wms)", timeout_ms: 1800000)'
+}
+
+t_spawn_into_another_front_keeps_both_coordinators() {
+  front_add wms
+  mkdir -p "$T/home/work"; echo '{}' > "$T/home/.claude.json"
+  HOME="$T/home" "$HIVE" --front wms spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  [ -f "$HIVE_DIR/fronts/wms/drones/kafka/meta.json" ] || fail "the drone is not in front wms"
+  [ -e "$HIVE_DIR/drones/kafka" ] && fail "the drone landed in the default front"
+  assert_contains "$FAKE_HERDR_LOG" "--env HIVE_FRONT=wms"
+  [ "$(cat "$HIVE_DIR/coord.pane")" = "w1:p1" ] || fail "the default front lost its coordinator"
+  [ -e "$HIVE_DIR/fronts/wms/coord.pane" ] && fail "the default coordinator's pane was registered for wms"
+  # Its own front's drones carry the default front by name.
+  HOME="$T/home" "$HIVE" spawn sql --cwd "$T/home/work" > /dev/null 2>&1 || fail "default spawn failed"
+  assert_contains "$FAKE_HERDR_LOG" "--env HIVE_FRONT=default"
+}
+
+t_spawn_name_is_unique_across_fronts() {
+  front_add wms
+  fake_drone default kafka
+  mkdir -p "$T/home/work"; echo '{}' > "$T/home/.claude.json"
+  HOME="$T/home" "$HIVE" --front wms spawn kafka --cwd "$T/home/work" > "$T/out" 2>&1 && fail "a second kafka was spawned"
+  assert_contains "$T/out" "drone kafka belongs to front default"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace create"
+}
+
+t_send_to_another_fronts_coordinator() {
+  front_add wms; front_add shp
+  printf 'the body' | HIVE_FRONT=wms HIVE_DRONE=kafka "$HIVE" send shp:coord "need the SHP schema" > "$T/out" \
+    || fail "cross-front send failed"
+  assert_contains "$T/out" "send: kafka -> shp:coord: need the SHP schema"
+  [ "$(front_letters shp)" = 1 ] || fail "shp coord mailbox holds $(front_letters shp) letter(s)"
+  [ "$(front_letters wms)" = 0 ] || fail "the letter stayed in wms"
+  local f; f=$(find "$HIVE_DIR/fronts/shp/mail/coord" -name '*.json' | head -1)
+  local from; from=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['from'])" "$f")
+  [ "$from" = "wms:kafka" ] || fail "sender is '$from', not wms:kafka"
+  python3 -c "import json,sys;sys.exit(0 if json.load(open(sys.argv[1]))['body']=='the body' else 1)" "$f" || fail "body lost"
+  # The reply goes back the same way; the default front is addressed by name too.
+  HIVE_FRONT=shp "$HIVE" send default:coord "ack" > /dev/null || fail "send to default:coord failed"
+  [ "$(letters)" = 1 ] || fail "default coord got $(letters) letter(s)"
+  HIVE_FRONT=wms "$HIVE" send shp:all "everyone" > "$T/all" 2>&1 && fail "a cross-front broadcast was sent"
+}
+
+t_send_bare_name_reaches_a_drone_of_another_front() {
+  front_add wms; front_add shp
+  fake_drone shp sql w5:p1
+  HIVE_FRONT=wms HIVE_DRONE=kafka "$HIVE" send sql "column names?" > /dev/null || fail "send failed"
+  [ "$(front_letters shp sql)" = 1 ] || fail "sql's mailbox in shp holds $(front_letters shp sql) letter(s)"
+  [ -e "$HIVE_DIR/fronts/wms/mail/sql" ] && fail "a ghost mailbox for sql appeared in wms"
+  assert_contains "$FAKE_HERDR_LOG" "agent prompt w5:p1 HIVE-MAIL: new mail. Run: hive inbox"
+}
+
+t_sweep_covers_every_front() {
+  front_add wms
+  fake_drone wms stuck w5:p1
+  export FAKE_AGENT_STATUS=idle
+  HIVE_FRONT=default "$HIVE" sweep > "$T/one"
+  [ "$(front_letters wms)" = 0 ] || fail "a sweep of the default front reported a wms drone"
+  "$HIVE" sweep > "$T/all"
+  assert_contains "$T/all" "sweep [wms]: SWEEP: drone stuck sits idle without a report"
+  [ "$(front_letters wms)" = 1 ] || fail "wms coord mailbox holds $(front_letters wms) letter(s)"
+  [ "$(letters)" = 0 ] || fail "the default coordinator got the wms sweep alert"
+}
+
+t_stop_hook_is_scoped_to_the_sessions_front() {
+  front_add wms
+  echo "w3:p1" > "$HIVE_DIR/fronts/wms/coord.pane"   # the default front's coordinator is w1:p1
+  HIVE_FRONT=wms HIVE_DRONE=kafka "$HIVE" send coord "finished" > /dev/null
+  # The wms coordinator (its hooks run in its pane, w3:p1) is held...
+  echo '{"session_id":"S1"}' | HERDR_PANE_ID=w3:p1 FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-mail-check.sh" > "$T/wms"
+  assert_contains "$T/wms" '"decision": "block"'
+  assert_contains "$T/wms" "the coordinator mailbox of front wms"
+  # ...and so is a session started by coord-start, which carries its front...
+  echo '{"session_id":"S1"}' | HIVE_FRONT=wms FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-mail-check.sh" > "$T/env"
+  assert_contains "$T/env" '"decision": "block"'
+  # ...while the default coordinator, whose own mailbox is empty, is not.
+  echo '{"session_id":"S2"}' | HERDR_PANE_ID=w1:p1 FAKE_SESSION_ID=S2 bash "$ROOT/skill/coord-mail-check.sh" > "$T/default"
+  [ -s "$T/default" ] && fail "the default coordinator was held for wms mail"
+  # Default-front mail does not hold the wms coordinator either.
+  "$HIVE" inbox > /dev/null; HIVE_FRONT=wms "$HIVE" inbox > /dev/null
+  HIVE_DRONE=sql "$HIVE" send coord "finished" > /dev/null
+  echo '{"session_id":"S1"}' | HERDR_PANE_ID=w3:p1 FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-mail-check.sh" > "$T/cross"
+  [ -s "$T/cross" ] && fail "the wms coordinator was held for default-front mail"
+}
+
+t_board_is_the_fronts_own() {
+  front_add wms
+  echo "w3:p1" > "$HIVE_DIR/fronts/wms/coord.pane"
+  fake_drone default homebody
+  fake_drone wms picker
+  echo '{"session_id":"S1","source":"compact"}' \
+    | HERDR_PANE_ID=w3:p1 FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-creed-inject.sh" > "$T/board"
+  assert_contains "$T/board" "You coordinate front 'wms'"
+  assert_contains "$T/board" 'Mail watcher: NOT ARMED — you hear no drone until you arm it: Monitor(command: "hive --front wms watch", description: "swarm mail (wms)", timeout_ms: 1800000).'
+  assert_contains "$T/board" "picker"
+  assert_not_contains "$T/board" "homebody"
+  echo '{"session_id":"S1"}' | HERDR_PANE_ID=w3:p1 FAKE_SESSION_ID=S1 bash "$ROOT/skill/coord-compact-brief.sh" > "$T/brief"
+  assert_contains "$T/brief" "This session coordinates front 'wms'"
+}
+
+t_drone_ping_reports_to_its_front() {
+  front_add wms
+  mkdir -p "$T/home/.claude/skills/hivemind" "$HIVE_DIR/fronts/wms/drones/kafka"
+  ln -s "$ROOT/skill/hive" "$T/home/.claude/skills/hivemind/hive"
+  printf 'STATUS: DONE\n' > "$HIVE_DIR/fronts/wms/drones/kafka/report.md"
+  echo '{}' | HOME="$T/home" HIVE_FRONT=wms HIVE_DRONE=kafka bash "$ROOT/skill/drone-ping.sh" done
+  [ "$(front_letters wms)" = 1 ] || fail "wms coord mailbox holds $(front_letters wms) letter(s)"
+  [ "$(letters)" = 0 ] || fail "the default coordinator got the wms drone's letter"
+  HIVE_FRONT=wms "$HIVE" inbox > "$T/inbox"
+  assert_contains "$T/inbox" "finished a turn (report: DONE)"
+}
+
+t_move_a_dead_drone() {
+  front_add wms
+  fake_drone default old w5:p1
+  HIVE_DRONE=coord "$HIVE" send old "a letter waiting" > /dev/null
+  FAKE_HERDR_DOWN=1 "$HIVE" move old wms > "$T/out" 2>&1 || fail "move failed: $(cat "$T/out")"
+  [ -f "$HIVE_DIR/fronts/wms/drones/old/meta.json" ] || fail "the drone is not in wms"
+  [ -e "$HIVE_DIR/drones/old" ] && fail "the drone is still in the default front"
+  [ "$(front_letters wms old)" = 1 ] || fail "its mailbox did not move along"
+  assert_contains "$HIVE_DIR/fronts/wms/drones/old/brief.md" "$HIVE_DIR/fronts/wms/drones/old/report.md"
+  assert_contains "$T/out" "hive --front wms revive old"
+  assert_not_contains "$FAKE_HERDR_LOG" "agent start"
+}
+
+t_move_a_living_drone_resumes_it_in_the_new_front() {
+  front_add wms
+  fake_drone default live w5:p1
+  local sid; sid=$(drone_meta_field live session_id)
+  mkdir -p "$T/home"; echo '{}' > "$T/home/.claude.json"
+  HOME="$T/home" "$HIVE" move live wms > "$T/out" 2>&1 || fail "move failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "workspace close w7"
+  assert_contains "$FAKE_HERDR_LOG" "--env HIVE_FRONT=wms"
+  assert_contains "$FAKE_HERDR_LOG" "--resume $sid"
+  assert_contains "$FAKE_HERDR_LOG" "agent prompt live hive: you were moved to front 'wms'"
+  [ -f "$HIVE_DIR/fronts/wms/drones/live/meta.json" ] || fail "the drone is not in wms"
+  [ "$(cat "$HIVE_DIR/coord.pane")" = "w1:p1" ] || fail "the default front lost its coordinator"
+  [ -e "$HIVE_DIR/fronts/wms/coord.pane" ] && fail "the move registered a coordinator for wms"
+}
+
+t_move_refuses_a_working_drone() {
+  front_add wms
+  fake_drone default busy w5:p1
+  FAKE_AGENT_STATUS=working "$HIVE" move busy wms > "$T/out" 2>&1 && fail "a working drone was moved"
+  assert_contains "$T/out" "busy is working"
+  [ -d "$HIVE_DIR/drones/busy" ] || fail "the refused move moved it anyway"
+  assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
+}
+
+t_fronts_overview_and_status_all() {
+  front_add wms "Warehouse"
+  fake_drone default homebody
+  fake_drone wms picker
+  "$HIVE" fronts > "$T/fronts"
+  assert_contains "$T/fronts" "FRONT"
+  grep -qE '^default +w1:p1 ' "$T/fronts" || fail "default row: $(grep '^default' "$T/fronts")"
+  grep -qE '^wms +- +- +off +0 +1 +1 +Warehouse$' "$T/fronts" || fail "wms row: $(grep '^wms' "$T/fronts")"
+  "$HIVE" status --all > "$T/all"
+  assert_contains "$T/all" "front: default"
+  assert_contains "$T/all" "front: wms"
+  assert_contains "$T/all" "homebody"
+  assert_contains "$T/all" "picker"
+}
+
+t_front_rm() {
+  front_add wms
+  fake_drone wms picker
+  "$HIVE" front rm wms > "$T/out" 2>&1 && fail "a front with drones was removed"
+  rm -rf "$HIVE_DIR/fronts/wms/drones/picker"
+  "$HIVE" front rm wms > "$T/out" 2>&1 || fail "front rm failed: $(cat "$T/out")"
+  [ -e "$HIVE_DIR/fronts/wms" ] && fail "the front is still there"
+  ls "$HIVE_DIR"/archive/front-wms-*.tar.gz > /dev/null 2>&1 || fail "no archive of the front"
+}
+
+t_coord_start_runs_in_the_fronts_home() {
+  front_add wms
+  HIVE_FRONT=wms "$HIVE" coord-start --dry-run > "$T/out" 2>&1 || fail "dry run failed: $(cat "$T/out")"
+  assert_contains "$T/out" "for front wms and run in $HIVE_DIR/coord/wms"
+  assert_contains "$T/out" "HIVE_FRONT=wms"
+}
+
+t_gate_is_shared_and_names_the_fronts_coordinator() {
+  front_add wms
+  HIVE_FRONT=wms "$HIVE" gate enter "full gate, ~5 min" > /dev/null || fail "gate enter failed"
+  assert_contains "$HIVE_DIR/gate.log" "wms:coord ENTER full gate, ~5 min"
+  [ -e "$HIVE_DIR/fronts/wms/gate.log" ] && fail "the front got a gate of its own"
+  "$HIVE" gate status > "$T/status"
+  assert_contains "$T/status" "wms:coord ENTER"
+}
+
+t_remote_forward_keeps_the_front() {
+  front_add wms
+  echo "coordhost" > "$HIVE_DIR/fronts/wms/coord.remote"
+  HIVE_FRONT=wms HIVE_DRONE=kafka "$HIVE" send coord "hello" > /dev/null
+  assert_contains "$FAKE_HERDR_LOG" "HIVE_FRONT=wms HIVE_DRONE=kafka@"
+  [ "$(front_letters wms)" = 1 ] || fail "the failed forward did not leave the letter in wms"
 }
 
 # --- main --------------------------------------------------------------------

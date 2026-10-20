@@ -242,6 +242,29 @@ falls under the threshold again.
 Moving a running coordinator: save its state, let it end its turn, run `hive coord-start` in a new
 pane (the registration moves at once), read the state back there, then `/exit` the old session.
 
+## Fronts: several coordinators on one machine
+
+One coordinator for every domain at once interleaves their decisions in one conversation, talks to
+thirty drones and has no time left for you. A **front** is an independent swarm with a coordinator of
+its own — its drones, mail, watcher and alerts — while the machine's resources stay shared: the gate,
+the accounts and their limits, the boundary blocks, and drone names (herdr's agent names are
+machine-wide).
+
+```bash
+hive front add wms "Warehouse: the WMS API and the scanner app"   # ~/.herdr-hive/fronts/wms
+hive --front wms coord-start                                       # in a new plain herdr pane
+hive fronts                                                        # every front at a glance
+hive send shp:coord "the label format changed" --body "..."        # to another front's coordinator
+hive move picker wms                                               # hand a drone to another front
+```
+
+The default front is `~/.herdr-hive` itself, so a hive without fronts — and a swarm already running —
+is untouched. A front's coordinator runs in `~/.herdr-hive/coord/<front>/` and reads the shared
+`coord/CLAUDE.md` above it as well as its own. `coord-start` and `spawn` pin the coordinator and its
+drones to their front through `HIVE_FRONT`; a coordinator registered by hand is found through its
+pane. The hooks, the sweep timer and the alerts each act on the front they belong to. Details and
+traps: SKILL.md, "Fronts".
+
 ## Boundaries in files
 
 Drones run with bypass permissions and ask about nothing, so every brief needs its boundaries — and
@@ -293,6 +316,9 @@ work share a shape:
   and clears it. An expired login otherwise looks exactly like a quiet day.
 - **Run it read-only.** A headless `claude -p` reader gets an allow-list of read tools, everything else
   denied, and the script refuses to start when inherited settings allow more.
+- **With fronts, the script picks the front.** `HIVE_FRONT=<front> hive send coord ...` lands in that
+  front's coordinator mailbox; `~/.herdr-hive/fronts/<front>/description` is the one line to classify
+  against. A timer that names no front writes to the default one.
 
 ## Several Claude Code accounts
 

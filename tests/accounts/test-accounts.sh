@@ -21,7 +21,7 @@ trap 'rm -rf "$T" "$ERRF"' EXIT
 export TZ=Europe/Berlin
 export HOME="$T/home" HIVE_DIR="$T/hive" FAKE_TMUX_DIR="$T/tmux" FAKE_PANELS="$T/panels" FAKE_HERDR_LOG="$T/herdr.log"
 export PATH="$HERE/fake-bin:$ROOT/tests/fake-herdr:$PATH"
-unset HIVE_ACCOUNT CLAUDE_CONFIG_DIR HIVE_DRONE HERDR_HIVE_ROLE HIVE_COORD_PANE NO_COLOR
+unset HIVE_ACCOUNT CLAUDE_CONFIG_DIR HIVE_DRONE HIVE_FRONT HERDR_PANE_ID HERDR_HIVE_ROLE HIVE_COORD_PANE NO_COLOR
 export HIVE_USAGE_TIMEOUT=5     # seconds per measurement step; the hang tests lower it
 
 # --- assertions -------------------------------------------------------------

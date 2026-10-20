@@ -15,8 +15,8 @@
 # registered as coordinator that early, and injecting into every fresh session on the machine
 # would leak swarm text into unrelated work. On startup the CLAUDE.md section does this job.
 #
-# Scoping: fires ONLY in the registered coordinator session (see coord-scope.sh). Drones,
-# subagents and unrelated sessions print nothing at all.
+# Scoping: fires ONLY in a registered coordinator session (see coord-scope.sh), and the board is
+# its own front's. Drones, subagents and unrelated sessions print nothing at all.
 set -uo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -39,11 +39,13 @@ case "${source:-}" in
   *) exit 0 ;;
 esac
 hive_is_coordinator_session "${sid:-}" || exit 0
+front="$HIVE_SESSION_FRONT"
+FRONT_DIR=$(hive_front_dir "$front")
 
 # --- the board ------------------------------------------------------------
 # One python pass over the swarm directory: spawning a process per drone would be slow on a hive
 # that has collected hundreds of them. herdr is asked only about the drones with a task in flight.
-board=$(python3 - "$HIVE_DIR" <<'PY'
+board=$(python3 - "$FRONT_DIR" <<'PY'
 import json, os, sys, time
 hive = sys.argv[1]
 drones = os.path.join(hive, "drones")
@@ -81,7 +83,7 @@ for r in rows:
 PY
 ) || board=""
 
-letters=$(find "$HIVE_DIR/mail/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+letters=$(find "$FRONT_DIR/mail/coord" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
 totals=$(printf '%s\n' "$board" | awk -F'\t' '$1=="TOTALS"{print $2" "$3" "$4}')
 read -r n_total n_reported n_concluded <<<"${totals:-0 0 0}"
 
@@ -119,9 +121,10 @@ fi
 # --- the injection --------------------------------------------------------
 echo "=== HIVE: coordinator discipline restored (SessionStart: ${source}) ==="
 echo
+[ "$front" != default ] && echo "You coordinate front '$front' — its drones, its mail, its watcher. Other fronts have coordinators of their own." && echo
 echo "The context you are reading was rebuilt. The rules below did not survive it on their own —"
 echo "they are re-stated here because they are the operating discipline of this session, and the"
-echo "board under them was read from $HIVE_DIR just now, so it is fact rather than recollection."
+echo "board under them was read from $FRONT_DIR just now, so it is fact rather than recollection."
 echo
 cat "$CREED"
 echo
@@ -133,8 +136,9 @@ else
 fi
 # A live heartbeat is information, not permission: it proves some watcher runs, not that this
 # rebuilt session still has its monitor.
-arm='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
-if "$SKILL_DIR/hive" _watched 2>/dev/null; then
+arm=$(HIVE_FRONT="$front" "$SKILL_DIR/hive" _arm 2>/dev/null)
+[ -n "$arm" ] || arm='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
+if HIVE_FRONT="$front" "$SKILL_DIR/hive" _watched 2>/dev/null; then
   echo "Mail watcher: a watcher is live — if this session has no hive watch monitor, arm one: $arm."
 else
   echo "Mail watcher: NOT ARMED — you hear no drone until you arm it: $arm."

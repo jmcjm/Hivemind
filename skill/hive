@@ -6,15 +6,109 @@ set -uo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
-DRONES_DIR="$HIVE_DIR/drones"
-MAIL_DIR="$HIVE_DIR/mail"
 MODEL="${HIVE_MODEL:-opus}"
-mkdir -p "$DRONES_DIR" "$MAIL_DIR"
 # Labels for a letter's kind — shared by the watcher line and the inbox listing.
 export MAIL_KIND_LABELS='{"decision":"DECISION","done":"finished"}'
 
 die() { echo "hive: $*" >&2; exit 1; }
 command -v herdr >/dev/null || die "herdr not found in PATH"
+
+# --- fronts -----------------------------------------------------------------
+# A front is an independent swarm with a coordinator of its own: its drones, its mailboxes, its
+# coordinator registration and mail watcher, its alerts. One coordinator holding thirty topics
+# from five domains interleaves them all in one conversation and has no time left for the human;
+# a front per domain keeps each conversation about one thing.
+# The default front is $HIVE_DIR itself — the layout of a hive without fronts, untouched. A named
+# front lives in $HIVE_DIR/fronts/<name>/ with the same layout. What belongs to the machine and not
+# to a front stays in $HIVE_DIR for all of them: the gate (one machine, one RAM), the accounts and
+# their measurements, the boundary blocks. Drone names stay unique across fronts, because herdr's
+# agent names are: two fronts cannot both run a drone called 'review'.
+# Which front a command acts on: --front <name> before the command, else HIVE_FRONT (spawn gives
+# every drone its own, coord-start every coordinator session), else the front whose coordinator is
+# registered in the calling pane, else the default front. 'default' names the default front.
+FRONTS_DIR="$HIVE_DIR/fronts"
+front_dir()   { case "${1:-}" in ''|default) printf '%s\n' "$HIVE_DIR" ;; *) printf '%s\n' "$FRONTS_DIR/$1" ;; esac; }
+front_label() { case "${1:-}" in ''|default) echo default ;; *) echo "$1" ;; esac; }
+front_valid() { [[ "$1" =~ ^[a-z][a-z0-9_-]{0,15}$ ]] && [ "$1" != default ]; }
+front_names() {  # every front, the default one first
+  echo default
+  local d
+  for d in "$FRONTS_DIR"/*/; do [ -d "$d" ] && basename "$d"; done
+}
+
+# front_of_pane <pane> — the front whose coordinator is registered in <pane>; fails when none is.
+front_of_pane() {
+  [ -n "${1:-}" ] || return 1
+  local f
+  for f in $(front_names); do
+    [ "$(cat "$(front_dir "$f")/coord.pane" 2>/dev/null)" = "$1" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+# drone_front <name> — the front a drone's directory lives in; fails when no front has it.
+drone_front() {
+  local f
+  for f in $(front_names); do
+    [ -d "$(front_dir "$f")/drones/$1" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+# name_free_elsewhere <name> — dies when another front already has a drone of that name: herdr's
+# agent names are machine-wide, so a second 'review' would be handed the first one's tasks.
+name_free_elsewhere() {
+  local owner; owner=$(drone_front "$1") || return 0
+  [ "$owner" = "$(front_label "$HIVE_FRONT")" ] && return 0
+  die "drone $1 belongs to front $owner — drone names are unique across fronts (herdr agent names are machine-wide). Pick another name, or bring it over: hive move $1 $(front_label "$HIVE_FRONT")"
+}
+
+# front_use <name> — points every per-front path at that front. Exported, so every hive this one
+# starts (sweep alerts, hooks, cross-front mail) acts on the same front.
+front_use() {
+  HIVE_FRONT="$1"; [ "$HIVE_FRONT" = default ] && HIVE_FRONT=""
+  export HIVE_FRONT
+  FRONT_DIR=$(front_dir "$HIVE_FRONT")
+  DRONES_DIR="$FRONT_DIR/drones"
+  MAIL_DIR="$FRONT_DIR/mail"
+  # The coordinator mail watcher's files — see 'coordinator mail watcher' below.
+  WATCH_BEAT="$FRONT_DIR/.watch-coord"        # heartbeat, touched every ~10 s by the live watcher
+  WATCH_OWNER="$FRONT_DIR/.watch-coord.pid"   # PID of the watcher armed last
+  WATCH_LAST="$FRONT_DIR/.watch-coord.last"   # touched by a watcher as it stops: the last moment one listened
+  # The copy-paste arm instruction. The Monitor tool refuses a call without a description.
+  if [ -n "$HIVE_FRONT" ]; then
+    WATCH_ARM="Monitor(command: \"hive --front $HIVE_FRONT watch\", description: \"swarm mail ($HIVE_FRONT)\", timeout_ms: 1800000)"
+  else
+    WATCH_ARM='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
+  fi
+}
+
+# FRONT_NAMED: the front was named (--front, HIVE_FRONT), not found through the calling pane. A
+# sweep nobody pointed at a front covers them all.
+FRONT_NAMED=0
+if [ "${1:-}" = --front ]; then
+  [ -n "${2:-}" ] || die "usage: hive --front <name> <command> ..."
+  HIVE_FRONT="$2"; shift 2
+fi
+if [ -n "${HIVE_FRONT+x}" ]; then
+  FRONT_NAMED=1
+elif [ -z "${HIVE_DRONE:-}" ] && [ -d "$FRONTS_DIR" ]; then
+  # HERDR_PANE_ID is herdr's own name for the pane a process runs in: the coordinator's commands,
+  # its hooks and its Monitor all carry it, so a coordinator registered with 'hive --front <name>
+  # coord' keeps its front without passing it to every command.
+  HIVE_FRONT=$(front_of_pane "${HERDR_PANE_ID:-}") || HIVE_FRONT=""
+fi
+[ "${HIVE_FRONT:-}" = default ] && HIVE_FRONT=""
+if [ -n "${HIVE_FRONT:-}" ]; then
+  front_valid "$HIVE_FRONT" || die "front '$HIVE_FRONT' rejected: [a-z][a-z0-9_-]{0,15}, not 'default'"
+  # 'hive front' manages the fronts themselves and must work with a front that is gone.
+  case "${1:-}" in front|fronts) ;; *)
+    [ -d "$FRONTS_DIR/$HIVE_FRONT" ] || die "unknown front '$HIVE_FRONT' — create it: hive front add $HIVE_FRONT" ;;
+  esac
+fi
+front_use "${HIVE_FRONT:-}"
+# Never for a named front that does not exist: that is how a typo would become a front.
+[ -z "$HIVE_FRONT" ] || [ -d "$FRONT_DIR" ] && mkdir -p "$DRONES_DIR" "$MAIL_DIR"
 
 # --- helpers --------------------------------------------------------------
 
@@ -78,12 +172,9 @@ print(last)
 # The coordinator's prompt belongs to the human too, so coord mail is never typed into it. The
 # coordinator keeps 'hive watch' armed as a Claude Code Monitor instead: every stdout line becomes
 # a notification in its session, and the prompt stays free for the human.
-# Globals, not locals: cmd_watch's EXIT trap reads them after the function has returned.
-WATCH_BEAT="$HIVE_DIR/.watch-coord"        # heartbeat, touched every ~10 s by the live watcher
-WATCH_OWNER="$HIVE_DIR/.watch-coord.pid"   # PID of the watcher armed last
-WATCH_LAST="$HIVE_DIR/.watch-coord.last"   # touched by a watcher as it stops: the last moment one listened
-# The copy-paste arm instruction. The Monitor tool refuses a call without a description.
-WATCH_ARM='Monitor(command: "hive watch", description: "swarm mail", timeout_ms: 1800000)'
+# Every front has a watcher of its own. Its files (WATCH_BEAT, WATCH_OWNER, WATCH_LAST) and the arm
+# instruction (WATCH_ARM) are set by front_use — globals, not locals: cmd_watch's EXIT trap reads
+# them after the function has returned.
 
 # Is a watcher listening? 'hive watch' touches its heartbeat every ~10 s, so 30 s of silence means
 # its monitor expired or its session is gone. A fresh heartbeat proves that SOME watcher lives, not
@@ -101,7 +192,7 @@ coord_watched() {
 coord_unheard() {
   coord_watched && return 1
   local f m since=0
-  for f in "$WATCH_BEAT" "$WATCH_LAST" "$HIVE_DIR/coord.pane"; do
+  for f in "$WATCH_BEAT" "$WATCH_LAST" "$FRONT_DIR/coord.pane"; do
     m=$(stat -c %Y "$f" 2>/dev/null) || continue
     [ "$m" -gt "$since" ] && since=$m
   done
@@ -213,10 +304,19 @@ watch_flush() {
 # Mailbox = a directory of message files. No daemon, no MTA: writes are atomic (mv).
 # A drone is woken by wake_recipient; the coordinator hears its mail through the watcher above.
 
-coord_pane() { cat "$HIVE_DIR/coord.pane" 2>/dev/null; }
+coord_pane() { cat "$FRONT_DIR/coord.pane" 2>/dev/null; }
 
 # Non-empty when the coordinator lives on another machine (hive coord --remote <ssh-host>).
-coord_remote() { cat "$HIVE_DIR/coord.remote" 2>/dev/null; }
+coord_remote() { cat "$FRONT_DIR/coord.remote" 2>/dev/null; }
+
+# The front, as an assignment for the hive a forward runs on the coordinator's machine: mail of a
+# named front lands in the same front there. Nothing for the default front, so a coordinator
+# machine without fronts keeps taking the forwards.
+remote_front_env() { [ -n "$HIVE_FRONT" ] && printf 'HIVE_FRONT=%q ' "$HIVE_FRONT"; }
+
+# The front as the human reads it in an alert: nothing for the default front, " (<front>)" for a
+# named one — with several coordinators, "nobody listens" must say whose mail it is.
+front_tag() { [ -n "$HIVE_FRONT" ] && printf ' (%s)' "$HIVE_FRONT"; }
 
 mailbox_put() {  # mailbox_put <from> <to> <kind> <subject> <body>
   local from="$1" to="$2" kind="$3" subject="$4" body="$5"
@@ -238,7 +338,7 @@ json.dump({'ts':time.strftime('%Y-%m-%d %H:%M:%S'),'from':frm,'to':to,
 # Rate-limited by a marker so a burst of drone hooks does not fire one ping per letter.
 # Returns 0 when the alert went out, 1 when the rate limit held it back, 2 when no channel took it.
 coord_stranded_notice() {
-  local mark="$HIVE_DIR/.stranded-notice" age n
+  local mark="$FRONT_DIR/.stranded-notice" age n
   if [ -f "$mark" ]; then
     age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
     [ "$age" -lt 900 ] && return 1
@@ -247,8 +347,9 @@ coord_stranded_notice() {
   # off again when nothing was shown: an alert nobody saw must not silence the next 15 minutes.
   : > "$mark"
   n=$(loud_letters | wc -l)
-  human_alert "Swarm mail: no coordinator is listening" \
-    "$n letter(s) waiting. In the coordinator session: hive coord, then arm Monitor(hive watch)" \
+  local fopt=""; [ -n "$HIVE_FRONT" ] && fopt="--front $HIVE_FRONT "
+  human_alert "Swarm mail$(front_tag): no coordinator is listening" \
+    "$n letter(s) waiting. In the coordinator session: hive ${fopt}coord, then arm Monitor(hive ${fopt}watch)" \
     && return 0
   rm -f "$mark"
   return 2
@@ -281,9 +382,9 @@ wake_recipient() {
   # archive the coordinator's mailbox. Its letters wait until revive gives it the swarm env.
   [ "$(meta_get "$who" adopted)" = True ] && return 0
 
-  exec 9>"$HIVE_DIR/.wake-lock"
+  exec 9>"$FRONT_DIR/.wake-lock"
   flock -w 15 9 || return 0
-  local mark="$HIVE_DIR/.wake-$who" age
+  local mark="$FRONT_DIR/.wake-$who" age
   if [ -f "$mark" ]; then
     age=$(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) ))
     [ "$age" -lt "$(secs HIVE_WAKE_TTL 900)" ] && return 0   # already woken, do not spam
@@ -362,7 +463,7 @@ drone_state() {
 # Prints the archive path on success; returns non-zero when there was nothing to pack or tar failed.
 hive_archive() {
   local label="$1"; shift
-  local adir="$HIVE_DIR/archive"; mkdir -p "$adir" || return 1
+  local adir="$FRONT_DIR/archive"; mkdir -p "$adir" || return 1
   local base="$adir/$label-$(date +%Y%m%d-%H%M%S)"
   # Two archives in the same second must not overwrite each other — the second one would
   # silently destroy the evidence the first one had just rescued.
@@ -374,8 +475,8 @@ hive_archive() {
     [ -d "$MAIL_DIR/$n" ]   && paths+=("mail/$n")
   done
   [ ${#paths[@]} -gt 0 ] || return 1
-  # Paths relative to $HIVE_DIR, so the tarball unpacks straight back over the hive directory.
-  tar -czf "$out" -C "$HIVE_DIR" "${paths[@]}" 2>/dev/null || { rm -f "$out"; return 1; }
+  # Paths relative to the front's directory, so the tarball unpacks straight back over it.
+  tar -czf "$out" -C "$FRONT_DIR" "${paths[@]}" 2>/dev/null || { rm -f "$out"; return 1; }
   printf '%s\n' "$out"
 }
 
@@ -383,7 +484,7 @@ hive_archive() {
 # the caller decides that, and it must have happened BEFORE this runs.
 drone_remove() {
   rm -rf "$(drone_dir "$1")" "$MAIL_DIR/$1"
-  rm -f "$HIVE_DIR/.wake-$1"
+  rm -f "$FRONT_DIR/.wake-$1"
 }
 
 # Claude Code accounts. A drone runs on the default account (~/.claude with ~/.claude.json) or on a
@@ -1108,6 +1209,7 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # unique among live agents.
   [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
     || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
+  name_free_elsewhere "$name"
   local cwd="$HOME" resume=0 account="${HIVE_ACCOUNT:-}" account_given=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1151,11 +1253,22 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # calling pane, so a remote coordinator's registration survives untouched.
   # The rm also clears a wake-up marker left by pre-watcher versions and resets the
   # unwatched-mail alert's rate limit for the new coordinator.
-  [ -n "$coord" ] && coord_register "$coord"
+  # A pane that coordinates another front stays there: its coordinator spawning a drone into this
+  # front (hive --front <name> spawn, hive move) hands the drone over, it does not change fronts.
+  # A move (SPAWN_KEEPS_COORD) never registers anybody: whoever runs it, the front it lands in keeps
+  # the coordinator it has.
+  local owner; owner=$(front_of_pane "$coord") || owner=""
+  if [ "${SPAWN_KEEPS_COORD:-0}" = 1 ] || { [ -n "$owner" ] && [ "$owner" != "$(front_label "$HIVE_FRONT")" ]; }; then
+    coord=$(coord_pane)
+  elif [ -n "$coord" ]; then
+    coord_register "$coord"
+  fi
 
   # 1 workspace per drone, label = drone name. Swarm environment variables enter here —
   # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
-  local -a envs=(--env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" --env "HERDR_HIVE_ROLE=drone")
+  # HIVE_FRONT goes even for the default front: set, it pins the drone's every hive call to its front.
+  local -a envs=(--env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" --env "HIVE_FRONT=$(front_label "$HIVE_FRONT")"
+                 --env "HERDR_HIVE_ROLE=drone")
   [ -n "$coord" ] && envs+=(--env "HIVE_COORD_PANE=$coord")
   # The default account gets no CLAUDE_CONFIG_DIR at all: an empty value is not "the default" to
   # Claude Code, it is a config dir named "" (logged out, measured on 2.1.283).
@@ -1169,7 +1282,9 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
 
   # Swarm protocol lives in the system prompt, not in the brief — the drone knows it from
   # turn one and never loses it across tasks. The brief stays purely about the work.
-  local sysprompt="You are drone '$name' in a swarm of agents run by a coordinator (another Claude Code).
+  local fronted=""
+  [ -n "$HIVE_FRONT" ] && fronted=" You belong to front '$HIVE_FRONT': 'coord' is that front's coordinator. Other fronts have coordinators of their own, reachable as '<front>:coord' — write to them only when your brief says so."
+  local sysprompt="You are drone '$name' in a swarm of agents run by a coordinator (another Claude Code).$fronted
 The human does NOT read your terminal — only what you write to files and send counts.
 
 Task report: write it to $dir/report.md (the brief gives the format). Without a report the task does not count.
@@ -1484,7 +1599,7 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
   touch "$WATCH_BEAT"
   # Somebody listens again, so the incident the unwatched-mail alert was rate-limited for is
   # over: the next time nobody listens it fires without waiting out the old limit.
-  rm -f "$HIVE_DIR/.stranded-notice"
+  rm -f "$FRONT_DIR/.stranded-notice"
   # The heartbeat dies with its owner, and only with its owner: after a takeover it belongs to the
   # new watcher. bash runs the EXIT trap on fatal signals too, so a watcher killed by SIGPIPE
   # (reader gone) cleans up as well; a Monitor stop (TaskStop, expiry) is a plain exit 0. The
@@ -1566,9 +1681,20 @@ cmd_watch() {  # watch — the coordinator's mail watcher; arm it as a Monitor, 
 # a remote registration, a wake-up marker of pre-watcher versions, the unwatched-mail alert's rate
 # limit, and a recorded session id (coord-scope.sh falls back to asking herdr which session owns
 # the pane, which also follows a /clear).
+# One pane coordinates one front: a pane registered for another front leaves that front, which is
+# said out loud — its drones have nobody listening until it gets a coordinator again.
 coord_register() {
-  rm -f "$HIVE_DIR/coord.remote" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice" "$HIVE_DIR/coord.session"
-  printf '%s\n' "$1" > "$HIVE_DIR/coord.pane"
+  local f d
+  for f in $(front_names); do
+    d=$(front_dir "$f")
+    [ "$d" = "$FRONT_DIR" ] && continue
+    if [ "$(cat "$d/coord.pane" 2>/dev/null)" = "$1" ]; then
+      rm -f "$d/coord.pane" "$d/coord.session"
+      echo "coord: pane $1 leaves front $f — front $f has no coordinator now" >&2
+    fi
+  done
+  rm -f "$FRONT_DIR/coord.remote" "$FRONT_DIR/.wake-coord" "$FRONT_DIR/.stranded-notice" "$FRONT_DIR/coord.session"
+  printf '%s\n' "$1" > "$FRONT_DIR/coord.pane"
 }
 
 # The coordinator lives in its own directory, not in a project: Claude Code loads the CLAUDE.md of
@@ -1576,7 +1702,11 @@ coord_register() {
 # context the coordinator pays for on every turn and never uses. $HIVE_COORD_DIR holds a short
 # CLAUDE.md of its own; coord-settings.json gives the session what drones must not have —
 # auto-compaction with its window, and the context guard on Stop.
+# A named front's coordinator lives one level down, in $HIVE_COORD_DIR/<front>: Claude Code loads
+# the CLAUDE.md of every directory above the one it runs in, so it reads the shared one first and
+# then its front's own (what the front is about), and the shared one is edited once for all.
 HIVE_COORD_DIR="${HIVE_COORD_DIR:-$HIVE_DIR/coord}"
+coord_home() { if [ -n "$HIVE_FRONT" ]; then echo "$HIVE_COORD_DIR/$HIVE_FRONT"; else echo "$HIVE_COORD_DIR"; fi; }
 cmd_coord_start() {  # coord-start [--dry-run] [-- <claude args>...] — the coordinator session, in this pane
   [ -n "${HIVE_DRONE:-}" ] && die "coord-start starts the coordinator — not from inside drone $HIVE_DRONE"
   local dry=0
@@ -1590,27 +1720,43 @@ cmd_coord_start() {  # coord-start [--dry-run] [-- <claude args>...] — the coo
   done
   local settings="$SKILL_DIR/coord-settings.json"
   [ -f "$settings" ] || die "coord-start: $settings is missing"
-  [ -f "$HIVE_COORD_DIR/CLAUDE.md" ] \
-    || echo "coord-start: warning — $HIVE_COORD_DIR/CLAUDE.md is missing; the session starts without its brief" >&2
+  local home; home=$(coord_home)
+  [ -f "$home/CLAUDE.md" ] \
+    || echo "coord-start: warning — $home/CLAUDE.md is missing; the session starts without its brief" >&2
   local pane; pane=$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")
   [ -n "$pane" ] || die "coord-start: run it in the herdr pane that is to host the coordinator (no current pane)"
   local -a argv=(claude --dangerously-skip-permissions --model "${HIVE_COORD_MODEL:-opus}"
                  --settings "$settings" ${extra[@]+"${extra[@]}"})
+  local front; front=$(front_label "$HIVE_FRONT")
   if [ "$dry" = 1 ]; then
-    printf 'coord-start: would register %s and run in %s:\n ' "$pane" "$HIVE_COORD_DIR"
-    printf ' %q' "${argv[@]}"; printf '\n'
+    printf 'coord-start: would register %s for front %s and run in %s:\n ' "$pane" "$front" "$home"
+    printf ' %q' "HIVE_FRONT=$front" "${argv[@]}"; printf '\n'
     return 0
   fi
-  mkdir -p "$HIVE_COORD_DIR"
-  ensure_trusted "$HIVE_COORD_DIR" "${CLAUDE_CONFIG_DIR:-}"
+  mkdir -p "$home"
+  ensure_trusted "$home" "${CLAUDE_CONFIG_DIR:-}"
   coord_register "$pane"
-  echo "coord: $pane — starting the coordinator in $HIVE_COORD_DIR"
+  echo "coord: $pane — starting the coordinator of front $front in $home"
   echo "coord: in the new session, arm the mail watcher: $WATCH_ARM"
-  cd "$HIVE_COORD_DIR" || die "coord-start: cannot enter $HIVE_COORD_DIR"
+  cd "$home" || die "coord-start: cannot enter $home"
+  # The session, its hooks, its Monitor and every command it runs carry the front from here on.
+  export HIVE_FRONT="$front"
   exec "${argv[@]}"
 }
 
-cmd_status() {  # status [name...] — never blocks
+cmd_status() {  # status [--all | name...] — never blocks
+  if [ "${1:-}" = --all ]; then
+    # Every front, each under its own 'front:' heading: the one view across the coordinators.
+    local f sep=""
+    for f in $(front_names); do
+      printf '%s' "$sep"; sep=$'\n'
+      ( front_use "$f"; cmd_status )
+    done
+    return 0
+  fi
+  # Which front this is, once there is more than one: two coordinators reading look-alike tables
+  # must not mistake each other's swarm for their own.
+  [ -d "$FRONTS_DIR" ] && [ -n "$(ls -A "$FRONTS_DIR" 2>/dev/null)" ] && echo "front: $(front_label "$HIVE_FRONT")"
   # Passive reconciliation surface: status gets run often, so unread mail nobody acted on
   # (no watcher armed, a notification missed) resurfaces here, with the watcher state,
   # instead of rotting.
@@ -1702,9 +1848,33 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
   # The exit status says whether every letter reached its mailbox: a caller that moves its own
   # marker only after a delivered letter (an external watcher, a timer) would lose the message to a
   # send that failed but exited 0.
-  local t remote lhost failed=0
+  local t remote lhost failed=0 tfront
   remote=$(coord_remote); lhost=$(hostname -s)
   for t in "${targets[@]}"; do
+    # Another front's mailbox: '<front>:coord' or '<front>:<drone>', and a bare drone name that
+    # lives in another front (names are unique across fronts). The letter is posted by a hive
+    # running in that front, so its wake-up and alert rules apply there, and the sender arrives as
+    # '<front>:<name>' — the address a reply goes to.
+    tfront=""
+    if [[ "$t" == *:* ]]; then
+      tfront="${t%%:*}"; t="${t#*:}"
+      [ "$t" = all ] && { echo "send: a broadcast stays within its front — not sent to $tfront:all" >&2; failed=1; continue; }
+    elif [ "$t" != coord ] && [ "$t" != all ] && [ ! -d "$DRONES_DIR/$t" ]; then
+      tfront=$(drone_front "$t") || tfront=""
+    fi
+    [ "$(front_label "$tfront")" = "$(front_label "$HIVE_FRONT")" ] && tfront=""
+    if [ -n "$tfront" ]; then
+      # Computed first: in 'A=x B="$A" cmd' bash expands B after assigning A, so the sender read
+      # inline would name the target front.
+      local sender; sender="$(front_label "$HIVE_FRONT"):$from"
+      if printf '%s' "$body" | HIVE_FRONT="$tfront" HIVE_DRONE="$sender" \
+           KIND="${KIND:-msg}" "$SKILL_DIR/hive" send "$t" "$subject" >/dev/null; then
+        echo "send: $from -> $tfront:$t: $subject"
+      else
+        echo "send: could not deliver to $tfront:$t" >&2; failed=1
+      fi
+      continue
+    fi
     # Remote coordinator (hive coord --remote): coord mail travels over ssh and lands in the
     # coordinator machine's mailbox, where the watcher THERE reports it. The sender arrives as
     # '<name>@<this host>' so the coordinator knows which machine's fleet is talking.
@@ -1712,7 +1882,7 @@ cmd_send() {  # send <to> <subject> [--body TEXT]  (without --body: body from st
     # the coordinator can still collect it with 'ssh <host> hive inbox'.
     if [ "$t" = coord ] && [ -n "$remote" ]; then
       if printf '%s' "$body" | ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
-           "HIVE_DRONE=$(printf '%q' "$from@$lhost") KIND=$(printf '%q' "${KIND:-msg}") \
+           "$(remote_front_env)HIVE_DRONE=$(printf '%q' "$from@$lhost") KIND=$(printf '%q' "${KIND:-msg}") \
             \"\$HOME/.claude/skills/hivemind/hive\" send coord $(printf '%q' "$subject")" \
            >/dev/null 2>&1; then
         echo "send: $from -> coord@$remote: $subject"
@@ -1742,13 +1912,13 @@ cmd_inbox() {  # inbox [who] [--keep] — reads and consumes a mailbox (own by d
   # Release the wake-up BEFORE scanning: a letter landing while we read gets a fresh
   # wake-up instead of hiding behind the old marker until the next unrelated send.
   # Worst case is a spurious "inbox empty" next turn — losing a letter is worse.
-  [ "$keep" = 0 ] && rm -f "$HIVE_DIR/.wake-$who"
-  [ "$who" = coord ] && rm -f "$HIVE_DIR/.overdue-notice"   # mail is being read — stop nagging
+  [ "$keep" = 0 ] && rm -f "$FRONT_DIR/.wake-$who"
+  [ "$who" = coord ] && rm -f "$FRONT_DIR/.overdue-notice"   # mail is being read — stop nagging
 
   local -a msgs=()
   while IFS= read -r f; do msgs+=("$f"); done < <(find "$box" -maxdepth 1 -name '*.json' | sort)
   if [ ${#msgs[@]} -eq 0 ]; then
-    echo "inbox ($who): empty"; rm -f "$HIVE_DIR/.wake-$who"; return 0
+    echo "inbox ($who): empty"; rm -f "$FRONT_DIR/.wake-$who"; return 0
   fi
 
   # An unreadable letter is named with the path it will have after this read: the archive, or the
@@ -1815,7 +1985,7 @@ cmd_kill() {  # kill <name> [--purge]
   # A directory without meta.json has no workspace to close; that is not a reason to refuse.
   local ws; ws=$(meta_get "$name" workspace_id) || ws=""
   [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
-  rm -f "$HIVE_DIR/.wake-$name"
+  rm -f "$FRONT_DIR/.wake-$name"
 
   if [ "$purge" = "--purge" ]; then
     drone_remove "$name"
@@ -1888,6 +2058,8 @@ cmd_rename() {  # rename <old> <new>
   local old="${1:?usage: hive rename <old> <new>}"; local new="${2:?missing new name}"
   [[ "$new" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
     || die "name '$new' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
+  [ -e "$(drone_dir "$new")" ] && die "drone $new already exists — pick another name"
+  name_free_elsewhere "$new"
   local ws pane; ws=$(meta_get "$old" workspace_id) || die "unknown drone: $old"
   pane=$(pane_of "$old")
   herdr workspace rename "$ws" "$new" >/dev/null 2>&1
@@ -1960,6 +2132,7 @@ cmd_adopt() {  # adopt <name> <pane_id> [--account NAME] — pulls a Claude Code
   [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
     || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   [ -f "$(drone_meta "$name")" ] && die "drone $name already exists — pick another name"
+  name_free_elsewhere "$name"
   local info; info=$(herdr pane get "$pane" 2>/dev/null) || die "no such pane: $pane"
   local agent; agent=$(jqp "print(r['pane'].get('agent') or '')" <<<"$info")
   [ "$agent" = claude ] || die "pane $pane does not host a claude agent (it hosts: ${agent:-nothing})"
@@ -1976,9 +2149,9 @@ print(s.get('value','') if s.get('kind')=='id' else '')" <<<"$info")
 
   # revive closes the drone's workspace — adopting the coordinator's own pane, or another drone's,
   # would hand that workspace to the wrong owner.
-  [ "$pane" = "$(coord_pane)" ] && die "pane $pane is the coordinator's pane"
+  local cfront; cfront=$(front_of_pane "$pane") && die "pane $pane is the coordinator's pane (front $cfront)"
   local m
-  for m in "$DRONES_DIR"/*/meta.json; do
+  for m in "$HIVE_DIR"/drones/*/meta.json "$FRONTS_DIR"/*/drones/*/meta.json; do
     [ -f "$m" ] || continue
     [ "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('pane_id',''))" "$m" 2>/dev/null)" = "$pane" ] \
       && die "pane $pane already belongs to drone $(basename "$(dirname "$m")")"
@@ -2057,6 +2230,159 @@ cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its
   local ws; ws=$(meta_get "$name" workspace_id)
   herdr workspace close "$ws" >/dev/null 2>&1
   cmd_spawn "$name" --cwd "$cwd" --account "$account" --resume
+}
+
+# --- fronts: commands -------------------------------------------------------
+
+# Moving a drone hands it to another front's coordinator. Its directory (brief, reports, sweep
+# history) and its mailbox go along, and a living drone is restarted there with --resume: its
+# environment names its front, and a running process cannot be given another environment. Its
+# conversation survives the restart; only the paths it was told change, and it is told the new ones.
+cmd_move() {  # move <drone> <front> [--force]
+  local name="${1:?usage: hive move <drone> <front> [--force]}" to="${2:?usage: hive move <drone> <front> [--force]}"
+  local force=0; [ "${3:-}" = --force ] && force=1
+  [ "$to" = default ] || { front_valid "$to" && [ -d "$FRONTS_DIR/$to" ]; } \
+    || die "move: unknown front '$to' — hive fronts lists them"
+  to=$(front_label "$to")
+  local from; from=$(drone_front "$name") || die "move: unknown drone: $name"
+  [ "$from" = "$to" ] && die "move: $name already belongs to front $to"
+  front_use "$from"
+
+  local src st cwd sid account ws live=1
+  src=$(drone_dir "$name")
+  st=$(drone_state "$name")
+  [ "$st" = dead ] && live=0
+  cwd=$(meta_get "$name" cwd); sid=$(meta_get "$name" session_id)
+  account=$(meta_get "$name" account); ws=$(meta_get "$name" workspace_id)
+  # Every refusal comes before anything is closed or moved.
+  if [ "$live" = 1 ]; then
+    [ "$st" = working ] && [ "$force" = 0 ] \
+      && die "move: $name is working — the move restarts it and would cut its turn off. Wait until its turn ends, or pass --force"
+    [ "$(meta_get "$name" adopted)" = True ] \
+      && die "move: $name is adopted and has no swarm env yet — revive it where it is first: hive --front $from revive $name"
+    [ -n "$sid" ] && [ -n "$cwd" ] \
+      || die "move: $name has no recorded session id or cwd — it could not be resumed in front $to; nothing moved"
+  fi
+  local dfront; dfront=$(front_dir "$to")
+  local dst="$dfront/drones/$name"
+  [ -e "$dst" ] && die "move: $dst exists already — nothing moved"
+
+  [ "$live" = 1 ] && [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
+  mkdir -p "$dfront/drones" "$dfront/mail"
+  mv "$src" "$dst" || die "move: could not move $src to $dst"
+  if [ -d "$MAIL_DIR/$name" ]; then
+    mv "$MAIL_DIR/$name" "$dfront/mail/$name" \
+      || echo "move: warning — the mailbox stayed behind in $MAIL_DIR/$name" >&2
+  fi
+  rm -f "$FRONT_DIR/.wake-$name" "$dst"/.sweep-*
+  # The brief tells the drone where its report goes; hive wrote that path, so hive moves it.
+  if [ -f "$dst/brief.md" ]; then
+    python3 - "$dst/brief.md" "$src/" "$dst/" <<'PY' || echo "move: warning — $dst/brief.md still names the old paths" >&2
+import os,sys,tempfile
+path,old,new=sys.argv[1:4]
+text=open(path,encoding='utf-8').read()
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd,'w',encoding='utf-8') as f: f.write(text.replace(old,new))
+os.replace(tmp,path)
+PY
+  fi
+  front_use "$to"
+  echo "move: $name  front $from -> $to"
+  if [ "$live" = 0 ]; then
+    echo "move: $name was not running — bring it back in its new front: hive --front $to revive $name"
+    return 0
+  fi
+  SPAWN_KEEPS_COORD=1 cmd_spawn "$name" --cwd "$cwd" --account "$(account_label "$account")" --resume
+  # Its conversation still names the old paths; one line puts it right.
+  ( cmd_say "$name" "hive: you were moved to front '$to' — 'coord' is now that front's coordinator. Your files moved with you: the brief is $dst/brief.md, the report goes to $dst/report.md (the old paths are gone). Nothing else changed." ) >/dev/null \
+    || echo "move: could not tell $name its new paths — tell it: report to $dst/report.md" >&2
+}
+
+# The coordinator's own brief for a new front, written once into its home. Generic on purpose:
+# what the front is about is the human's to write there.
+front_claude_md() {  # front_claude_md <name> <description>
+  cat <<EOF
+# Front: $1
+
+${2:-<!-- What this front is about: its repositories, its people, its boundaries. -->}
+
+This session coordinates front \`$1\` and nothing else. Its drones, its mailbox and its mail watcher
+are its own; every other front has a coordinator of its own. The CLAUDE.md one directory up holds
+what every coordinator shares.
+
+- Mail watcher: \`Monitor(command: "hive --front $1 watch", description: "swarm mail ($1)", timeout_ms: 1800000)\`
+- Every hive command acts on this front: the session carries HIVE_FRONT=$1. \`hive fronts\` shows them all.
+- To another front's coordinator: \`hive send <front>:coord '<subject>' --body '<text>'\`.
+- Restart through \`hive --front $1 coord-start -- --continue\`, never a bare \`claude --resume\`.
+EOF
+}
+
+cmd_front() {  # front add <name> [description] | describe <name> <description> | rm <name> | list
+  local sub="${1:-list}"; [ $# -gt 0 ] && shift
+  local name
+  case "$sub" in
+    add)
+      name="${1:?usage: hive front add <name> [description]}"; shift
+      front_valid "$name" || die "front '$name' rejected: [a-z][a-z0-9_-]{0,15}, not 'default'"
+      [ -d "$FRONTS_DIR/$name" ] && die "front $name exists already"
+      mkdir -p "$FRONTS_DIR/$name/drones" "$FRONTS_DIR/$name/mail" || die "cannot create $FRONTS_DIR/$name"
+      [ $# -gt 0 ] && printf '%s\n' "$*" > "$FRONTS_DIR/$name/description"
+      local home="$HIVE_COORD_DIR/$name"
+      mkdir -p "$home" || die "cannot create $home"
+      [ -f "$home/CLAUDE.md" ] || front_claude_md "$name" "$*" > "$home/CLAUDE.md"
+      echo "front: $name created in $FRONTS_DIR/$name"
+      echo "front: its coordinator lives in $home — write what the front is about into its CLAUDE.md"
+      echo "front: start the coordinator in a new herdr pane: hive --front $name coord-start" ;;
+    describe)
+      # One line, read by 'hive fronts' and by whatever routes outside mail to a front.
+      name="${1:?usage: hive front describe <name> <description>}"; shift
+      front_valid "$name" && [ -d "$FRONTS_DIR/$name" ] || die "unknown front: $name"
+      [ $# -gt 0 ] || die "usage: hive front describe <name> <description>"
+      printf '%s\n' "$*" > "$FRONTS_DIR/$name/description"
+      echo "front: $name — $*" ;;
+    rm)
+      name="${1:?usage: hive front rm <name>}"
+      front_valid "$name" && [ -d "$FRONTS_DIR/$name" ] || die "unknown front: $name"
+      [ -n "$(ls -A "$FRONTS_DIR/$name/drones" 2>/dev/null)" ] \
+        && die "front $name still has drones — move them (hive move <drone> <front>) or prune them first"
+      [ -n "$(find "$FRONTS_DIR/$name/mail" -path '*/.archive' -prune -o -name '*.json' -print 2>/dev/null | head -1)" ] \
+        && die "front $name has unread mail — read it first: hive --front $name inbox"
+      ( front_use "$name"; coord_watched ) && die "front $name still has a live watcher — end its coordinator session first"
+      # Its read mail and archives are evidence: packed before the directory goes.
+      local adir="$HIVE_DIR/archive" out
+      mkdir -p "$adir" || die "cannot create $adir"
+      out="$adir/front-$name-$(date +%Y%m%d-%H%M%S).tar.gz"
+      tar -czf "$out" -C "$FRONTS_DIR" "$name" 2>/dev/null || { rm -f "$out"; die "archiving front $name failed — nothing removed"; }
+      rm -rf "${FRONTS_DIR:?}/$name"
+      echo "front: $name removed (archive $out; its coordinator's home $HIVE_COORD_DIR/$name stays)" ;;
+    list) cmd_fronts ;;
+    *) die "usage: hive front add <name> [description] | describe <name> <description> | rm <name> | list" ;;
+  esac
+}
+
+cmd_fronts() {  # fronts — every front: its coordinator, whether it listens, its mail and its drones
+  printf '%-12s %-10s %-8s %-7s %-5s %-7s %-9s %s\n' FRONT COORD STATE WATCH MAIL DRONES IN-FLIGHT DESCRIPTION
+  local f
+  for f in $(front_names); do
+    (
+      front_use "$f"
+      local coord state watch mail drones=0 inflight=0 d desc remote
+      remote=$(coord_remote); coord=$(coord_pane)
+      if [ -n "$remote" ]; then coord="@$remote"; state="remote"; watch="remote"
+      else
+        state="-"; [ -n "$coord" ] && state=$(pane_status "$coord")
+        if coord_watched; then watch="live"; else watch="off"; fi
+      fi
+      mail=$(loud_letters | wc -l | tr -d ' ')
+      for d in "$DRONES_DIR"/*/; do
+        [ -f "$d/meta.json" ] || continue
+        drones=$((drones + 1))
+        [ -f "$d/brief.md" ] && [ ! -f "$d/report.md" ] && [ ! -f "$d/.killed" ] && inflight=$((inflight + 1))
+      done
+      desc=$(head -1 "$FRONT_DIR/description" 2>/dev/null | cut -c1-60)
+      printf '%-12s %-10s %-8s %-7s %-5s %-7s %-9s %s\n' "$f" "${coord:--}" "$state" "$watch" "$mail" "$drones" "$inflight" "${desc:--}"
+    )
+  done
 }
 
 # --- reconciliation sweep -------------------------------------------------
@@ -2151,7 +2477,21 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
   # Without a reachable herdr server nothing can be woken or notified — a swarm without herdr
   # is not asleep, it is off. Stay silent instead of mailing "drone is dead" about every drone.
   herdr_reachable || return 0
+  # The timer names no front, so a pass covers them all, each in a subshell of its own front;
+  # --front or HIVE_FRONT keeps it to that one. A named front's journal lines say which it is.
+  [ "$FRONT_NAMED" = 1 ] && { sweep_front; return 0; }
+  local f
+  for f in $(front_names); do
+    if [ "$f" = default ]; then
+      ( front_use "$f"; sweep_front )
+    else
+      ( front_use "$f"; sweep_front ) | sed "s/^sweep: /sweep [$f]: /"
+    fi
+  done
+  return 0
+}
 
+sweep_front() {  # one reconciliation pass over the current front
   local now; now=$(date +%s)
   local remote; remote=$(coord_remote)
 
@@ -2168,7 +2508,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
         lsubj=$(jqf "$f" subject | head -1)
         if python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('body') or '', end='')" "$f" \
            | ssh -o BatchMode=yes -o ConnectTimeout=5 "$remote" \
-               "HIVE_DRONE=$(printf '%q' "$lfrom@$lhost") KIND=$(printf '%q' "${lkind:-msg}") \
+               "$(remote_front_env)HIVE_DRONE=$(printf '%q' "$lfrom@$lhost") KIND=$(printf '%q' "${lkind:-msg}") \
                 \"\$HOME/.claude/skills/hivemind/hive\" send coord $(printf '%q' "$lsubj")" \
                >/dev/null 2>&1
         then
@@ -2198,7 +2538,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
   # HIVE_MAIL_OVERDUE_BUSY old: a pane that reports 'working' that long over waiting mail is
   # stuck (a hung tool call, a retry loop), and nothing else would tell the human. What is left
   # is a coordinator that heard and does not act — idle, or blocked on a dialog.
-  local age=0 due=0 mark="$HIVE_DIR/.overdue-notice"
+  local age=0 due=0 mark="$FRONT_DIR/.overdue-notice"
   if [ ${#letters[@]} -gt 0 ]; then
     age=$(( now - $(stat -c %Y "${letters[0]}" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "$(secs HIVE_MAIL_OVERDUE 1800)" ] && due=1
@@ -2211,7 +2551,7 @@ cmd_sweep() {  # sweep — one reconciliation pass; safe to run any time, quiet 
     [ $(( now - $(stat -c %Y "$mark" 2>/dev/null || echo 0) )) -lt "$(secs HIVE_SWEEP_RENOTIFY "$SWEEP_RENOTIFY_DEFAULT")" ] && due=0
   fi
   if [ "$due" = 1 ]; then
-    if human_alert "Swarm mail unread for $((age/60)) min" \
+    if human_alert "Swarm mail$(front_tag) unread for $((age/60)) min" \
          "${#letters[@]} letter(s) for coord — run hive inbox in the coordinator pane"; then
       : > "$mark"        # only an alert that went out starts the re-nag interval
       echo "sweep: overdue mail reminder (${#letters[@]} letters, $((age/60)) min old) via $ALERT_VIA"
@@ -2411,6 +2751,9 @@ cmd_accounts() {  # accounts [--refresh] [--pick] — the accounts, their limits
 cmd_gate() {  # gate enter|release|status|queue|force-release [description]
   local sub="${1:?usage: hive gate enter|release|status|queue|force-release [description]}"; shift || true
   local who="${HIVE_DRONE:-coord}" desc="${*:-}"
+  # The gate is the machine's, shared by every front: two coordinators both logged as 'coord' would
+  # release each other's windows. Drone names are unique across fronts already.
+  [ -z "${HIVE_DRONE:-}" ] && [ -n "$HIVE_FRONT" ] && who="$HIVE_FRONT:coord"
   case "$sub" in
     # `status` answers "is someone INSIDE"; the queue answers "who is PROMISED next". The queue must
     # live WHERE PEOPLE LOOK — not in someone else's mailbox (two collisions in one day taught this).
@@ -2519,12 +2862,12 @@ case "${1:-}" in
           # letters stranded by a dead predecessor surface here, not at the next send.
           if [ "${1:-}" = --remote ]; then
             [ -n "${2:-}" ] || die "usage: hive coord --remote <ssh-host>"
-            printf '%s\n' "$2" > "$HIVE_DIR/coord.remote"
-            rm -f "$HIVE_DIR/coord.pane" "$HIVE_DIR/.wake-coord" "$HIVE_DIR/.stranded-notice"
+            printf '%s\n' "$2" > "$FRONT_DIR/coord.remote"
+            rm -f "$FRONT_DIR/coord.pane" "$FRONT_DIR/.wake-coord" "$FRONT_DIR/.stranded-notice"
             echo "coord: remote at $2 — coord mail is forwarded over ssh"
           else
             coord_register "$(herdr pane current --current 2>/dev/null | jqp "print(r['pane']['pane_id'])")"
-            echo "coord: $(coord_pane)"
+            echo "coord: $(coord_pane)${HIVE_FRONT:+ — front $HIVE_FRONT}"
             # Always, even with a fresh heartbeat: that proves some watcher lives, not that this
             # session has one — and re-arming is harmless, the last armed watcher wins.
             echo "coord: arm the mail watcher — $WATCH_ARM; re-arm it every time it expires"
@@ -2537,6 +2880,10 @@ case "${1:-}" in
   _loud)   loud_letters | wc -l | tr -d ' ' ;;                 # internal, for coord-mail-check.sh
   _pending) shift; prompt_pending "${1:?missing pane}" ;;   # internal, for drone-ping.sh
   _watched) coord_watched ;;                                   # internal, for coord-creed-inject.sh
+  _arm)    printf '%s\n' "$WATCH_ARM" ;;                       # internal, for coord-creed-inject.sh
+  front)  shift; cmd_front  "$@" ;;
+  fronts) shift; cmd_fronts "$@" ;;
+  move)   shift; cmd_move   "$@" ;;
   status) shift; cmd_status "$@" ;;
   wait)   shift; cmd_wait   "$@" ;;
   report) shift; cmd_report "$@" ;;
@@ -2562,7 +2909,8 @@ hive — command a swarm of Claude Code agents in herdr
                                      or a '## Boundaries' section
   hive say    <name> <text>          ad-hoc message to a drone
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
-  hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all) + drone wake-up / watcher notice (coord)
+  hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all | <front>:coord | <front>:<drone>)
+                                     + drone wake-up / watcher notice (coord)
   hive inbox  [who] [--keep]         read and consume a mailbox (own by default)
   hive watch                         coordinator's mail watcher — arm it as a Monitor (one line per burst of
                                      letters; a turn ended without a report stays quiet, HIVE_WATCH_ALL=1 shows all)
@@ -2570,7 +2918,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive coord --remote <ssh-host>     coordinator lives on another machine — forward coord mail over ssh
   hive coord-start [--dry-run] [-- ARGS]  start the coordinator session in THIS pane: its own directory
                                      (~/.herdr-hive/coord), coord-settings.json (auto-compact + context guard)
-  hive status [name]                 swarm state table (never blocks)
+  hive status [--all | name]         swarm state table (never blocks); --all: every front
   hive wait   [names] [--timeout S]  wait for reports, hard limit (default 300s)
   hive report <name>                 show a drone's report
   hive mute   <name> [--off]         silence automatic wake-ups (conversational drone)
@@ -2588,7 +2936,16 @@ hive — command a swarm of Claude Code agents in herdr
                                      (a systemd user timer runs it every 5 min — install.sh sets it up)
   hive gate   <enter|release|status|queue> [desc]  one exclusive machine window for full gates (flock-backed)
 
-Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/
+Fronts — independent swarms, one coordinator each (the gate, accounts and rules are shared):
+  hive --front <front> <command>     act on that front (also HIVE_FRONT; without either: the front whose
+                                     coordinator is registered in this pane, else the default front)
+  hive fronts                        every front: its coordinator, watcher, unread mail, drones
+  hive front add <front> [desc]      new front + its coordinator's home (~/.herdr-hive/coord/<front>)
+  hive front describe <front> <desc> the front's one-line description
+  hive front rm <front>              remove a front without drones or unread mail (archived)
+  hive move   <drone> <front> [--force]  hand a drone to another front (a living one is resumed there)
+
+Model: $HIVE_MODEL (default opus).  Data: ~/.herdr-hive/drones/<name>/, a named front's in ~/.herdr-hive/fronts/<front>/
 Accounts: --account NAME runs on CLAUDE_CONFIG_DIR=~/.claude-NAME (logged in, onboarded);
           HIVE_ACCOUNT sets the default for spawn and usage; none/"default" = ~/.claude.
           With ~/.herdr-hive/accounts.conf, spawn without --account/HIVE_ACCOUNT takes the account
