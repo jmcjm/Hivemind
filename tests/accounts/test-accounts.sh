@@ -736,8 +736,8 @@ eq "a hive killed mid-measurement leaves no temp files"  0 "$(find "$T/tmp" -min
 # =============================================================================
 section "spawn and revive (stand-in herdr)"
 world
-spawned() { grep -c '^workspace create' "$FAKE_HERDR_LOG" || true; }
-last_create() { grep '^workspace create' "$FAKE_HERDR_LOG" | tail -1; }
+spawned() { grep -cE '^(workspace|tab) create' "$FAKE_HERDR_LOG" || true; }
+last_create() { grep -E '^(workspace|tab) create' "$FAKE_HERDR_LOG" | tail -1; }
 
 run "$HIVE" spawn d0
 eq "no accounts.conf: spawn works as before"     0 "$RC"
@@ -873,12 +873,12 @@ has "revive: and the reason says so"             "alpha does not see session $si
 eq "revive past a blind account: on default"     default "$(meta_account d1)"
 
 cache alpha:60:0:-:0:432000 beta:60:100:3600:0:432000 default:60:100:3600:0:432000
-n=$(grep -c '^workspace close' "$FAKE_HERDR_LOG")
+n=$(grep -cE '^(workspace|tab) close' "$FAKE_HERDR_LOG")
 run "$HIVE" revive d1
 eq "revive: no account can take the drone — refused" 1 "$RC"
 has "revive refused: says nothing was closed"    "revive: no account for d1 — nothing closed" "$ERR"
 has "revive refused: names the way out"          "hive revive d1 --account default" "$ERR"
-eq "revive refused: the workspace is not closed" "$n" "$(grep -c '^workspace close' "$FAKE_HERDR_LOG")"
+eq "revive refused: the workspace is not closed" "$n" "$(grep -cE '^(workspace|tab) close' "$FAKE_HERDR_LOG")"
 eq "revive refused: the drone stays recorded where it was" default "$(meta_account d1)"
 
 conf <<'EOF'

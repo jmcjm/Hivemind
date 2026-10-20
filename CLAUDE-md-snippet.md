@@ -19,7 +19,7 @@ writes `report.md`, reports blockers via `hive send coord`, and does NOT spawn i
 (subagents within its own session are OK). A drone receives the swarm protocol in its system prompt at spawn.
 
 Rules in short (details in the skill):
-- One drone = one herdr workspace = one pane with an interactive Claude Code on **opus**, `--dangerously-skip-permissions`
+- One drone = one tab in its coordinator's herdr workspace = one pane with an interactive Claude Code on **opus**, `--dangerously-skip-permissions`
 - Communication through **files**: brief → `brief.md`, result → `report.md`. I read the TUI only for diagnosis
 - The completion signal is the **existence of `report.md`**, not the agent status (`idle` only means "not generating tokens right now")
 - **I do not watch the swarm in a loop** — drones have `Stop`/`Notification` hooks and mail me themselves; my

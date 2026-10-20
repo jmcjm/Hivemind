@@ -1,6 +1,6 @@
 ---
 name: hivemind
-description: Use when the user wants you to run a swarm of Claude Code agents in herdr — phrases like "run the hivemind", "manage the swarm", "spawn agents", "delegate this to the drones", "what are the agents doing", "collect the reports". Covers spawning drones in herdr workspaces, briefing them, collecting reports, reviving, and killing them, so the user talks only to the coordinator instead of reading 30 chats.
+description: Use when the user wants you to run a swarm of Claude Code agents in herdr — phrases like "run the hivemind", "manage the swarm", "spawn agents", "delegate this to the drones", "what are the agents doing", "collect the reports". Covers spawning drones as tabs of the coordinator's herdr workspace, briefing them, collecting reports, reviving, and killing them, so the user talks only to the coordinator instead of reading 30 chats.
 ---
 
 # Hivemind — commanding a swarm of agents in herdr
@@ -15,7 +15,7 @@ on them, collect the results, and give the user **one condensed answer**.
 it handles every trap described below. Add it to PATH or call it by full path.
 
 ```
-hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, --dangerously-skip-permissions, own workspace)
+hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, --dangerously-skip-permissions), a tab in its coordinator's workspace
 hive task   <name> <file|->        brief from file/stdin + appended reporting protocol; needs a
                                    'Rules: <blocks>' line or a '## Boundaries' section
 hive say    <name> <text>          ad-hoc message
@@ -33,7 +33,7 @@ hive peek   <name> [lines]         view of the drone's terminal
 hive kill   <name> [--purge]       kill a drone; an already dead one is archived and removed
                                    (--purge deletes without an archive)
 hive prune  [--purge] [--dry-run] [names]  clear out dead drones — archives them, then removes
-hive rename <old> <new>            rename a drone and its workspace
+hive rename <old> <new>            rename a drone and its tab (or its own workspace)
 hive revive <name> [--account NAME]  resurrection with full conversation history (--resume); --account moves it
 hive adopt  <name> <pane_id> [--account NAME]  pull a Claude Code started outside hive into the swarm
 hive accounts [--refresh] [--pick] accounts table: limits, resets, status, and the account a spawn takes
@@ -52,9 +52,22 @@ Model: `opus` (overridable via `HIVE_MODEL`).
 
 ## Architecture
 
-One drone = one **herdr workspace** = one pane with an interactive Claude Code.
-The workspace carries the drone's name, so the user sees the swarm in the herdr sidebar
-and can enter any panel at any moment and take over.
+One drone = one **tab in its coordinator's workspace** = one pane with an interactive Claude Code.
+A front is then one workspace in the herdr sidebar: the coordinator's tab and a tab per drone, each
+labelled with the drone's name, so the user sees who works for whom and can enter any panel at any
+moment and take over.
+
+- A front without a living local coordinator (none registered, a remote one, its pane gone) gives a
+  new drone a workspace of its own, as `HIVE_DRONE_LAYOUT=workspace` does for every spawn.
+- `meta.json` says what a drone owns: `tab_id` (its tab; the workspace is `home_workspace_id`, never
+  `workspace_id`, which older versions of hive close outright), `workspace_id` (a workspace of its
+  own — drones from before tabs), or neither (an adopted agent that shares its tab). `kill`,
+  `revive`, `move` and a failed start close what it owns only after herdr confirms, at that moment,
+  that it is alone there and no coordinator is; otherwise only the drone's pane goes. A coordinator
+  later started inside an old drone's workspace, or a shell split into a drone's tab, survives.
+- **Never close the coordinator's workspace while it holds drones**: that ends every one of them
+  (`hive revive` brings each back, in the workspace of whoever coordinates the front then). Moving
+  the coordinator elsewhere, close its own tab, not the workspace.
 
 **Communication goes through files, not the terminal.** The brief lands in `brief.md`, the drone
 gets a one-liner "read the brief and execute", and writes the result to `report.md`.
@@ -502,7 +515,9 @@ make it yours — where you keep the coordinator state, which accounts and repos
    the old session's hooks stop treating it as the coordinator.
 3. In the new session: arm the watcher, read the saved state back, `hive status`, `hive inbox`, then
    delete any session crons it recreated from memory whose work a timer now does.
-4. Close the old session when its last turn is over (`/exit`). Its own crons die with it.
+4. Close the old session when its last turn is over (`/exit`). Its own crons die with it. Leave its
+   workspace open while drones live in its tabs — closing it would end them all; close the old
+   coordinator's tab only. New drones open in the new coordinator's workspace.
 
 ## Surviving a compaction
 
@@ -615,7 +630,7 @@ When a Claude Code started by hand (not through `hive`) already runs in herdr, d
 blind — it sits on context that exists nowhere else. The order:
 
 ```bash
-hive adopt <name> <pane_id>   # registers it in the swarm, records its session_id, renames the workspace
+hive adopt <name> <pane_id>   # registers it in the swarm, records its session_id and what it owns, renames its workspace or tab
 hive revive <name>            # restart with --resume: history stays; hooks, env and mail protocol arrive
 ```
 
@@ -625,8 +640,9 @@ wake-ups either — without `HIVE_DRONE` its `hive inbox` would read the coordin
 adds all of that; it refuses to run when herdr reported no session id, because there would be no
 history to resume. Before
 `revive` check `hive peek` — if the agent asked a question and waits, answer it after the revival,
-otherwise it picks the topic up its own way. `revive` closes the drone's whole workspace; `adopt`
-warns when that workspace holds other panes too.
+otherwise it picks the topic up its own way. `revive` closes what the drone owns: an agent alone in
+its workspace owns the workspace; one in a shared workspace (a coordinator's, yours) owns its tab when
+it is alone there, and only its pane when it shares the tab (`adopt` says so).
 
 **A long session resumes from a summary.** Reviving a session of several hours, Claude Code asks
 whether to resume from a summary or in full. `hive` takes the summary (cheaper) and warns loudly.
@@ -670,7 +686,7 @@ needs `meta.json`. It stops being useful once hundreds of corpses bury the livin
 - `hive prune --purge` — the same, without the archive. Nothing to restore afterwards.
 - `hive prune <names...>` — restrict it to the drones you name (still dead-only).
 - `hive kill <dead-drone>` cleans up the same way instead of leaving a ghost behind: it archives
-  and removes. Killing a **living** drone still only closes the workspace and keeps the report,
+  and removes. Killing a **living** drone still only closes its tab (or own workspace) and keeps the report,
   because that report is usually the reason you are killing it.
 
 The sweep and prune are the two halves of the same job: the sweep **detects** — it mails
@@ -689,8 +705,11 @@ about whether the work succeeded.
   The name must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents —
   `hive spawn`/`rename` validate this.
 - `herdr agent start <name> --kind claude --pane <id>` starts the agent in an **existing**
-  shell pane — zero splits. `hive spawn` uses the root pane from `workspace create`.
-  Environment variables enter via `workspace create --env` (`agent start` has no `--env`).
+  shell pane — zero splits. `hive spawn` uses the root pane from `tab create` (or `workspace create`).
+  Environment variables enter via their `--env` (`agent start` has no `--env`).
+- `workspace get` reports `pane_count` and `tab_count`, `tab get` the tab's `pane_count`, `pane get` the
+  pane's `workspace_id` and `tab_id`. hive closes a drone's workspace or tab only after these confirm
+  the drone is alone there and no coordinator is (`drone_close`); otherwise `pane close` takes its pane.
 - `herdr agent prompt <drone> "<text>"` appends Enter **atomically** (honors bracketed-paste)
   and returns immediately; an agent stuck at a dialog is rejected with `agent_blocked` —
   nothing gets sent. With `--wait` it waits for a settled state (`--timeout` works only with

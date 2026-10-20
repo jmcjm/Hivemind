@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # hive — command a swarm of Claude Code agents in herdr.
-# One drone = one herdr workspace = one pane with an interactive Claude Code (opus).
+# One drone = one tab in its coordinator's herdr workspace = one pane with an interactive Claude Code (opus).
 # Communication: brief in a file -> drone works -> report in a file. Zero TUI scraping.
 set -uo pipefail
 
@@ -428,6 +428,100 @@ print(json.load(open('$(drone_meta "$1")')).get('$2',''))" 2>/dev/null
 }
 
 pane_of() { meta_get "$1" pane_id; }
+
+# --- where a drone lives in herdr --------------------------------------------
+# A drone opens as a tab in its coordinator's workspace: a front is then one workspace in herdr's
+# sidebar, the coordinator and its drones side by side, instead of one workspace per drone. A front
+# without a living local coordinator (none registered, a remote one, its pane gone) gives the drone a
+# workspace of its own, as does HIVE_DRONE_LAYOUT=workspace.
+# The coordinator's workspace is shared, so nothing may ever close it, or the coordinator's tab, on
+# a drone's behalf. meta.json says what a drone owns: tab_id (its tab; home_workspace_id names the
+# workspace the tab lives in), workspace_id (a workspace of its own — the only key older versions
+# of hive close, which is why a drone in a tab never carries it), or neither (an adopted agent that
+# shares its tab: only its pane is its own). And ownership is checked again at the moment of
+# closing (drone_close), against herdr as it is then: a coordinator registered later inside a
+# drone's workspace, a pane split into a drone's tab, must not go down with the drone.
+
+check_layout() {  # dies on a HIVE_DRONE_LAYOUT spawn could not honour — before anything is closed
+  case "${HIVE_DRONE_LAYOUT:-tab}" in
+    tab|workspace) ;;
+    *) die "HIVE_DRONE_LAYOUT='$HIVE_DRONE_LAYOUT' — tab or workspace" ;;
+  esac
+}
+
+# drone_home — the workspace a new drone opens a tab in; fails when it gets a workspace of its own.
+drone_home() {
+  [ "${HIVE_DRONE_LAYOUT:-tab}" = tab ] || return 1
+  [ -z "$(coord_remote)" ] || return 1
+  local pane ws; pane=$(coord_pane)
+  [ -n "$pane" ] || return 1
+  ws=$(herdr pane get "$pane" 2>/dev/null | jqp "print(r['pane'].get('workspace_id') or '')") || return 1
+  [ -n "$ws" ] || return 1
+  echo "$ws"
+}
+
+# coordinator_panes — the registered coordinator pane of every front, one per line.
+coordinator_panes() {
+  local f p
+  for f in $(front_names); do
+    p=$(cat "$(front_dir "$f")/coord.pane" 2>/dev/null) && [ -n "$p" ] && echo "$p"
+  done
+}
+
+# coordinator_homes <field> — the workspace_id or tab_id of every front's coordinator pane, asked
+# of herdr (not read off the pane id: a pane can move). A pane herdr cannot find is no home.
+coordinator_homes() {
+  local c
+  while IFS= read -r c; do
+    herdr pane get "$c" 2>/dev/null | jqp "print(r['pane'].get('$1') or '')"
+  done < <(coordinator_panes)
+}
+
+# workspace_exclusive <ws> — true only when herdr confirms the workspace holds one tab with one pane
+# and no front's coordinator: then it is a drone's own and may be closed. Unknown means no.
+workspace_exclusive() {
+  local info counts
+  info=$(herdr workspace get "$1" 2>/dev/null) || return 1
+  counts=$(jqp "w=r['workspace']; print(int(w.get('pane_count') or 0), int(w.get('tab_count') or 1))" <<<"$info") || return 1
+  [ "$counts" = "1 1" ] || return 1
+  ! coordinator_homes workspace_id | grep -qxF -- "$1"
+}
+
+# tab_exclusive <tab> — the same for a tab: one pane, and not the tab of any front's coordinator.
+tab_exclusive() {
+  local info n
+  info=$(herdr tab get "$1" 2>/dev/null) || return 1
+  n=$(jqp "print(int(r['tab'].get('pane_count') or 0))" <<<"$info") || return 1
+  [ "$n" = 1 ] || return 1
+  ! coordinator_homes tab_id | grep -qxF -- "$1"
+}
+
+# drone_close <name> — ends the drone's place in herdr: the tab or workspace it owns, when herdr
+# confirms the drone's pane is still in it and alone there; else only its own pane. A drone whose
+# pane is gone has nothing left to close — whatever now sits in its old tab or workspace is not its.
+# Prints what it closed ("tab <id>", "workspace <id>", "pane <id>"), nothing when nothing was.
+drone_close() {
+  local tab ws pane info ptab pws
+  tab=$(meta_get "$1" tab_id 2>/dev/null) || tab=""
+  ws=$(meta_get "$1" workspace_id 2>/dev/null) || ws=""
+  pane=$(meta_get "$1" pane_id 2>/dev/null) || pane=""
+  [ -n "$pane" ] || return 0
+  info=$(herdr pane get "$pane" 2>/dev/null) || return 0
+  ptab=$(jqp "print(r['pane'].get('tab_id') or '')" <<<"$info") || ptab=""
+  pws=$(jqp "print(r['pane'].get('workspace_id') or '')" <<<"$info") || pws=""
+  if [ -n "$tab" ] && [ "$ptab" = "$tab" ] && tab_exclusive "$tab"; then
+    herdr tab close "$tab" >/dev/null 2>&1 && echo "tab $tab"; return 0
+  fi
+  if [ -z "$tab" ] && [ -n "$ws" ] && [ "$pws" = "$ws" ] && workspace_exclusive "$ws"; then
+    herdr workspace close "$ws" >/dev/null 2>&1 && echo "workspace $ws"; return 0
+  fi
+  # A drone that owns a tab or a workspace owns at least the tab its pane is alone in.
+  if { [ -n "$tab" ] || [ -n "$ws" ]; } && [ -n "$ptab" ] && tab_exclusive "$ptab"; then
+    herdr tab close "$ptab" >/dev/null 2>&1 && echo "tab $ptab"; return 0
+  fi
+  herdr pane close "$pane" >/dev/null 2>&1 && echo "pane $pane"
+  return 0
+}
 
 # Current pane status straight from herdr (idle|working|blocked|unknown|dead)
 pane_status() {
@@ -1233,6 +1327,7 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
     esac
   done
   [ -d "$cwd" ] || die "cwd does not exist: $cwd"
+  check_layout
   # A resumed session stays on the account it ran on unless moved explicitly — HIVE_ACCOUNT is the
   # default for NEW drones and must not quietly carry an existing one elsewhere.
   if [ "$resume" = 1 ] && [ "$account_given" = 0 ] && [ -f "$(drone_meta "$name")" ]; then
@@ -1286,8 +1381,9 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
     coord_register "$coord"
   fi
 
-  # 1 workspace per drone, label = drone name. Swarm environment variables enter here —
-  # herdr 0.8 injects --env into the root pane shell, and agent start has no --env at all.
+  # The drone's home, label = drone name: a tab in its coordinator's workspace (drone_home), else a
+  # workspace of its own. Swarm environment variables enter here — herdr injects --env into the root
+  # pane shell of a new tab or workspace, and agent start has no --env at all.
   # HIVE_FRONT goes even for the default front: set, it pins the drone's every hive call to its front.
   local -a envs=(--env "HIVE_DRONE=$name" --env "HIVE_DIR=$HIVE_DIR" --env "HIVE_FRONT=$(front_label "$HIVE_FRONT")"
                  --env "HERDR_HIVE_ROLE=drone")
@@ -1295,12 +1391,27 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # The default account gets no CLAUDE_CONFIG_DIR at all: an empty value is not "the default" to
   # Claude Code, it is a config dir named "" (logged out, measured on 2.1.283).
   [ -n "$acc_dir" ] && envs+=(--env "CLAUDE_CONFIG_DIR=$acc_dir")
-  local ws_json ws pane
-  ws_json=$(herdr workspace create --label "$name" --cwd "$cwd" --no-focus "${envs[@]}" 2>/dev/null) \
-    || die "failed to create workspace"
-  ws=$(jqp "print(r['workspace']['workspace_id'])" <<<"$ws_json")
-  pane=$(jqp "print(r['root_pane']['pane_id'])" <<<"$ws_json")
-  [ -n "$ws" ] && [ -n "$pane" ] || die "workspace create returned an incomplete response: $ws_json"
+  local ws_json ws pane tab="" home_ws
+  home_ws=$(drone_home) || home_ws=""
+  if [ -n "$home_ws" ]; then
+    if ws_json=$(herdr tab create --workspace "$home_ws" --label "$name" --cwd "$cwd" --no-focus "${envs[@]}" 2>/dev/null); then
+      ws="$home_ws"
+      tab=$(jqp "print(r['tab']['tab_id'])" <<<"$ws_json")
+      pane=$(jqp "print(r['root_pane']['pane_id'])" <<<"$ws_json")
+      [ -n "$tab" ] && [ -n "$pane" ] || die "tab create returned an incomplete response: $ws_json"
+    else
+      # The coordinator's workspace went away since it was looked up: a workspace of the drone's own.
+      echo "spawn: no tab in workspace $home_ws (gone?) — $name gets a workspace of its own" >&2
+      home_ws=""
+    fi
+  fi
+  if [ -z "$home_ws" ]; then
+    ws_json=$(herdr workspace create --label "$name" --cwd "$cwd" --no-focus "${envs[@]}" 2>/dev/null) \
+      || die "failed to create workspace"
+    ws=$(jqp "print(r['workspace']['workspace_id'])" <<<"$ws_json")
+    pane=$(jqp "print(r['root_pane']['pane_id'])" <<<"$ws_json")
+    [ -n "$ws" ] && [ -n "$pane" ] || die "workspace create returned an incomplete response: $ws_json"
+  fi
 
   # Swarm protocol lives in the system prompt, not in the brief — the drone knows it from
   # turn one and never loses it across tasks. The brief stays purely about the work.
@@ -1341,18 +1452,24 @@ Report questions and blockers via 'hive send coord' — do not wait idly, nobody
   if [ "$ready" != 1 ]; then
     case "$start_out" in
       *agent_not_ready*) : ;;   # startup dialog — handled in the bootstrap below
-      *) herdr workspace close "$ws" >/dev/null 2>&1
+      *) # Only what this spawn opened: a tab's workspace is the coordinator's.
+         if [ -n "$tab" ]; then herdr tab close "$tab" >/dev/null 2>&1
+         else herdr workspace close "$ws" >/dev/null 2>&1; fi
          die "failed to start the agent: $start_out" ;;
     esac
   fi
 
   # The account is recorded because 'revive' must resume on it: --resume looks the session up in
   # the account's projects/ directory.
-  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" <<'PY'
+  # What the drone owns (see drone_close): a tab in a shared workspace, or a workspace of its own.
+  # A drone in a tab never carries workspace_id — older versions of hive close that key outright.
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" "$tab" <<'PY'
 import json,sys
-d,name,ws,pane,sid,cwd,account = sys.argv[1:8]
-json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account},
-          open(f"{d}/meta.json","w"), indent=1)
+d,name,ws,pane,sid,cwd,account,tab = sys.argv[1:9]
+meta={"name":name,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account}
+if tab: meta.update(tab_id=tab, home_workspace_id=ws)
+else: meta["workspace_id"]=ws
+json.dump(meta, open(f"{d}/meta.json","w"), indent=1)
 PY
 
   # Startup dialog bootstrap: the trust dialog appears despite --dangerously-skip-permissions
@@ -1395,7 +1512,7 @@ Compaction drops detail. Before tasking it: wait until its status is no longer '
 restate what binds in one 'hive say' — state on disk, scope, boundaries. Do not assume it remembers.
 EOF
 
-  echo "spawn: $name  ws=$ws pane=$pane model=$MODEL account=$(account_label "$account") cwd=$cwd"
+  echo "spawn: $name  ws=$ws${tab:+ tab=$tab} pane=$pane model=$MODEL account=$(account_label "$account") cwd=$cwd"
   echo "sid=$sid"
 }
 
@@ -2024,9 +2141,8 @@ cmd_kill() {  # kill <name> [--purge]
   # The state is read BEFORE the workspace is closed — afterwards every drone looks dead,
   # and the difference between "killed just now" and "was already a corpse" would be lost.
   local state; state=$(drone_state "$name")
-  # A directory without meta.json has no workspace to close; that is not a reason to refuse.
-  local ws; ws=$(meta_get "$name" workspace_id) || ws=""
-  [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
+  # A directory without meta.json has nothing to close; that is not a reason to refuse.
+  local closed; closed=$(drone_close "$name")
   rm -f "$FRONT_DIR/.wake-$name"
 
   if [ "$purge" = "--purge" ]; then
@@ -2050,7 +2166,7 @@ cmd_kill() {  # kill <name> [--purge]
   # Concluded on purpose — the sweep must not keep reporting this corpse as an anomaly.
   # The directory stays: killing a LIVING drone is usually done for its report.
   : > "$(drone_dir "$name")/.killed"
-  echo "kill: $name (workspace $ws closed, report kept)"
+  echo "kill: $name (${closed:-nothing} closed, report kept)"
 }
 
 cmd_prune() {  # prune [--purge] [--dry-run] [name...] — clears out dead drones
@@ -2102,9 +2218,12 @@ cmd_rename() {  # rename <old> <new>
     || die "name '$new' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   [ -e "$(drone_dir "$new")" ] && die "drone $new already exists — pick another name"
   name_free_elsewhere "$new"
-  local ws pane; ws=$(meta_get "$old" workspace_id) || unknown_drone "$old"
-  pane=$(pane_of "$old")
-  herdr workspace rename "$ws" "$new" >/dev/null 2>&1
+  local ws pane tab; ws=$(meta_get "$old" workspace_id) || unknown_drone "$old"
+  pane=$(pane_of "$old"); tab=$(meta_get "$old" tab_id)
+  # A drone in a tab renames its tab: the workspace is its coordinator's.
+  # A workspace's label follows the drone only while the workspace is still its own alone.
+  if [ -n "$tab" ]; then herdr tab rename "$tab" "$new" >/dev/null 2>&1
+  elif [ -n "$ws" ] && workspace_exclusive "$ws"; then herdr workspace rename "$ws" "$new" >/dev/null 2>&1; fi
   herdr agent rename "$pane" "$new" >/dev/null 2>&1
   mv "$(drone_dir "$old")" "$(drone_dir "$new")"
   python3 -c "
@@ -2201,23 +2320,43 @@ print(s.get('value','') if s.get('kind')=='id' else '')" <<<"$info")
 
   # The name is claimed in herdr first: agent names are unique among live agents, and a drone
   # registered under a name held by someone else would have its tasks delivered to that agent.
+  # What the agent owns decides what its revive and kill may close (drone_close): a workspace it is
+  # alone in, else a tab it is alone in (and that is no coordinator's), else only its pane. Decided
+  # before anything changes; when herdr cannot say, nothing is adopted.
+  herdr workspace get "$ws" >/dev/null 2>&1 \
+    || die "herdr could not describe workspace $ws — cannot tell what the agent owns; nothing adopted"
+  local tab="" own_ws=""
+  if workspace_exclusive "$ws"; then
+    own_ws="$ws"
+  else
+    tab=$(jqp "print(r['pane'].get('tab_id') or '')" <<<"$info")
+    if [ -z "$tab" ] || ! tab_exclusive "$tab"; then
+      tab=""
+      echo "adopt: $pane shares its tab — the drone owns only its pane; kill and revive close just that pane" >&2
+    fi
+  fi
+
   herdr agent rename "$pane" "$name" >/dev/null 2>&1 \
     || die "herdr refused the name '$name' (taken by another live agent?) — nothing adopted"
-  herdr workspace rename "$ws" "$name" >/dev/null 2>&1
+  if [ -n "$own_ws" ]; then herdr workspace rename "$ws" "$name" >/dev/null 2>&1
+  elif [ -n "$tab" ]; then herdr tab rename "$tab" "$name" >/dev/null 2>&1; fi
 
   local dir; dir=$(drone_dir "$name"); mkdir -p "$dir"
   rm -f "$dir"/.sweep-* "$dir/.killed"   # leftovers of a ghost directory must not judge the new drone
   # 'adopted' marks a drone without the swarm env: until revive it has no HIVE_DRONE, so its
   # 'hive inbox' would read the COORDINATOR's mailbox — wake_recipient leaves it alone.
-  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" <<'PY'
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" "$tab" "$own_ws" <<'PY'
 import json,sys
-d,name,ws,pane,sid,cwd,account = sys.argv[1:8]
-json.dump({"name":name,"workspace_id":ws,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account,
-           "adopted":True},
-          open(f"{d}/meta.json","w"), indent=1)
+d,name,ws,pane,sid,cwd,account,tab,own_ws = sys.argv[1:10]
+meta={"name":name,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account,"adopted":True}
+if own_ws: meta["workspace_id"]=own_ws
+else:
+    meta["home_workspace_id"]=ws
+    if tab: meta["tab_id"]=tab
+json.dump(meta, open(f"{d}/meta.json","w"), indent=1)
 PY
 
-  echo "adopt: $name  ws=$ws pane=$pane account=$(account_label "$account") cwd=$cwd"
+  echo "adopt: $name  ws=$ws${tab:+ tab=$tab} pane=$pane account=$(account_label "$account") cwd=$cwd"
   local missing=""
   [ -n "$sid" ] || missing="session_id"
   [ -n "$cwd" ] || missing="${missing:+$missing and }cwd"
@@ -2226,10 +2365,6 @@ PY
     return 0
   fi
   echo "sid=$sid"
-  # revive closes the drone's whole workspace — an adopted agent may share it with other panes.
-  local panes; panes=$(herdr workspace get "$ws" 2>/dev/null | jqp "print(r['workspace'].get('pane_count') or 0)")
-  [ "${panes:-0}" -gt 1 ] 2>/dev/null \
-    && echo "warning: workspace $ws holds $panes panes — 'hive revive' closes the whole workspace, not just this pane" >&2
   cat <<EOF
 note: an adopted agent has no swarm hooks (it will not report in), no swarm env and no mail protocol.
 Full integration: hive revive $name   (restart with --resume; the conversation history survives)
@@ -2238,6 +2373,7 @@ EOF
 
 cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its conversation history intact
   local name="${1:?usage: hive revive <name> [--account NAME]}"; shift
+  check_layout   # before anything is closed: the spawn that follows would refuse it
   local cwd; cwd=$(meta_get "$name" cwd) || unknown_drone "$name"
   # A drone comes back on the account it ran on. --account moves it; without it the drone moves
   # only when its account has no room left (over its threshold, full, unusable, disabled) — then to
@@ -2269,8 +2405,7 @@ cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its
     compgen -G "${acc_dir:-$HOME/.claude}/projects/*/$sid.jsonl" >/dev/null \
       || die "revive: account '$(account_label "$account")' does not see session $sid (projects/ not shared with the drone's account?) — nothing closed"
   fi
-  local ws; ws=$(meta_get "$name" workspace_id)
-  herdr workspace close "$ws" >/dev/null 2>&1
+  drone_close "$name" >/dev/null
   cmd_spawn "$name" --cwd "$cwd" --account "$account" --resume
 }
 
@@ -2293,17 +2428,18 @@ cmd_move() {  # move <drone> <front> [--force]
   # An unreachable server makes every living drone read as dead, and a living drone moved as a dead
   # one keeps running with its old front and paths.
   herdr_reachable || die "move: herdr server unreachable (down, or older than this client) — every drone would read as dead; nothing moved"
+  check_layout
   to=$(front_label "$to")
   local from; from=$(drone_front "$name") || die "move: unknown drone: $name"
   [ "$from" = "$to" ] && die "move: $name already belongs to front $to"
   front_use "$from"
 
-  local src st cwd sid account ws live=1
+  local src st cwd sid account live=1
   src=$(drone_dir "$name")
   st=$(drone_state "$name")
   [ "$st" = dead ] && live=0
   cwd=$(meta_get "$name" cwd); sid=$(meta_get "$name" session_id)
-  account=$(meta_get "$name" account); ws=$(meta_get "$name" workspace_id)
+  account=$(meta_get "$name" account)
   # Every refusal comes before anything is closed or moved.
   if [ "$live" = 1 ]; then
     [ "$st" = working ] && [ "$force" = 0 ] \
@@ -2317,9 +2453,9 @@ cmd_move() {  # move <drone> <front> [--force]
   local dst="$dfront/drones/$name"
   [ -e "$dst" ] && die "move: $dst exists already — nothing moved"
 
-  [ "$live" = 1 ] && [ -n "$ws" ] && herdr workspace close "$ws" >/dev/null 2>&1
+  [ "$live" = 1 ] && drone_close "$name" >/dev/null
   mkdir -p "$dfront/drones" "$dfront/mail"
-  local closed=""; [ "$live" = 1 ] && closed=" — its workspace is closed already: hive --front $from revive $name"
+  local closed=""; [ "$live" = 1 ] && closed=" — it is closed already: hive --front $from revive $name"
   mv "$src" "$dst" || die "move: could not move $src to $dst$closed"
   # The mailbox may exist in the new front already (an 'inbox' or a letter sent there first): its
   # letters are merged into it, never nested under it where nobody reads.
@@ -2988,7 +3124,8 @@ case "${1:-}" in
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
 
-  hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, skip-permissions, own workspace)
+  hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, skip-permissions): a tab in its coordinator's
+                                     workspace (HIVE_DRONE_LAYOUT=workspace: a workspace of its own)
   hive task   <name> <file|->        send a brief (file or stdin) + report protocol; the brief needs
                                      a 'Rules: <blocks>' line (expanded from ~/.herdr-hive/rules)
                                      or a '## Boundaries' section
@@ -3013,7 +3150,7 @@ hive — command a swarm of Claude Code agents in herdr
   hive peek   <name> [lines]         view of the drone's terminal
   hive kill   <name> [--purge]       kill a drone (a dead one is archived and removed)
   hive prune  [--purge] [--dry-run] [names]  clear out dead drones (archived unless --purge)
-  hive rename <old> <new>            rename a drone and its workspace
+  hive rename <old> <new>            rename a drone and its tab (or its own workspace)
   hive revive <name> [--account NAME]  resurrect a drone with its history (--resume); --account moves it
   hive adopt  <name> <pane_id> [--account NAME]  pull a Claude Code started outside hive into the swarm
   hive unblock <name>                answer the dialog a drone is stuck on (resume/trust/consent)
