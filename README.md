@@ -395,7 +395,8 @@ drone lands on" in `skill/SKILL.md`.
 | `hive revive` loses history | herdr integration missing | `herdr integration status` → must say `claude: current` |
 | drones bypass the mailbox | old spawn without the system prompt | kill and spawn anew |
 | `hive accounts` shows `no data — measurement failed: …` | tmux missing, Claude Code slower than `HIVE_USAGE_TIMEOUT`, or a `/usage` panel the parser does not know | the status names the cause; an unknown panel is kept in `~/.herdr-hive/usage-panel-<account>.txt` |
-| spawn refuses: `no account is selectable` | every listed account is full, over a `hard` threshold or `disabled` | wait for the reset the message names, or force one with `--account NAME` |
+| spawn refuses: `no account is selectable` | every listed account is full, over a `hard` threshold or `disabled` | wait for the reset the message names (`hive accounts`) |
+| spawn refuses: `account NAME has no room` | the account named with `--account` or `HIVE_ACCOUNT` is full, over its threshold or `disabled`; a drone started there would take its brief and sit on the usage-limit screen | wait for its reset, pick another account, or pass `--force` |
 
 ## Customization
 

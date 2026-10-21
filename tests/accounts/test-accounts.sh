@@ -779,8 +779,17 @@ like "nothing selectable: spawn says which account resets when" 'alpha: UNAVAILA
 like "nothing selectable: spawn names the first account to get room" 'First to get room: beta, [A-Z][a-z]{2} [0-9]{2} [0-9]{2}:[0-9]{2} \(in (1h00m|59m)\)\.' "$ERR"
 eq "nothing selectable: no workspace is created" "$n" "$(spawned)"
 eq "nothing selectable: no drone is recorded"    no "$([ -e "$HIVE_DIR/drones/d6/meta.json" ] && echo yes || echo no)"
+n=$(spawned)
 run "$HIVE" spawn d6 --account alpha
-eq "nothing selectable: --account still forces one" alpha "$(meta_account d6)"
+eq "named account without room: spawn is refused" 1 "$RC"
+has "named account without room: spawn says why" "spawn: account alpha has no room (UNAVAILABLE: week 100%) — nothing started" "$ERR"
+has "named account without room: spawn names --force" "pass --force to start it anyway" "$ERR"
+eq "named account without room: no workspace is created" "$n" "$(spawned)"
+eq "named account without room: no drone is recorded" no "$([ -e "$HIVE_DIR/drones/d6/meta.json" ] && echo yes || echo no)"
+HIVE_ACCOUNT=alpha run "$HIVE" spawn d6
+eq "HIVE_ACCOUNT without room: spawn is refused" 1 "$RC"
+run "$HIVE" spawn d6 --account alpha --force
+eq "nothing selectable: --account --force still forces one" alpha "$(meta_account d6)"
 
 panel 100 "$SESSION_IN_2H" 10 "$WEEK_IN_3D" > "$FAKE_PANELS/alpha.txt"
 panel 10 "$SESSION_IN_2H" 10 "$WEEK_IN_3D"  > "$FAKE_PANELS/beta.txt"

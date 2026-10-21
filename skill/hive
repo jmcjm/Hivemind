@@ -1317,12 +1317,13 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
     || die "name '$name' rejected: herdr requires [a-z][a-z0-9_-]{0,31}"
   name_free_elsewhere "$name"
-  local cwd="$HOME" resume=0 account="${HIVE_ACCOUNT:-}" account_given=0
+  local cwd="$HOME" resume=0 account="${HIVE_ACCOUNT:-}" account_given=0 force=0 picked_auto=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --cwd) cwd="$2"; shift 2 ;;
       --account) account="${2?--account needs a name}"; account_given=1; shift 2 ;;
       --resume) resume=1; shift ;;
+      --force) force=1; shift ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -1337,6 +1338,18 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
     local picked; picked=$(account_pick) || die "spawn: no account for $name — nothing started"
     account="${picked%%$'\t'*}"
     echo "spawn: account $account — ${picked#*$'\t'}"
+    picked_auto=1
+  fi
+  # A named account (--account, HIVE_ACCOUNT) is checked too: a drone started on a full account
+  # takes its brief and then sits on the usage-limit screen until the reset, looking alive.
+  # Only a new drone is checked; a resume keeps its account and revive picks its own. A broken
+  # accounts.conf cannot say anything about room, and the named account still wins then.
+  if [ "$resume" = 0 ] && [ "$picked_auto" = 0 ] && [ "$force" = 0 ] && [ -e "$ACCOUNTS_CONF" ] \
+     && accounts_py check >/dev/null 2>&1; then
+    local room_why
+    accounts_refresh stale >&2 || echo "hive: accounts: checking on the measurements already stored" >&2
+    room_why=$(accounts_py room "${account:-default}") \
+      || die "spawn: account ${account:-default} has no room ($room_why) — nothing started. The reset is in 'hive accounts'; pass --force to start it anyway"
   fi
   local acc_dir; acc_dir=$(account_dir "$account") || exit 1
   [ "$account" = default ] && account=""
@@ -3127,8 +3140,9 @@ case "${1:-}" in
   *) cat <<'EOF'
 hive — command a swarm of Claude Code agents in herdr
 
-  hive spawn  <name> [--cwd PATH] [--account NAME]  new drone (opus, skip-permissions): a tab in its coordinator's
-                                     workspace (HIVE_DRONE_LAYOUT=workspace: a workspace of its own)
+  hive spawn  <name> [--cwd PATH] [--account NAME] [--force]  new drone (opus, skip-permissions): a tab in its
+                                     coordinator's workspace (HIVE_DRONE_LAYOUT=workspace: a workspace of its own);
+                                     a named account without room is refused unless --force
   hive task   <name> <file|->        send a brief (file or stdin) + report protocol; the brief needs
                                      a 'Rules: <blocks>' line (expanded from ~/.herdr-hive/rules)
                                      or a '## Boundaries' section
