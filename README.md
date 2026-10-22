@@ -285,7 +285,8 @@ Rules: repo review
 first), then `repo.md` and `review.md`. If the brief has its own `## Boundaries` section, the blocks
 go to the top of it. A brief with neither the line nor such a section is refused, so is one naming a
 block that does not exist; `HIVE_NO_RULES=1` lets a brief through on purpose. A refused brief never
-replaces the drone's current one. Lines in code fences are text, not directives. An example
+replaces the drone's current one. Lines in code fences are text, not directives; every other line
+starting with `Rules:` is one, a list item too, so reword a sentence that starts that way. An example
 `common.md`:
 
 ```markdown
@@ -415,7 +416,8 @@ drone lands on" in `skill/SKILL.md`.
 - Boundaries: `HIVE_RULES_DIR` (default `~/.herdr-hive/rules`).
 - Coordinator session: `HIVE_COORD_DIR` (default `~/.herdr-hive/coord`), `HIVE_COORD_MODEL` (default
   `opus`); in `coord-settings.json` the window, `HIVE_COORD_WARN_TOKENS`, and `HIVE_COORD_GUARD_MSG` for
-  the guard's text (`{k}` = context in thousands) — name the place you keep the coordinator state there.
+  the guard's text (`{k}` = context in thousands) — name the place you keep the coordinator state there;
+  `HIVE_COORD_GUARD_NOTIFY=0` keeps the guard off the desktop (no notification when it holds a turn).
 - Language: the skill and the drones' system prompt are in English — translate `SKILL.md` and
   `$sysprompt` in the `cmd_spawn` function if the target human speaks another language.
 - Tests: `tests/run.sh` — hermetic tests of the coordinator mail path and of account handling against a fake herdr;

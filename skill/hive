@@ -1584,7 +1584,9 @@ for n in names:
     elif f not in files: files.append(f)
 if missing:
     have=sorted(os.path.splitext(x)[0] for x in os.listdir(rdir) if x.endswith('.md')) if os.path.isdir(rdir) else []
-    print(f"no boundary block for: {' '.join(missing)} (in {rdir}: {' '.join(have) or 'nothing'})", file=sys.stderr)
+    print(f"no boundary block for: {' '.join(missing)} (in {rdir}: {' '.join(have) or 'nothing'})."
+          f" Every line starting with '{kw}:' is a directive, a list item too: reword a sentence that"
+          f" starts so, or put it in a code fence", file=sys.stderr)
     sys.exit(4)
 if not files:
     print(f"'{kw}:' names no block and {rdir} has no common.md", file=sys.stderr); sys.exit(4)
@@ -2836,7 +2838,8 @@ sweep_front() {  # one reconciliation pass over the current front
     # (not a race: another /proc layout, a Claude Code that starts its shells differently) would
     # silence the drone's idle alert for good, so the passes in a row are counted, and after
     # HIVE_SWEEP_NOSCAN of them (default 6: half an hour of 5-minute sweeps) the coordinator hears it,
-    # once. The count goes with the other markers as soon as a scan works again (sweep_state).
+    # once per HIVE_SWEEP_RENOTIFY like every sweep alert. The count goes with the other markers as
+    # soon as a scan works again (sweep_state).
     local bg=""
     case "$st" in idle|done) bg=$(drone_bg_shells "$name")
                              [ "$bg" = '?' ] && bg=$(drone_bg_shells "$name") ;; esac
