@@ -170,7 +170,8 @@ reliability net behind the happy path:
   it is reported only after `HIVE_SWEEP_BGWAIT` (default 2 h) of that. A `/proc` scan that fails twice
   in a pass leaves the drone as it was (no alert, no marker touched) and logs `background shells
   unknown` in the sweep journal; after `HIVE_SWEEP_NOSCAN` such passes in a row (default 6) you get
-  one `SWEEP: cannot scan /proc for drone <name>`. An alert that could not be written to the mailbox
+  `SWEEP: cannot scan /proc for drone <name>`, again every `HIVE_SWEEP_RENOTIFY` while the scan keeps
+  failing. An alert that could not be written to the mailbox
   keeps no marker, so the next pass tries again. `hive kill` marks the drone
   concluded so its corpse stops alarming, and a new spawn/task resets the verdicts.
   A coordinator mid-turn keeps the overdue reminder quiet only until the oldest letter is
@@ -582,7 +583,8 @@ The brief is a contract. The drone knows nothing of your conversation with the u
   `## Boundaries` section of the brief — with the line too, the blocks land at the top of it. A brief
   with neither the line nor such a section is refused, and so is one that names a block that does not
   exist; a refused brief never replaces the drone's current one. `HIVE_NO_RULES=1` lets a brief without
-  boundaries through on purpose. Lines in code fences are text, not directives.
+  boundaries through on purpose. Lines in code fences are text, not directives; every other line
+  starting with `Rules:` is one, a list item too, so reword a sentence that starts that way.
 - **Concrete paths, repos, tables** — not "fix the service", but the full path.
 - **Required evidence** — test output, query results. Otherwise you get an optimistic
   "done" with nothing behind it.

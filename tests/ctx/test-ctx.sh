@@ -216,6 +216,9 @@ env PATH="$T/badpy:$PATH" "$HIVE" sweep >/dev/null 2>&1
 eq "the sixth (HIVE_SWEEP_NOSCAN) tells the coordinator the scan keeps failing" 1 "$(noscan)"
 env PATH="$T/badpy:$PATH" "$HIVE" sweep >/dev/null 2>&1
 eq "once" 1 "$(noscan)"
+touch -d '2 hours ago' "$HIVE_DIR/drones/d2/.sweep-noscan"
+env PATH="$T/badpy:$PATH" "$HIVE" sweep >/dev/null 2>&1
+eq "and again after HIVE_SWEEP_RENOTIFY while the scan keeps failing" 2 "$(noscan)"
 eq "still without a stall alert or a restarted bgwait clock" "0 $BGM" "$(sweep_count d2) $(stat -c %Y "$HIVE_DIR/drones/d2/.sweep-bgwait" 2>/dev/null)"
 "$HIVE" sweep >/dev/null 2>&1
 eq "a scan that works again clears the count" no "$([ -e "$HIVE_DIR/drones/d2/.sweep-bgunknown" ] && echo yes || echo no)"
@@ -293,6 +296,11 @@ eq "an unknown block is refused" 1 "$RC"
 has "naming the missing one" "no boundary block for: nosuch" "$ERR"
 has "and the drone's current brief stays" "written by hand" "$(cat "$B" 2>/dev/null)"
 
+brief "# Task" "" "## Boundaries" "- Rules: keep the public API stable"
+run "$HIVE" task t1 "$T/brief.md"
+eq "a sentence starting with 'Rules:' is a directive too, in a list as well: refused" 1 "$RC"
+has "and the refusal says why and what to do" "Every line starting with 'Rules:' is a directive, a list item too: reword" "$ERR"
+
 run "$HIVE" task t1 "$T/no-such-brief.md"
 eq "a brief file that cannot be read is refused" 1 "$RC"
 has "and the drone's current brief stays too" "written by hand" "$(cat "$B" 2>/dev/null)"
@@ -333,6 +341,21 @@ brief "# Task" "**Rules:** review"
 run "$HIVE" task t1 "$T/brief.md"
 eq "a bold 'Rules:' line is a directive too" 0 "$RC"
 has "with the common block and the named one only" $'## Boundaries (absolute)\n\n- COMMON-1\n- COMMON-2\n\n- REVIEW-1' "$(cat "$B")"
+
+brief "# Task" "rules: review"
+run "$HIVE" task t1 "$T/brief.md"
+eq "a lowercase 'rules:' line is a directive" 0 "$RC"
+has "expanded like any other" $'## Boundaries (absolute)\n\n- COMMON-1\n- COMMON-2\n\n- REVIEW-1' "$(cat "$B")"
+
+brief "# Task" "Rules: Common review"
+run "$HIVE" task t1 "$T/brief.md"
+eq "'Common' with a capital is the common block, not a missing one" 0 "$RC"
+eq "and it comes once" 1 "$(grep -c -- '- COMMON-1' "$B")"
+
+printf '5\n' > "$HIVE_DIR/drones/t1/.sweep-bgunknown"; : > "$HIVE_DIR/drones/t1/.sweep-noscan"
+brief "# Task" "Rules: repo"
+run "$HIVE" task t1 "$T/brief.md"
+eq "a new task resets the sweep's verdicts, the /proc count included" "" "$(ls -A "$HIVE_DIR/drones/t1" | grep '^\.sweep-')"
 
 rm -f "$HIVE_RULES_DIR/common.md"
 brief "# Task" "Rules: review"
