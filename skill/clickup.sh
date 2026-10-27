@@ -27,13 +27,16 @@ CU_LOG="$CU_DIR/sync.log"
 CU_SYNC_STATE="$CU_DIR/sync.state"
 CU_SYNC_FAILED="$CU_DIR/sync.failed"
 CU_SYNC_RETRY="$CU_DIR/sync.retry"
+# The start writes of a brief let through while ClickUp was down, one file each; clickup-sync replays them.
+CU_STARTS="$CU_DIR/starts"
 CU_COMMENT_MAX=8000                  # ClickUp takes 40000 characters; a report comment stays readable
 CU_REGISTRY_TTL=600                  # 'ct find' refreshes a cache older than this
+CU_GATE_BUDGET=10                    # seconds 'hive task' waits for ClickUp before counting it down
 CU_KINDS="front module area type"
 CU_ROW_HEADER=$'id\tstatus\tfront\tmodules\tarea\tparent\tname\tupdated'
-CU_TMP="" CU_NO_TOKEN=0 CU_LOADED=0 CU_SPACE_TAGS=""
+CU_TMP="" CU_NO_TOKEN=0 CU_LOADED=0 CU_SPACE_TAGS="" CU_DEADLINE=""
 declare -A CU_CFG=() CU_STATUSES=()
-declare -a CU_JQ_ARGS=()
+declare -a CU_JQ_ARGS=() CU_RETRY_GUARD=()
 
 cu_say() { echo "clickup: $*" >&2; }
 cu_die() { cu_say "$*"; exit 1; }
@@ -48,15 +51,17 @@ cu_trim() { local s=$1; s="${s#"${s%%[![:space:]]*}"}"; printf '%s\n' "${s%"${s#
 cu_init() {
   [ "$CU_LOADED" = 1 ] && return 0
   cu_enabled || { cu_say "ClickUp tracking is off (no $CU_CONF)"; return 1; }
-  local k v
-  while IFS='=' read -r k v; do
+  local line k v
+  # Split on the first '=' by hand: read with IFS='=' would drop a trailing '=' from the value.
+  while IFS= read -r line; do
+    k=${line%%=*}; v=""; [ "$k" = "$line" ] || v=${line#*=}
     k=$(cu_trim "$k"); [ -n "$k" ] && CU_CFG[$k]=$(cu_trim "$v")
   done < <(grep -vE '^[[:space:]]*(#|$)' "$CU_CONF")
   : "${CU_CFG[status_early]:=to do}" "${CU_CFG[status_active]:=in progress}" "${CU_CFG[status_closed]:=complete | closed}"
   : "${CU_CFG[status_start]:=in progress}" "${CU_CFG[status_done]:=complete}"
   : "${CU_CFG[prefix_front]:=front-}" "${CU_CFG[prefix_module]:=mod-}" "${CU_CFG[prefix_area]:=area-}" "${CU_CFG[prefix_type]:=type-}"
   for k in workspace space list; do
-    [ -n "${CU_CFG[$k]}" ] || { cu_say "$CU_CONF has no '$k'"; return 1; }
+    [ -n "${CU_CFG[$k]:-}" ] || { cu_say "$CU_CONF has no '$k'"; return 1; }
   done
   [ -n "${CU_CFG[token_cmd]:-}${CU_CFG[token_file]:-}" ] || { cu_say "$CU_CONF has neither 'token_cmd' nor 'token_file'"; return 1; }
   [ -s "$CU_TAXONOMY" ] || { cu_say "no taxonomy ($CU_TAXONOMY) — see taxonomy.tsv.example"; return 1; }
@@ -135,7 +140,8 @@ cu_ready() {
   local cmd file
   cmd=$(cu_cfg token_cmd); file=$(cu_cfg token_file); file=${file/#\~/$HOME}
   if [ -n "$cmd" ]; then
-    timeout 60 bash -c "$cmd" > "$CU_TMP/tok" 2>"$CU_TMP/tok.err" </dev/null \
+    [ "$(cu_time 60)" -gt 0 ] || { cu_say "no time left to run token_cmd"; return 1; }
+    timeout "$(cu_time 60)" bash -c "$cmd" > "$CU_TMP/tok" 2>"$CU_TMP/tok.err" </dev/null \
       || { cu_say "token_cmd failed: $(tail -1 "$CU_TMP/tok.err" 2>/dev/null)"; CU_NO_TOKEN=1; return 1; }
   else
     cat -- "$file" > "$CU_TMP/tok" 2>/dev/null || { cu_say "cannot read token_file $file"; CU_NO_TOKEN=1; return 1; }
@@ -145,21 +151,37 @@ cu_ready() {
   shred -u "$CU_TMP/tok"
 }
 
+# cu_time <seconds> — that many, or fewer when the deadline CU_DEADLINE (epoch seconds, set by the
+# 'hive task' gate) comes sooner: 0 once it passed.
+cu_time() {
+  local left
+  [ -n "$CU_DEADLINE" ] || { echo "$1"; return; }
+  left=$(( CU_DEADLINE - $(date +%s) )); [ "$left" -gt 0 ] || left=0
+  echo $(( left < $1 ? left : $1 ))
+}
+
 # cu_api <METHOD> <path> [json-body] — prints the response body. Returns 0 on success, 3 when the
 # object does not exist (ClickUp answers 401 OAUTH_027 for a task id nobody has, not 404), 1 when
 # ClickUp refuses the call (its message on stderr), 2 when ClickUp is unavailable: no token, network
-# down, 5xx, a rejected token, or a rate limit beyond the retries.
+# down, 5xx, a rejected token, or a rate limit beyond the retries. No attempt and no wait runs past
+# CU_DEADLINE. A write whose attempt timed out or got a 5xx may have landed all the same: when
+# CU_RETRY_GUARD holds a command, it runs before every retry, and its success ends the call as done.
 cu_api() {
-  local method=$1 path=$2 body=${3:-} attempt code wait reset err
+  local method=$1 path=$2 body=${3:-} attempt code="" wait reset err max
+  local -a guard=("${CU_RETRY_GUARD[@]}"); local -a CU_RETRY_GUARD=()   # not for the guard's own calls
   [ -n "$CU_TMP" ] && [ -s "$CU_TMP/auth" ] || { cu_say "no API token (cu_ready failed or was not called)"; return 2; }
   local out="$CU_TMP/out.$BASHPID" hdr="$CU_TMP/hdr.$BASHPID" data="$CU_TMP/data.$BASHPID"
-  local -a args=(-sS --max-time 30 -X "$method" -H "@$CU_TMP/auth" -D "$hdr" -o "$out" -w '%{http_code}')
+  local -a args=(-sS -X "$method" -H "@$CU_TMP/auth" -D "$hdr" -o "$out" -w '%{http_code}')
   if [ -n "$body" ]; then
     printf '%s' "$body" > "$data"
     args+=(-H 'Content-Type: application/json' --data-binary "@$data")
   fi
   for attempt in 1 2 3 4; do
-    code=$(curl "${args[@]}" "$CU_API$path" 2>/dev/null) || code=000
+    max=$(cu_time 30); [ "$max" -gt 0 ] || break
+    if [ "$attempt" -gt 1 ] && [ "$code" != 429 ] && [ ${#guard[@]} -gt 0 ] && "${guard[@]}" 2>/dev/null; then
+      rm -f "$out" "$hdr" "$data"; return 0
+    fi
+    code=$(curl "${args[@]}" --connect-timeout "$(( max < 5 ? max : 5 ))" --max-time "$max" "$CU_API$path" 2>/dev/null) || code=000
     case "$code" in
       2??) cat "$out"; rm -f "$out" "$hdr" "$data"; return 0 ;;
       429) reset=$(grep -i '^x-ratelimit-reset:' "$hdr" 2>/dev/null | tr -dc '0-9')
@@ -174,10 +196,10 @@ cu_api() {
          esac
          cu_say "$method $path: HTTP $code${err:+ ($err)}"; return 1 ;;
     esac
-    [ "$attempt" -lt 4 ] && sleep "$wait"
+    [ "$attempt" -lt 4 ] && sleep "$(cu_time "$wait")"
   done
   rm -f "$out" "$hdr" "$data"
-  cu_say "$method $path: ClickUp unavailable (HTTP $code after 4 attempts)"
+  cu_say "$method $path: ClickUp unavailable (last HTTP ${code:-000})"
   return 2
 }
 
@@ -351,7 +373,10 @@ cu_set_status() {
   cu_api PUT "/task/$(jq -r .id <<<"$1")" "$(jq -nc --arg s "$status" '{status: $s}')" >/dev/null
 }
 
-cu_comment() {  # cu_comment <id> <text>
+# cu_comment <id> <text> [marker] — before a retry it looks for the marker the text carries (else for
+# the text): an attempt that timed out may have landed, and a retry must not double it.
+cu_comment() {
+  local -a CU_RETRY_GUARD=(cu_has_comment "$1" "${3:-$2}" ${3:+--contains})
   cu_api POST "/task/$1/comment" "$(jq -nc --arg t "$2" '{comment_text: $t, notify_all: false}')" >/dev/null
 }
 
@@ -365,11 +390,11 @@ cu_has_comment() {
     <<<"$json" >/dev/null
 }
 
-cu_comment_once() {  # cu_comment_once <id> <text> — never twice the same comment
-  local rc; cu_has_comment "$1" "$2"; rc=$?
+cu_comment_once() {  # cu_comment_once <id> <text> [marker] — never twice the same comment (or marker)
+  local rc; cu_has_comment "$1" "${3:-$2}" ${3:+--contains}; rc=$?
   [ "$rc" = 0 ] && return 0
   [ "$rc" = 2 ] && return 2
-  cu_comment "$1" "$2"
+  cu_comment "$@"
 }
 
 # cu_set_front <task-json> <front-tag> <why> — hands a task to another front, with a comment.
@@ -428,20 +453,22 @@ cu_brief_header() {
   CU_CHECKED=$(cu_brief_values "$1" "Collision checked" alias_collision)
 }
 
-# cu_claims [except-drone] — CU_CLAIMS: the living drones that hold a task (hive's drone_claims:
-# front, drone, task, modules), every front. Empty where hive is not around.
+# cu_claims [except-front except-drone] — CU_CLAIMS: the drones at work on a task (hive's
+# drone_claims: front, drone, task, modules), every front. Empty where hive is not around.
 cu_claims() {
   CU_CLAIMS="$CU_TMP/claims"
-  if declare -F drone_claims >/dev/null; then drone_claims "${1:-}" > "$CU_CLAIMS"; else : > "$CU_CLAIMS"; fi
+  if declare -F drone_claims >/dev/null; then drone_claims "${1:-}" "${2:-}" > "$CU_CLAIMS"; else : > "$CU_CLAIMS"; fi
 }
 
 # cu_collisions <task|-> <modules> — the tasks a drone on <task> working in <modules> would collide with:
 # a task in an active status sharing a module, other than the task itself, its ancestors and its
 # subtasks, and not an epic (a task with subtasks); plus the tasks living drones hold in a shared
-# module, whatever their status. One line each: id, status, front, shared modules, name, drones.
+# module, whatever their status, unless the cache has the task closed. One line each: id, status,
+# front, shared modules, name, drones.
 cu_collisions() {
   local reg=$CU_REGISTRY; [ -f "$reg" ] || reg=/dev/null
-  awk -F'\t' -v self="$1" -v want="$2" -v active="|$(cu_statuses active | paste -sd'|')|" -v claims="$CU_CLAIMS" '
+  awk -F'\t' -v self="$1" -v want="$2" -v active="|$(cu_statuses active | paste -sd'|')|" -v claims="$CU_CLAIMS" \
+      -v closed="|$(cu_statuses closed | paste -sd'|')|" '
     function shared(mods,   n, a, i, out) { n = split(mods, a, ","); out = ""
       for (i = 1; i <= n; i++) if (a[i] != "" && index("," want ",", "," a[i] ",") && !index("," out ",", "," a[i] ",")) out = out (out == "" ? "" : ",") a[i]
       return out }
@@ -461,7 +488,7 @@ cu_collisions() {
         if (related(id) || (id in haschild) || !index(active, "|" status[id] "|")) continue
         s = shared(mods[id]); if (s != "") hit[id] = s }
       for (j = 1; j <= nc; j++) { id = ctask[j]
-        if (id == "" || related(id)) continue
+        if (id == "" || related(id) || ((id in status) && index(closed, "|" status[id] "|"))) continue
         s = shared(cmods[j]); if (s == "") continue
         hit[id] = (id in hit) ? union(hit[id], s) : s
         drones[id] = drones[id] (drones[id] == "" ? "" : ",") cdrone[j] " (front " cfront[j] ")" }
@@ -508,22 +535,28 @@ Wait for them, or once you checked the work does not clash add one line per task
 
 # --- the 'hive task' gate -----------------------------------------------------
 
-CU_GATE_MSG="" CU_GATE_TASK="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_CHECKED="" CU_SETTLED="" CU_CLAIMS=""
+CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_CHECKED="" CU_SETTLED="" CU_CLAIMS=""
 # cu_gate <drone> <task> <brief> <front> — may <drone> of <front> start on <task>? 0 yes, 1 no with
 # CU_GATE_MSG saying what to fix. ClickUp being down lets the brief through with CU_GATE_MSG as a
-# warning (an outage must not stop the swarm); collisions are then counted on the cache and on the
-# living drones. Leaves the task in CU_GATE_TASK and CU_UP=1 when ClickUp answered.
+# warning (an outage must not stop the swarm); collisions are then counted on the cache as it is and
+# on the drones at work. ClickUp gets CU_GATE_BUDGET seconds for the token and the task: a network
+# that drops packets must not hold the coordinator for minutes. Leaves the task id in CU_GATE_ID,
+# the task in CU_GATE_TASK and CU_UP=1 when ClickUp answered.
 cu_gate() {
   local drone=$1 id=$2 brief=$3 front=$4 rc mine fronts areas col warn=""
-  CU_UP=0 CU_GATE_TASK="" CU_GATE_MSG=""
+  CU_UP=0 CU_GATE_TASK="" CU_GATE_ID=$id CU_GATE_MSG=""
   cu_init 2>/dev/null || { CU_GATE_MSG=$(cu_init 2>&1); return 1; }
   cu_brief_header "$brief" || return 1
   mine=$(cu_front_tag "$front" 2>&1) || { CU_GATE_MSG="front $front has no tag in $CU_TAXONOMY: $mine"; return 1; }
-  if cu_ready; then CU_GATE_TASK=$(cu_task "$id" 2>/dev/null); rc=$?; else rc=2; fi
+  cu_tmpdir || { CU_GATE_MSG="cannot create a private directory"; return 1; }
+  CU_DEADLINE=$(( $(date +%s) + CU_GATE_BUDGET ))
+  if cu_ready; then CU_GATE_TASK=$(cu_task "$id" 2>"$CU_TMP/gate.err"); rc=$?; else rc=2; fi
+  CU_DEADLINE=""
   case "$rc" in
     0) CU_UP=1 ;;
     3) CU_GATE_MSG="ClickUp task $id does not exist — find the right one: hive ct find <words>"; return 1 ;;
-    *) warn="ClickUp unreachable — task $id not checked, collisions counted on the cache and the living drones" ;;
+    1) CU_GATE_MSG="ClickUp refused to show task $id: $(tail -1 "$CU_TMP/gate.err" | sed 's/^clickup: //')"; return 1 ;;
+    *) warn="ClickUp unreachable — task $id not checked, collisions counted on the cache$([ -f "$CU_REGISTRY" ] || echo ' (there is none)') and the drones at work; the start writes wait for clickup-sync" ;;
   esac
   if [ "$CU_UP" = 1 ]; then
     if [ "$(cu_jq "$CU_GATE_TASK" closed)" = true ]; then
@@ -541,34 +574,66 @@ cu_gate() {
       return 1
     fi
   fi
-  cu_registry_ready 0 2>/dev/null || true
-  cu_claims "$drone"
+  [ "$CU_UP" = 1 ] && { cu_registry_ready 0 2>/dev/null || true; }
+  cu_claims "$front" "$drone"
   col=$(cu_collisions "$id" "$CU_MODS${CU_IMPACT:+,$CU_IMPACT}")
   cu_settle "$col" || return 1
   CU_GATE_MSG=$warn
 }
 
-# cu_started <drone> <front> <title> — after the brief is installed: the brief's modules the task
-# lacks are added to it, an early status moves to status_start, the task gets a start comment, and
-# every settled collision a comment on both tasks. Warns, never fails.
+# cu_started <drone> <front> <title> — after the brief is installed: its start writes (cu_start_apply)
+# go to the start queue, and right away to ClickUp when it answered the gate. Those ClickUp fails on,
+# or all of them while it is down, wait in the queue for clickup-sync. Warns, never fails.
 cu_started() {
-  local drone=$1 front=$2 title=$3 id status cid reason shared m add=""
+  local at tmp f
+  at=$(date +%s)
+  mkdir -p "$CU_STARTS" && tmp=$(mktemp "$CU_STARTS/.start.XXXXXX") \
+    || { cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
+  f="$CU_STARTS/$at.${tmp##*.}.json"   # oldest first in a listing
+  jq -n --arg drone "$1" --arg front "$2" --arg title "$3" --arg task "$CU_GATE_ID" --arg mods "$CU_MODS" \
+        --arg impact "$CU_IMPACT" --arg settled "$CU_SETTLED" --arg at "$at" \
+        '{drone: $drone, front: $front, task: $task, title: $title, modules: $mods, impact: $impact, settled: $settled, at: $at}' > "$tmp" \
+    && mv -f "$tmp" "$f" || { rm -f "$tmp"; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
   [ "$CU_UP" = 1 ] || return 0
-  id=$(jq -r .id <<<"$CU_GATE_TASK"); status=$(cu_status_of "$CU_GATE_TASK")
-  for m in ${CU_MODS//,/ }; do add+="$(cu_tag module "$m")"$'\n'; done
-  cu_tags_change "$CU_GATE_TASK" "$add" "" || cu_say "could not add the brief's modules to $id"
-  if cu_status_is "$status" early; then
-    cu_set_status "$CU_GATE_TASK" "$(cu_statuses start | head -1)" || cu_say "could not move $id to '$(cu_statuses start | head -1)'"
+  cu_start_apply "$f"
+  if [ "$?" = 2 ]; then cu_say "ClickUp failed — clickup-sync retries the start writes of $CU_GATE_ID"; else rm -f "$f"; fi
+}
+
+# cu_start_apply <file> — the start writes of a queued brief: the brief's modules the task lacks are
+# added to it, an early status moves to status_start, the task gets a start comment (marked
+# hive-start:<drone>:<time>: a replay never doubles it) and every settled collision a comment on both
+# tasks. 0 done, 2 when ClickUp failed on a write (worth a retry), 1 when there is nothing to retry:
+# the record is unreadable or the task cannot be read.
+cu_start_apply() {
+  local drone front id title mods impact at settled json st m add="" cid reason shared marker rc
+  IFS=$'\037' read -r drone front id title mods impact at \
+    < <(jq -r '[.drone, .front, .task, .title, .modules, .impact, .at] | join("\u001f")' "$1" 2>/dev/null)
+  [ -n "$id" ] && [ -n "$at" ] || { cu_say "unreadable start record $1"; return 1; }
+  settled=$(jq -r .settled "$1")
+  json=$(cu_task "$id" 2>/dev/null); rc=$?
+  case "$rc" in
+    0) rc=0 ;;
+    2) return 2 ;;
+    *) cu_say "task $id cannot be read — its start writes are dropped"; return 1 ;;
+  esac
+  for m in ${mods//,/ }; do add+="$(cu_tag module "$m")"$'\n'; done
+  cu_tags_change "$json" "$add" "" || { [ "$?" = 2 ] && rc=2; cu_say "could not add the brief's modules to $id"; }
+  st=$(cu_status_of "$json")
+  if cu_status_is "$st" early; then
+    cu_set_status "$json" "$(cu_statuses start | head -1)" \
+      || { [ "$?" = 2 ] && rc=2; cu_say "could not move $id to '$(cu_statuses start | head -1)'"; }
   fi
-  cu_comment_once "$id" "🤖 drone $drone (front $front) start: $title; modules: ${CU_MODS//,/, }; impact: ${CU_IMPACT:-none}" \
-    || cu_say "could not comment on $id"
+  marker="hive-start:$drone:$at"
+  cu_comment_once "$id" "🤖 drone $drone (front $front) start: $title; modules: ${mods//,/, }; impact: ${impact:-none}"$'\n'"$marker" "$marker" \
+    || { [ "$?" = 2 ] && rc=2; cu_say "could not comment on $id"; }
   while IFS=$'\t' read -r cid reason shared; do
     [ -n "$cid" ] || continue
     for m in "$id" "$cid"; do
       cu_comment_once "$m" "🤖 collision checked: drone $drone (front $front) on $id works in modules ${shared//,/, } of $cid as well: $reason" \
-        || cu_say "could not comment on $m"
+        || { [ "$?" = 2 ] && rc=2; cu_say "could not comment on $m"; }
     done
-  done <<<"$CU_SETTLED"
+  done <<<"$settled"
+  return "$rc"
 }
 
 # --- hive ct ------------------------------------------------------------------
@@ -720,7 +785,7 @@ ct_check() {  # check --module M[,M] [--impact M[,M]] [--task ID]
   cu_tmpdir || exit 1
   cu_registry_ready 0 || true
   cu_ready 2>/dev/null && CU_UP=1
-  cu_claims "${HIVE_DRONE:-}"
+  cu_claims "$(front_label "${HIVE_FRONT:-}")" "${HIVE_DRONE:-}"
   col=$(cu_collisions "$task" "$mods${impact:+,$impact}")
   if [ -z "$col" ]; then echo "check: no collisions in ${mods//,/, }${impact:+ (impact ${impact//,/, })}"; return 0; fi
   echo "check: collisions in ${mods//,/, }${impact:+ (impact ${impact//,/, })}:"

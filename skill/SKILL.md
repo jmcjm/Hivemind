@@ -631,16 +631,24 @@ The gate checks, in order: the task exists (ClickUp answers a task id nobody has
 not 404 — told apart from a rejected token, `OAUTH_025`); it is open; its one front is the briefing
 coordinator's (a task of another front is taken over only on purpose: `hive ct set <id> --front <mine>`);
 it has one area; no collision is left unsettled. Then the brief's modules the task lacks are added to
-it, an early status moves to `status_start`, the task gets a start comment, and the drone's `meta.json`
-records `clickup_task`, `modules` and `impact`. ClickUp being down lets the brief through with a warning
-— an outage must not stop the swarm — with collisions counted on the cache and the living drones.
+it, an early status moves to `status_start`, the task gets a start comment (marked
+`hive-start:<drone>:<time>`), and the drone's `meta.json` records `clickup_task`, `modules` and `impact`.
+ClickUp being down lets the brief through with a warning — an outage must not stop the swarm — with
+collisions counted on the cache as it is and on the drones at work. The gate gives ClickUp 10 seconds
+(token and task), so a network that drops packets holds the coordinator no longer. ClickUp refusing
+the call itself (any other 4xx) refuses the brief with ClickUp's message. The start writes go through
+a queue (`~/.herdr-hive/clickup/starts/`): those ClickUp could not take, all of them while it is down,
+wait there, and `clickup-sync.sh` replays them before the reports; the marker keeps a replay from
+doubling the start comment.
 `HIVE_NO_CLICKUP=1` lets a brief without a task through on purpose. The config's `alias_*` keys add
 names for these lines, e.g. in your own language.
 
 **Collisions.** The modules checked are those of `Modules:` and `Impact:`. Another task collides when it
 is in an active status (`status_active`), shares a module, is not the task itself, an ancestor or a
 subtask, and is not an epic (a task with subtasks; epics gather work and would always collide). Every
-living drone of every front counts too, with the modules of its brief, whatever its task's status. Each
+drone at work, in every front, counts too, with the modules of its brief, whatever its task's open
+status. A drone is not at work when its pane is dead, when the cache has its task closed, or when
+its report, newer than its brief, says `DONE` or `FAILED`; a `BLOCKED` drone still holds its modules. Each
 collision is listed with its status, front, shared modules, drone and PRs. The only way through is one
 line per colliding task, with a reason:
 ```
@@ -670,7 +678,9 @@ characters, pointing at the report; ClickUp itself takes 40000) — and sets the
 `complete` mean `status_done`; with `status_unverified` set, `status_done` without a `## Prod` section
 lands there instead, unless the task carries the `verify_exempt` tag (an analysis is done once
 delivered). A closed task is never reopened. The comment ends with `hive-report:<drone>:<mtime>`, looked
-for before commenting, so a lost state never doubles it; `flock` keeps the hook and the timer apart. The
+for before commenting and again before a retry of the comment (an attempt that timed out may have
+landed), so neither a lost state nor a lost answer doubles it; `flock` keeps the hook and the timer
+apart. The
 coordinator gets a `CLICKUP` letter only when a person is needed: no section, no task, a task that does
 not exist, a status the list lacks, `status_done` lowered for want of `## Prod`, ClickUp failing (once;
 the report is retried on every run). Reports in an older format (with an `applied:` line) and those of

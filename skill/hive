@@ -444,19 +444,25 @@ brief_title() {
   printf '%s\n' "${t:0:120}"
 }
 
-# drone_claims [except] — the living drones of every front that hold a ClickUp task, one a line:
-# front, drone, task, the modules of its brief (its impact included). clickup.sh counts collisions
-# on them: a drone at work keeps its modules even when somebody moved its task on in ClickUp.
+# drone_claims [except-front except-drone] — the drones of every front at work on a ClickUp task, one
+# a line: front, drone, task, the modules of its brief (its impact included). clickup.sh counts
+# collisions on them: a drone at work keeps its modules even when somebody moved its task on in
+# ClickUp. A dead drone holds nothing, nor does one whose report, newer than its brief, says it is
+# DONE or FAILED; a BLOCKED one still holds its modules.
 drone_claims() {
-  local f m name pane task mods
+  local f m d name pane task mods
   for f in $(front_names); do
     for m in "$(front_dir "$f")"/drones/*/meta.json; do
       [ -f "$m" ] || continue
       IFS=$'\t' read -r pane task mods < <(jq -r 'select((.clickup_task // "") != "" and (.modules // "") != "")
         | [(.pane_id // "-"), .clickup_task, ([.modules, .impact // ""] | map(select(. != "")) | join(","))] | @tsv' "$m" 2>/dev/null) \
         || continue
-      name=$(basename "$(dirname "$m")")
-      [ "$name" != "${1:-}" ] && [ "$(pane_status "$pane")" != dead ] || continue
+      d=$(dirname "$m"); name=$(basename "$d")
+      [ "$f" = "${1:-}" ] && [ "$name" = "${2:-}" ] && continue
+      [ "$(pane_status "$pane")" != dead ] || continue
+      if [ "$d/report.md" -nt "$d/brief.md" ]; then
+        case "$(grep -m1 -oE '^STATUS:[[:space:]]*[A-Z]+' "$d/report.md")" in *DONE|*FAILED) continue ;; esac
+      fi
       printf '%s\t%s\t%s\t%s\n' "$f" "$name" "$task" "$mods"
     done
   done
@@ -3252,7 +3258,7 @@ hive — command a swarm of Claude Code agents in herdr
                                      a 'Rules: <blocks>' line (expanded from ~/.herdr-hive/rules)
                                      or a '## Boundaries' section; with ClickUp tracking on also
                                      'ClickUp: <id>', 'Modules: <m,...>' and 'Impact: <m,...|none>'
-  hive say    <name> <text>         ad-hoc message to a drone
+  hive say    <name> <text>          ad-hoc message to a drone
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
   hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all | <front>:coord | <front>:<drone>)
                                      + drone wake-up / watcher notice (coord)

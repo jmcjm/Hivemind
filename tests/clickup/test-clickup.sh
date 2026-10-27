@@ -131,6 +131,7 @@ module	mod-api	the API		default
 module	mod-web	the web app		web
 module	mod-db	the database		default
 module	mod-infra	infrastructure		default
+module	mod-docs	documentation		default
 area	area-billing	billing	epbill1	default
 area	area-search	search		web
 area	area-other	other		default
@@ -146,6 +147,22 @@ mktask thold01 "on hold" "front-default,area-other,mod-db" "Database: vacuum sch
 mktask ttwo001 backlog "front-default,area-billing,area-other,mod-db" "Task with two areas"
 mktask tsub001 ready "front-default,area-billing,mod-db" "Invoices: rounding subtask" tref001
 mktask tana001 backlog "front-default,area-other,mod-infra,type-analysis" "Analysis: cluster costs"
+
+# =============================================================================
+section "config"
+cp "$CU/config" "$T/config.good"
+printf 'pk_fake_SECRET_TOKEN\n' > "$T/tok="
+grep -v '^token_cmd' "$T/config.good" > "$CU/config"; echo "token_cmd = cat $T/tok=" >> "$CU/config"
+run "$HIVE" ct show tinv001
+eq "a value ending in '=' keeps it" 0 "$RC"
+grep -v '^space' "$T/config.good" > "$CU/config"
+mkdrone d0c p0c working
+brief "$T/b0c" "# No space" "ClickUp: tref001" "Modules: api" "Impact: none"
+run "$HIVE" task d0c "$T/b0c"
+eq "a config without a key refuses the brief" 1 "$RC"
+has "saying which key" "has no 'space'" "$ERR"
+eq "and leaves no staged brief" no "$([ -e "$HIVE_DIR/drones/d0c/.brief.staged" ] && echo yes || echo no)"
+cp "$T/config.good" "$CU/config"; rm -f "$FAKE_PANES/p0c.status"
 
 # =============================================================================
 section "taxonomy: only known tags"
@@ -176,6 +193,12 @@ eq "a front without such tasks" "no candidates" "$OUT"
 eq "the cache is written" 1 "$(grep -c '^tsrch01' "$CU/registry.tsv")"
 n=$(nrequests); run "$HIVE" ct find rounding
 eq "a fresh cache is searched without asking ClickUp" "$n" "$(nrequests)"
+touch -d '-1 hour' "$CU/registry.tsv"; touch "$FAKE_CU/down"
+run "$HIVE" ct find rounding
+eq "ClickUp down: a stale cache is searched all the same" "0" "$RC"
+has "finding what it holds" "tinv001" "$OUT"
+has "with a warning" "using the cache" "$ERR"
+rm -f "$FAKE_CU/down"
 
 # =============================================================================
 section "ct new"
@@ -223,6 +246,9 @@ eq "status, area, modules and parent" "ready area-other,front-default,mod-db epb
 has "and the comment" "a note" "$(comments_of tset001)"
 run "$HIVE" ct set tset001 --comment "a note"
 eq "the same comment is not added twice" 1 "$(ncomments tset001)"
+echo 1 > "$FAKE_CU/lost"
+run "$HIVE" ct set tset001 --comment "landed once"
+eq "a comment whose answer was lost (500) is not posted again on the retry" "0 1" "$RC $(comments_of tset001 | grep -c 'landed once')"
 run "$HIVE" ct set tset001 --type analysis
 has "--type sets the type" "type-analysis" "$(tags_of tset001)"
 run "$HIVE" ct set tset001 --type none
@@ -264,6 +290,40 @@ has "and is named" "drone w-live (front web)" "$OUT"
 echo dead > /dev/null; rm -f "$FAKE_PANES/pw1.status"
 run "$HIVE" ct check --module infra
 eq "a dead drone holds nothing" 0 "$RC"
+claim() {  # claim <drone> <pane> <front> <task> <modules> [report STATUS] — a drone at work on a task, its brief an hour old
+  local d="$HIVE_DIR/fronts/$3/drones/$1"; [ "$3" = default ] && d="$HIVE_DIR/drones/$1"
+  mkdrone "$1" "$2" working "$([ "$3" = default ] || echo "$3")"
+  jq --arg t "$4" --arg m "$5" '. + {clickup_task: $t, modules: $m, impact: ""}' "$d/meta.json" > "$T/m" && mv "$T/m" "$d/meta.json"
+  echo "# brief" > "$d/brief.md"; touch -d '-1 hour' "$d/brief.md"; rm -f "$d/report.md"
+  [ -z "${6:-}" ] || printf 'STATUS: %s\n## Result\nx\n' "$6" > "$d/report.md"
+}
+claim c-done pc1 default tinv002 infra DONE
+run "$HIVE" ct check --module infra
+eq "a drone whose report after its brief says DONE holds nothing" 0 "$RC"
+claim c-done pc1 default tinv002 infra FAILED
+run "$HIVE" ct check --module infra
+eq "nor FAILED" 0 "$RC"
+claim c-done pc1 default tinv002 infra BLOCKED
+run "$HIVE" ct check --module infra
+has "a BLOCKED one still holds its modules" "c-done (front default)" "$OUT"
+claim c-done pc1 default tinv002 infra DONE; touch -d '-2 hours' "$HIVE_DIR/drones/c-done/report.md"
+run "$HIVE" ct check --module infra
+has "a DONE report older than the brief is the previous task's: the drone holds the new one" "c-done (front default)" "$OUT"
+rm -f "$FAKE_PANES/pc1.status"
+claim c-shut pc2 default told001 infra
+run "$HIVE" ct check --module infra
+eq "a drone whose task the cache has closed holds nothing" 0 "$RC"
+rm -f "$FAKE_PANES/pc2.status"
+claim c-anc pc3 default tref001 docs
+run "$HIVE" ct check --module docs --task tsub001
+eq "a drone on an ancestor of the task does not collide" 0 "$RC"
+rm -f "$FAKE_PANES/pc3.status"
+claim twin pc4 web tinv002 docs
+run env HIVE_DRONE=twin "$HIVE" ct check --module docs
+has "the caller is left out by front and name: its namesake in another front still counts" "twin (front web)" "$OUT"
+run env HIVE_DRONE=twin HIVE_FRONT=web "$HIVE" ct check --module docs
+eq "the caller itself does not" 0 "$RC"
+rm -f "$FAKE_PANES/pc4.status"
 echo working > "$FAKE_PANES/pw1.status"
 
 # =============================================================================
@@ -335,6 +395,19 @@ brief "$T/b2" "# Analysis" "ClickUp: tana001" "Modules: infra, db" "Impact: none
 run "$HIVE" task d2 "$T/b2"
 eq "passes once settled" 0 "$RC"
 eq "the brief's modules the task lacked are added to it" "area-other,front-default,mod-db,mod-infra,type-analysis" "$(tags_of tana001)"
+eq "start writes ClickUp took leave nothing queued" 0 "$(ls "$CU/starts" | wc -l)"
+mktask trev001 "in review" "front-default,area-other,mod-docs" "Docs: in review already"
+mkdrone d4 p4 working
+brief "$T/b4r" "# Docs" "ClickUp: trev001" "Modules: docs" "Impact: none"
+run "$HIVE" task d4 "$T/b4r"
+eq "a start leaves a later status alone" "0 in review" "$RC $(task_field trev001 .status.status)"
+has "and comments all the same" "drone d4 (front default) start: Docs" "$(comments_of trev001)"
+has "with its marker" "hive-start:d4:" "$(comments_of trev001)"
+echo 1 > "$FAKE_CU/refuse"
+run "$HIVE" task d4 "$T/b4r"
+eq "ClickUp refusing the task (a 4xx) refuses the brief" 1 "$RC"
+has "with ClickUp's word" "HTTP 400 (Bad request INPUT_002)" "$ERR"
+rm -f "$FAKE_PANES/p4.status"
 section "hive task: ClickUp down"
 mkdrone d3 p3 working
 touch "$FAKE_CU/down"
@@ -343,11 +416,33 @@ run "$HIVE" task d3 "$T/b3"
 eq "collisions are counted on the cache and the living drones" 1 "$RC"
 has "the living drone d1 holds api" "d1 (front default)" "$ERR"
 brief "$T/b3" "# Down" "ClickUp: thold01" "Modules: web" "Impact: none" "Collision checked: tsrch01 — ui only"
+n=$(grep -c '/team/' "$FAKE_CU/curl.argv")
 run "$HIVE" task d3 "$T/b3"
 eq "without a collision the brief passes" 0 "$RC"
 has "with a warning" "ClickUp unreachable" "$ERR"
+eq "the cache is not refreshed while ClickUp is down" "$n" "$(grep -c '/team/' "$FAKE_CU/curl.argv")"
 eq "the drone holds its task all the same" "thold01" "$(meta_of d3 clickup_task)"
+eq "its start writes are queued" 1 "$(ls "$CU/starts" | wc -l)"
+cp "$CU"/starts/*.json "$T/start.json"
 rm -f "$FAKE_CU/down"
+sync_now
+has "clickup-sync makes them once ClickUp is back: the modules" "mod-web" "$(tags_of thold01)"
+has "the start comment" "drone d3 (front default) start: Down; modules: web" "$(comments_of thold01)"
+has "the collision comment" "on thold01 works in modules web of tsrch01 as well: ui only" "$(comments_of tsrch01)"
+eq "a status past the early ones stays" "on hold" "$(task_field thold01 .status.status)"
+eq "and the queue is empty" 0 "$(ls "$CU/starts" | wc -l)"
+cp "$T/start.json" "$CU/starts/"; n=$(ncomments thold01); sync_now
+eq "a replay of the same start adds nothing (its marker)" "$n" "$(ncomments thold01)"
+eq "and leaves the queue" 0 "$(ls "$CU/starts" | wc -l)"
+section "hive task: a network that drops packets"
+touch "$FAKE_CU/hang"
+mkdrone d5 p5 working
+brief "$T/b5" "# Hang" "ClickUp: tana001" "Modules: docs" "Impact: none" "Collision checked: trev001 — other pages"
+s=$SECONDS; run timeout 200 "$HIVE" task d5 "$T/b5"; took=$((SECONDS - s))
+eq "the gate lets the brief through" 0 "$RC"
+eq "within its budget, not minutes" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
+has "with the warning" "ClickUp unreachable" "$ERR"
+rm -f "$FAKE_CU/hang" "$CU"/starts/*.json "$FAKE_PANES/p5.status"
 section "hive task: HIVE_NO_CLICKUP"
 n=$(nrequests)
 brief "$T/b4" "# Helper" "Look around."
@@ -357,10 +452,19 @@ eq "and the drone holds no task any more" "" "$(meta_of d3 clickup_task)"
 
 # =============================================================================
 section "clickup-sync"
+mktask tbase01 "in progress" "front-default,area-other,mod-docs" "Baseline"
+mkdrone s0 ps0 idle
+jq '. + {clickup_task: "tbase01"}' "$HIVE_DIR/drones/s0/meta.json" > "$T/m" && mv "$T/m" "$HIVE_DIR/drones/s0/meta.json"
+report s0 "STATUS: DONE" "## Result" "Old." "## ClickUp" "task: tbase01" "status: in review" "comment: old news"
+touch -d '-2 days' "$HIVE_DIR/drones/s0/report.md"
+rm -f "$CU/sync.state"; sync_now
+eq "first run: a report older than 24 h is recorded without a call" "0 in progress" "$(ncomments tbase01) $(task_field tbase01 .status.status)"
+has "and not looked at again" "$HIVE_DIR/drones/s0/report.md" "$(cat "$CU/sync.state")"
 mkdrone s1 ps1 idle
 jq '. + {clickup_task: "tinv001"}' "$HIVE_DIR/drones/s1/meta.json" > "$T/m" && mv "$T/m" "$HIVE_DIR/drones/s1/meta.json"
 report s1 "STATUS: DONE" "## Result" "Rounding fixed." "## ClickUp" "task: tinv001" "status: in review" "comment: rounding fixed, PR open" \
   "pr: https://example.com/pr/1" "pr: https://example.com/pr/2" "branch: tinv001-rounding"
+nl=$(subjects | wc -l)
 sync_now
 C=$(comments_of tinv001)
 eq "the status is applied" "in review" "$(task_field tinv001 .status.status)"
@@ -371,11 +475,19 @@ has "the Result section" "Rounding fixed." "$C"
 has "and the marker" "hive-report:s1:" "$C"
 has "a line in the log" "applied default/s1 tinv001" "$(cat "$CU/sync.log")"
 has "the outcome for drone-ping" "tinv001 → in review ✓" "$(cat "$HIVE_DIR/drones/s1/.clickup-sync")"
-hasnt "no letter for a success" "s1" "$(subjects)"
+eq "no letter for a success" "$nl" "$(subjects | wc -l)"
 n=$(ncomments tinv001); sync_now
 eq "a second run adds nothing" "$n" "$(ncomments tinv001)"
 : > "$CU/sync.state"; sync_now
 eq "nor does a run after the state was lost (the marker)" "$n" "$(ncomments tinv001)"
+report s1 "STATUS: DONE" "## Result" "Again." "## ClickUp" "task: tinv001" "status: in review" "comment: two syncs at once"
+echo 0.3 > "$FAKE_CU/slow"; n=$(ncomments tinv001)
+sync_now & sync_now; wait
+rm -f "$FAKE_CU/slow"
+eq "two syncs at once comment once (the lock)" "$((n + 1))" "$(ncomments tinv001)"
+report s1 "STATUS: DONE" "## Result" "Again." "## ClickUp" "task: tinv001" "status: in review" "comment: answer lost"
+echo 1 > "$FAKE_CU/lost"; n=$(ncomments tinv001); sync_now
+eq "a report comment whose answer was lost (500) is not posted again" "$((n + 1))" "$(ncomments tinv001)"
 report s1 "STATUS: DONE" "## Result" "Deployed." "## ClickUp" "task: tinv001" "status: done" "comment: deployed"
 sync_now
 eq "done without '## Prod' is lowered" "testing" "$(task_field tinv001 .status.status)"

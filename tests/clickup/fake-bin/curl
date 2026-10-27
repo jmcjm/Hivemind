@@ -5,12 +5,16 @@
 #   space-tags.json      the space's tags;  statuses.json  the list's statuses
 # Like the live API: an unknown task id is 401 OAUTH_027, a bad token 401 OAUTH_025, a comment over
 # 40000 characters 413 COMM_160.
-# Faults: $FAKE_CU/down (connection refused), $FAKE_CU/429 (holds a count of 429 answers to give).
+# Faults: $FAKE_CU/down (connection refused), $FAKE_CU/hang (a network that drops packets: the call
+# hangs until curl's --connect-timeout or --max-time, or 300 s without them), $FAKE_CU/429 (holds a
+# count of 429 answers to give), $FAKE_CU/lost (a count of comment POSTs that land but answer 500, as
+# when the answer is lost), $FAKE_CU/refuse (a count of 400 answers to give), $FAKE_CU/slow (seconds
+# every request takes).
 # argv of every call goes to $FAKE_CU/curl.argv; every request to $FAKE_CU/requests.log.
 set -u
 D=${FAKE_CU:?}
 printf '%s\n' "$*" >> "$D/curl.argv"
-method=GET hdrout=/dev/null out=/dev/stdout wfmt="" data="" auth="" url=""
+method=GET hdrout=/dev/null out=/dev/stdout wfmt="" data="" auth="" url="" limit=300
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method=$2; shift 2 ;;
@@ -19,12 +23,15 @@ while [ $# -gt 0 ]; do
     -w) wfmt=$2; shift 2 ;;
     -H) case "$2" in @*) auth=$(cat "${2#@}") ;; esac; shift 2 ;;
     --data-binary) data=$(cat "${2#@}"); shift 2 ;;
-    --max-time) shift 2 ;;
+    --max-time|--connect-timeout) [ "$2" -lt "$limit" ] && limit=$2; shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
 done
 [ -e "$D/down" ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }
+[ -e "$D/hang" ] && { sleep "$limit"; echo "curl: (28) Connection timed out" >&2; exit 28; }
+[ -s "$D/slow" ] && sleep "$(cat "$D/slow")"
+exec 7>"$D/.lock"; flock 7   # one request at a time: two writers must not lose each other's write
 path=${url#https://api.clickup.com/api/v2}; query=""
 case "$path" in *\?*) query=${path#*\?}; path=${path%%\?*} ;; esac
 printf '%s %s %s\n' "$method" "$path" "$data" >> "$D/requests.log"
@@ -37,6 +44,7 @@ reply() {  # reply <code> <json>
 # ClickUp answers a task id nobody has with 401 OAUTH_027, not 404 (checked on the live API).
 missing() { reply 401 '{"err":"Team not authorized","ECODE":"OAUTH_027"}'; }
 if [ -s "$D/429" ] && [ "$(cat "$D/429")" -gt 0 ]; then echo $(( $(cat "$D/429") - 1 )) > "$D/429"; reply 429 '{"err":"Rate limit reached"}'; fi
+if [ -s "$D/refuse" ] && [ "$(cat "$D/refuse")" -gt 0 ]; then echo $(( $(cat "$D/refuse") - 1 )) > "$D/refuse"; reply 400 '{"err":"Bad request","ECODE":"INPUT_002"}'; fi
 [ "$auth" = "Authorization: pk_fake_SECRET_TOKEN" ] || reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}'
 now=$(( $(date +%s) * 1000 ))
 T="$D/tasks"; C="$D/comments"; mkdir -p "$T" "$C"
@@ -52,6 +60,7 @@ case "$method $path" in
     [ -f "$C/$id.json" ] || echo '[]' > "$C/$id.json"
     jq --argjson b "$data" --arg n "$now" '[{id: ("c" + $n + (length|tostring)), comment_text: $b.comment_text, date: $n, user: {username: "tester"}}] + .' \
       "$C/$id.json" > "$C/$id.tmp" && mv "$C/$id.tmp" "$C/$id.json"
+    if [ -s "$D/lost" ] && [ "$(cat "$D/lost")" -gt 0 ]; then echo $(( $(cat "$D/lost") - 1 )) > "$D/lost"; reply 500 '{"err":"Internal"}'; fi
     reply 200 '{"id":"c1"}' ;;
   "POST /task/"*/tag/*|"DELETE /task/"*/tag/*)
     id=${path#/task/}; id=${id%%/*}; tag=$(printf '%b' "${path##*/tag/}" | sed 's/%20/ /g')

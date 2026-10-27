@@ -20,6 +20,7 @@
 # First run (no state): reports older than HIVE_CLICKUP_SYNC_SINCE seconds (default 24 h) are recorded
 # without a word, and so is every report in the format from before this sync (an 'applied:' line).
 # Reports of drones without a ClickUp task in their meta.json and of muted drones are skipped.
+# Before the reports it replays the start writes 'hive task' could not make (clickup/starts).
 set -uo pipefail
 
 HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
@@ -128,7 +129,7 @@ sync_report() {
   case "$rc" in
     0) ;;
     2) return 2 ;;
-    *) cu_comment "$task" "$(report_comment "$shown" "$note")" || return 2 ;;
+    *) cu_comment "$task" "$(report_comment "$shown" "$note")" "$marker" || return 2 ;;
   esac
   if [ -n "$setto" ]; then cu_set_status "$json" "$setto" || return 2; fi
   log "applied $front/$drone $task: comment${setto:+, status $now -> $setto}${note:+ ($note)}"
@@ -144,6 +145,18 @@ Once production is checked: hive ct set $task --status $done_st --comment \"<wha
   fi
   return 0
 }
+
+# The start writes 'hive task' queued (ClickUp down at the gate, or failing on a write), oldest first,
+# before the reports: a start never lands after the report that ends the work. The first one ClickUp
+# fails on stops the replay; it and the rest wait for the next run.
+for start in "$CU_STARTS"/*.json; do
+  [ -f "$start" ] || continue
+  what=$(jq -r '"\(.front)/\(.drone) \(.task)"' "$start" 2>/dev/null)
+  rc=2; cu_ready && { cu_start_apply "$start" 2>/dev/null; rc=$?; }
+  if [ "$rc" = 2 ]; then log "ClickUp unavailable for the start writes of ${what:-$start} — will retry"; break; fi
+  rm -f "$start"
+  log "start writes $what: $([ "$rc" = 0 ] && echo applied || echo 'dropped (task unreadable)')"
+done
 
 for report in "$HIVE_DIR"/drones/*/report.md "$HIVE_DIR"/fronts/*/drones/*/report.md; do
   [ -f "$report" ] || continue
