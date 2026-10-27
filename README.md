@@ -68,7 +68,7 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.claude/skills/hivemind/SKILL.md` | doctrine for the coordinator, loaded automatically |
 | `~/.claude/skills/hivemind/hive` | swarm CLI (a wrapper around `herdr`) |
 | `~/.claude/skills/hivemind/drone-ping.sh` | drone hook: reports end of turn / needed decision |
-| `~/.claude/skills/hivemind/coord-creed.md` | the eleven coordinator rules — single source of truth |
+| `~/.claude/skills/hivemind/coord-creed.md` | the twelve coordinator rules — single source of truth |
 | `~/.claude/skills/hivemind/coord-creed-inject.sh` | `SessionStart` hook: after a compaction, re-injects the creed + the live board |
 | `~/.claude/skills/hivemind/coord-compact-brief.sh` | `PreCompact` hook: tells the summarizer which coordination state must survive |
 | `~/.claude/skills/hivemind/coord-scope.sh` | shared scoping helper — the coordinator hooks fire in one session only |
@@ -77,6 +77,9 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.claude/skills/hivemind/coord-context-guard.sh` | coordinator `Stop` hook: asks to save the state once the context nears compaction |
 | `~/.claude/skills/hivemind/coord-CLAUDE.md` | the template `install.sh` copies to `~/.herdr-hive/coord/CLAUDE.md` |
 | `~/.claude/skills/hivemind/accounts.conf.example` | commented example of the accounts file — never read by `hive` |
+| `~/.claude/skills/hivemind/clickup.sh`, `clickup-sync.sh` | optional ClickUp task tracking: `hive ct`, the brief's task gate, reports applied to their tasks |
+| `~/.claude/skills/hivemind/clickup.conf.example`, `taxonomy.tsv.example` | commented examples of the ClickUp config and tag taxonomy — never read by `hive` |
+| `~/.herdr-hive/clickup/` | optional, written by you: `config` and `taxonomy.tsv` turn ClickUp tracking on; the sync keeps its cache, state and log here |
 | `~/.local/bin/hive` | symlink so drones have `hive` in PATH |
 | `~/.claude/CLAUDE.md` | the "Hivemind" section — the coordinator's identity |
 | `~/.claude/hooks/herdr-agent-state.sh` | installed by `herdr integration install claude` |
@@ -296,6 +299,16 @@ starting with `Rules:` is one, a list item too, so reword a sentence that starts
 - Delete only literal paths or "${VAR:?}", never a bare variable.
 - Never quote passwords, tokens or keys in a report.
 ```
+
+## Task tracking in ClickUp (optional)
+
+Off unless `~/.herdr-hive/clickup/config` exists. Turned on, every brief names its ClickUp task, the
+modules it works in and the ones it affects; `hive task` refuses a brief whose task is closed, belongs to
+another front or collides with a task in progress in the same modules (unless the brief says why it does
+not clash), and drone reports reach their tasks by themselves — a comment with the result and PRs, and
+the status. Setup: copy `skill/clickup.conf.example` and `skill/taxonomy.tsv.example` to
+`~/.herdr-hive/clickup/config` and `taxonomy.tsv`, fill them in, run `hive ct sync`. Details:
+"Task tracking in ClickUp" in `SKILL.md`. Tests: `tests/clickup/test-clickup.sh` (a fake ClickUp API).
 
 ## Watching outside sources
 

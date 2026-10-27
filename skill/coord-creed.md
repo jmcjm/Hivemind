@@ -1,6 +1,6 @@
 # Coordinator creed
 
-The eleven rules that must survive a compacted context. This file is the single source of truth:
+The twelve rules that must survive a compacted context. This file is the single source of truth:
 `coord-creed-inject.sh` prints it verbatim into the coordinator's context after compaction, and
 `SKILL.md` explains the reasoning behind each rule at length. Edit the discipline here, nowhere else.
 
@@ -38,3 +38,12 @@ The eleven rules that must survive a compacted context. This file is the single 
     coordinator state where you keep it (delete what is stale, add what is new) before ending the turn —
     drones in flight, what each was told, open questions, decisions pending from the user. The summary
     keeps less.
+12. **With ClickUp tracking on, everything about tasks goes through `hive ct`.** (On when
+    `~/.herdr-hive/clickup/config` exists.) Before a brief: `hive ct find` (create only through
+    `hive ct new`, which refuses look-alikes) and `hive ct check --module …`. The brief carries
+    `ClickUp: <id>`, `Modules: …` and `Impact: …|none`; a collision needs its own
+    `Collision checked: <id> — <reason>` line or the brief is refused. A deploy brief states the task's
+    current and target status (done only with a `## Prod` section in the report). Never write to ClickUp
+    any other way: drone reports reach their tasks by themselves (clickup-sync), and a report the sync
+    could not apply comes as a `CLICKUP ✗` letter — settle it by hand, then `hive ct ack <drone> --manual
+    "<what you did>"`.

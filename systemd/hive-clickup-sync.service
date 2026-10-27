@@ -1,0 +1,9 @@
+[Unit]
+Description=hivemind ClickUp sync — applies drone reports to their ClickUp tasks (a no-op without ~/.herdr-hive/clickup/config)
+
+[Service]
+Type=oneshot
+# systemd user sessions get a bare PATH; hive, herdr, jq and the token command usually live outside
+# it (~/.local/bin, linuxbrew). Extend here if yours live elsewhere.
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.claude/skills/hivemind/clickup-sync.sh

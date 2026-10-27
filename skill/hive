@@ -427,7 +427,40 @@ import json,sys
 print(json.load(open('$(drone_meta "$1")')).get('$2',''))" 2>/dev/null
 }
 
+meta_set() {  # meta_set <drone> <key> <value> [<key> <value>...] — string fields, written atomically
+  local meta tmp; meta=$(drone_meta "$1"); shift
+  [ -f "$meta" ] || return 1
+  tmp=$(mktemp "$meta.XXXXXX") || return 1
+  jq --args '. + ([$ARGS.positional as $a | range(0; $a | length; 2) | {($a[.]): $a[. + 1]}] | add // {})' "$@" \
+     < "$meta" > "$tmp" && chmod --reference="$meta" "$tmp" && mv -f "$tmp" "$meta" || { rm -f "$tmp"; return 1; }
+}
+
 pane_of() { meta_get "$1" pane_id; }
+
+# brief_title <file> — the brief's first heading, else its first line; at most 120 characters.
+brief_title() {
+  local t; t=$(grep -m1 -E '^#+[[:space:]]' "$1" | sed -E 's/^#+[[:space:]]*//')
+  [ -n "$t" ] || t=$(grep -m1 -vE '^[[:space:]]*$' "$1")
+  printf '%s\n' "${t:0:120}"
+}
+
+# drone_claims [except] — the living drones of every front that hold a ClickUp task, one a line:
+# front, drone, task, the modules of its brief (its impact included). clickup.sh counts collisions
+# on them: a drone at work keeps its modules even when somebody moved its task on in ClickUp.
+drone_claims() {
+  local f m name pane task mods
+  for f in $(front_names); do
+    for m in "$(front_dir "$f")"/drones/*/meta.json; do
+      [ -f "$m" ] || continue
+      IFS=$'\t' read -r pane task mods < <(jq -r 'select((.clickup_task // "") != "" and (.modules // "") != "")
+        | [(.pane_id // "-"), .clickup_task, ([.modules, .impact // ""] | map(select(. != "")) | join(","))] | @tsv' "$m" 2>/dev/null) \
+        || continue
+      name=$(basename "$(dirname "$m")")
+      [ "$name" != "${1:-}" ] && [ "$(pane_status "$pane")" != dead ] || continue
+      printf '%s\t%s\t%s\t%s\n' "$f" "$name" "$task" "$mods"
+    done
+  done
+}
 
 # --- where a drone lives in herdr --------------------------------------------
 # A drone opens as a tab in its coordinator's workspace: a front is then one workspace in herdr's
@@ -1621,6 +1654,28 @@ cmd_task() {  # task <name> <brief-file>  |  task <name> - (brief from stdin)
   local staged="$dir/.brief.staged"
   if [ "$src" = "-" ]; then cat > "$staged"; else cp "$src" "$staged"; fi || { rm -f "$staged"; die "cannot read the brief: $src"; }
 
+  # Task tracking (clickup.sh) is on when ~/.herdr-hive/clickup/config exists. The brief then names
+  # its task ('ClickUp: <id>'), the modules it works in ('Modules:') and the ones it affects
+  # ('Impact:'). The task must exist, be open, belong to this front, have one area and collide with no
+  # task in progress, unless a 'Collision checked: <id> — <reason>' line says why the work does not
+  # clash. ClickUp being down lets the brief through with a warning: an outage must not stop the
+  # swarm. HIVE_NO_CLICKUP=1 lets a brief through on purpose (a helper with nothing to track).
+  local clickup="" cu_on=0 tracked=0
+  [ -f "$HIVE_DIR/clickup/config" ] && tracked=1
+  if [ "$tracked" = 1 ] && [ "${HIVE_NO_CLICKUP:-0}" != 1 ]; then
+    clickup=$(grep -m1 -oiE '^[[:space:]>*-]*ClickUp:[[:space:]]*(https://app\.clickup\.com/t/[^[:space:])]+|[0-9a-z]{6,})' "$staged" \
+              | sed -E 's/^[^:]*:[[:space:]]*//; s#https://app\.clickup\.com/t/([0-9]+/)?##')
+    if [ -z "$clickup" ]; then
+      rm -f "$staged"
+      die "brief has no 'ClickUp: <task id>' line — find or create the task (hive ct find / hive ct new) and add the line (HIVE_NO_CLICKUP=1 to skip on purpose)"
+    fi
+    # shellcheck source=clickup.sh
+    . "$SKILL_DIR/clickup.sh"
+    cu_on=1
+    if ! cu_gate "$name" "$clickup" "$staged" "$(front_label "$HIVE_FRONT")"; then rm -f "$staged"; die "brief refused: $CU_GATE_MSG"; fi
+    [ -z "$CU_GATE_MSG" ] || echo "task: warning — $CU_GATE_MSG" >&2
+  fi
+
   # Every brief states its boundaries: drones run with bypass permissions and ask about nothing.
   # 'Rules: <blocks>' pulls them from $HIVE_RULES_DIR (rules_expand); a brief with neither the
   # line nor a boundaries section is refused. HIVE_NO_RULES=1 lets one through on purpose.
@@ -1652,12 +1707,43 @@ When the task is finished, WRITE a report to \`$dir/report.md\`:
     <changed/created paths, or "none">
     ## Issues
     <what went wrong, what you need, or "none">
+EOF
+  if [ "$cu_on" = 1 ]; then
+    cat >> "$staged" <<EOF
+    ## ClickUp
+    task: $clickup
+    status: <the status you propose for the task: one of its list's statuses>
+    comment: <1-3 sentences for the task: what changed, PR/commit/deploy, what is next>
+    pr: <pull request URL — one line each, optional>
+    branch: <branch name — optional>
+    ## Prod
+    <what you checked in production after the deploy: image version, query, result — required
+     with status: $(cu_statuses done | head -1)>
+
+The ClickUp section is mandatory. Never write to ClickUp yourself: the moment the report is written,
+hive applies it to the task (comment, PRs, status). Your only ClickUp commands are 'hive ct show',
+'hive ct find', 'hive ct check' and 'hive ct new'.
+Before you start, read the task's history — its description and latest comments: 'hive ct show $clickup'.
+Name a new branch '$clickup-<short-slug>'.
+If you find you must change a module outside the brief's 'Modules:' line, first run
+'hive ct check --module <module> --task $clickup'. On a collision stop and tell the coordinator
+('hive send coord') before you commit anything in that module.
+EOF
+  fi
+  cat >> "$staged" <<EOF
 
 The report is the only channel to the coordinator — nobody reads your terminal.
 Without a written report the task counts as not done.
 If you get stuck or need something: write a report with STATUS: BLOCKED and describe what you need.
 EOF
   mv -f "$staged" "$dir/brief.md" || die "cannot install the brief for $name"
+  if [ "$cu_on" = 1 ]; then
+    cu_started "$name" "$(front_label "$HIVE_FRONT")" "$(brief_title "$dir/brief.md")"
+    meta_set "$name" clickup_task "$clickup" modules "$CU_MODS" impact "$CU_IMPACT" \
+      || echo "task: warning — could not record task $clickup in meta.json" >&2
+  elif [ "$tracked" = 1 ]; then
+    meta_set "$name" clickup_task "" modules "" impact ""   # an untracked brief holds no task
+  fi
 
   # The previous report is archived, not deleted: it is often the input to the next turn (the
   # drone's own plan), and deleting it cut the drone off from its own conclusions.
@@ -2429,10 +2515,22 @@ cmd_revive() {  # revive <name> [--account NAME] — resurrects a drone with its
 
 # --- fronts: commands -------------------------------------------------------
 
+# move_task_front <drone> <from> <to> — the moved drone's ClickUp task is handed to its new front,
+# with a comment saying so. A failure only warns: the drone has moved already.
+move_task_front() {
+  local task; task=$(meta_get "$1" clickup_task)
+  [ -n "$task" ] && [ -f "$HIVE_DIR/clickup/config" ] || return 0
+  # shellcheck source=clickup.sh
+  ( . "$SKILL_DIR/clickup.sh"
+    cu_ready && tag=$(cu_front_tag "$3") && json=$(cu_task "$task") && cu_set_front "$json" "$tag" "hive move $1 (front $2 -> $3)" ) \
+    || echo "move: warning — ClickUp task $task still belongs to front $2: hive --front $3 ct set $task --front $3" >&2
+}
+
 # Moving a drone hands it to another front's coordinator. Its directory (brief, reports, sweep
 # history) and its mailbox go along, and a living drone is restarted there with --resume: its
 # environment names its front, and a running process cannot be given another environment. Its
 # conversation survives the restart; only the paths it was told change, and it is told the new ones.
+# With task tracking on, its ClickUp task goes to the new front too (move_task_front).
 cmd_move() {  # move <drone> <front> [--force]
   local force=0 a
   local -a pos=()
@@ -2505,6 +2603,7 @@ PY
   fi
   front_use "$to"
   echo "move: $name  front $from -> $to"
+  move_task_front "$name" "$from" "$to"
   if [ "$live" = 0 ]; then
     echo "move: $name was not running — bring it back in its new front: hive --front $to revive $name"
     return 0
@@ -3137,6 +3236,9 @@ case "${1:-}" in
   unblock) shift; cmd_unblock "$@" ;;
   sweep)  shift; cmd_sweep  "$@" ;;
   gate)   shift; cmd_gate   "$@" ;;
+  ct)     shift
+          # shellcheck source=clickup.sh
+          . "$SKILL_DIR/clickup.sh"; ct_main "$@" ;;
   usage)  shift; cmd_usage  "$@" ;;
   accounts) shift; cmd_accounts "$@" ;;
   _usage-parse) shift; accounts_py parse "${1:?missing panel file}" ${2:+"$2"} ;;   # internal, for tests/accounts
@@ -3148,8 +3250,9 @@ hive — command a swarm of Claude Code agents in herdr
                                      a named account without room is refused unless --force
   hive task   <name> <file|->        send a brief (file or stdin) + report protocol; the brief needs
                                      a 'Rules: <blocks>' line (expanded from ~/.herdr-hive/rules)
-                                     or a '## Boundaries' section
-  hive say    <name> <text>          ad-hoc message to a drone
+                                     or a '## Boundaries' section; with ClickUp tracking on also
+                                     'ClickUp: <id>', 'Modules: <m,...>' and 'Impact: <m,...|none>'
+  hive say    <name> <text>         ad-hoc message to a drone
   hive clear  <name>                 clear the drone's input field (when foreign text hangs there)
   hive send   <to> <subject> [--body T] swarm mail (to: coord | drone | all | <front>:coord | <front>:<drone>)
                                      + drone wake-up / watcher notice (coord)
@@ -3177,6 +3280,16 @@ hive — command a swarm of Claude Code agents in herdr
   hive sweep                         reconciliation pass: retry lost wake-ups, surface silent drones
                                      (a systemd user timer runs it every 5 min — install.sh sets it up)
   hive gate   <enter|release|status|queue> [desc]  one exclusive machine window for full gates (flock-backed)
+
+ClickUp task tracking — on when ~/.herdr-hive/clickup/config exists ('hive ct help' for the details):
+  hive ct find <words> [--module M] [--area A] [--front F] [--closed]  candidates by name
+  hive ct new --area A --module M[,M] --name "..." [...]  create; refuses while similar tasks exist
+  hive ct show <id>                  status, tags, parent, subtasks, PRs, description, latest comments
+  hive ct set <id> [--status S] [--comment T] [--area A] [--module +M,-M] [--parent ID] [--front F] ...
+  hive ct check --module M[,M] [--impact M[,M]] [--task ID]  collisions with tasks in progress
+  hive ct apply <file.tsv> [--yes]   bulk changes, a dry run unless --yes
+  hive ct sync                       refresh the cache, create the taxonomy's missing tags
+  hive ct ack <drone> --manual "<reason>"  a report clickup-sync could not apply, settled by hand
 
 Fronts — independent swarms, one coordinator each (the gate, accounts and rules are shared):
   hive --front <front> <command>     act on that front (also HIVE_FRONT; without either: the front whose

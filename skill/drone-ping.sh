@@ -58,7 +58,25 @@ body="${note:-}"
 [ -f "$report" ] && body="${body}${body:+
 }report: $report"
 
-KIND="$KIND_ARG" HIVE_DRONE="$HIVE_DRONE" HIVE_DIR="$HIVE_DIR" \
-  "$HIVE_BIN" send coord "$subject" --body "$body" >/dev/null 2>&1
+send_turn() {  # send_turn <subject>
+  KIND="$KIND_ARG" HIVE_DRONE="$HIVE_DRONE" HIVE_DIR="$HIVE_DIR" \
+    "$HIVE_BIN" send coord "$1" --body "$body" >/dev/null 2>&1
+}
+
+# With ClickUp tracking on (clickup/config), clickup-sync applies the report to its task first, so the
+# subject says how that went: 'ClickUp <id> → <status> ✓' or '✗ <why>'. In the background: the hook
+# never waits for the API.
+sync="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/clickup-sync.sh"
+if [ "$KIND_ARG" = done ] && [ -f "$report" ] && [ -f "$HIVE_DIR/clickup/config" ] && [ -x "$sync" ] \
+   && [ -n "$(jq -r '.clickup_task // empty' "$FRONT_DIR/drones/$HIVE_DRONE/meta.json" 2>/dev/null)" ]; then
+  (
+    HIVE_DIR="$HIVE_DIR" timeout 120 "$sync" >/dev/null 2>&1
+    mtime=$(stat -c %Y "$report" 2>/dev/null)
+    outcome=$(awk -F'\t' -v m="$mtime" '$1 == m { print $2 }' "$(dirname "$report")/.clickup-sync" 2>/dev/null)
+    send_turn "${subject%)}, ClickUp ${outcome:-sync pending})"
+  ) </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
+send_turn "$subject"
 
 exit 0
