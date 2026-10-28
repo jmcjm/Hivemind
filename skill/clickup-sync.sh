@@ -155,7 +155,11 @@ for start in "$CU_STARTS"/*.json; do
   rc=2; cu_ready && { cu_start_apply "$start" 2>/dev/null; rc=$?; }
   if [ "$rc" = 2 ]; then log "ClickUp unavailable for the start writes of ${what:-$start} — will retry"; break; fi
   rm -f "$start"
-  log "start writes $what: $([ "$rc" = 0 ] && echo applied || echo 'dropped (task unreadable)')"
+  case "$rc" in
+    0) log "start writes $what: applied" ;;
+    4) log "start writes ${what:-$start}: dropped (record unreadable)" ;;
+    *) log "start writes $what: dropped (task unreadable)" ;;
+  esac
 done
 
 for report in "$HIVE_DIR"/drones/*/report.md "$HIVE_DIR"/fronts/*/drones/*/report.md; do

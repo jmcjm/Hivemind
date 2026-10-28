@@ -83,6 +83,12 @@ report() {  # report <drone> <lines...> — the drone's report, a second newer t
   touch -d "@$(( ${RSEQ:-$(date +%s)} ))" "$f"; RSEQ=$(( ${RSEQ:-$(date +%s)} + 1 ))
 }
 sync_now() { bash "$SK/clickup-sync.sh"; }
+queue_start() {  # queue_start <task> <drone> <at> [modules] — a start record as cu_started queues it
+  mkdir -p "$CU/starts"
+  jq -n --arg t "$1" --arg d "$2" --arg at "$3" --arg m "${4:-}" \
+    '{drone: $d, front: "default", task: $t, title: "Queued", modules: $m, impact: "", settled: "", at: $at}' > "$CU/starts/$3.test.json"
+}
+nstarts() { find "$CU/starts" -maxdepth 1 -name '*.json' ! -name '.*' | wc -l; }
 
 # =============================================================================
 section "tracking off: no config, no ClickUp"
@@ -424,6 +430,9 @@ eq "the cache is not refreshed while ClickUp is down" "$n" "$(grep -c '/team/' "
 eq "the drone holds its task all the same" "thold01" "$(meta_of d3 clickup_task)"
 eq "its start writes are queued" 1 "$(ls "$CU/starts" | wc -l)"
 cp "$CU"/starts/*.json "$T/start.json"
+sync_now
+eq "a sync while ClickUp is still down keeps them" 1 "$(ls "$CU/starts" | wc -l)"
+has "and says it will retry" "ClickUp unavailable for the start writes of default/d3 thold01 — will retry" "$(cat "$CU/sync.log")"
 rm -f "$FAKE_CU/down"
 sync_now
 has "clickup-sync makes them once ClickUp is back: the modules" "mod-web" "$(tags_of thold01)"
@@ -443,6 +452,89 @@ eq "the gate lets the brief through" 0 "$RC"
 eq "within its budget, not minutes" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
 has "with the warning" "ClickUp unreachable" "$ERR"
 rm -f "$FAKE_CU/hang" "$CU"/starts/*.json "$FAKE_PANES/p5.status"
+eq "every call caps the connection, not only the whole call" 0 "$(grep -vc -- '--connect-timeout' "$FAKE_CU/curl.argv")"
+section "hive task: the task answers, the writes hang"
+touch "$FAKE_CU/hangwrites"
+mkdrone q1 pq1 working
+brief "$T/bq1" "# Hanging writes" "ClickUp: tana001" "Modules: docs" "Impact: none" "Collision checked: trev001 — other pages"
+n=$(grep -c '^GET /task/tana001 $' "$FAKE_CU/requests.log")
+s=$SECONDS; run timeout 200 "$HIVE" task q1 "$T/bq1"; took=$((SECONDS - s))
+rm -f "$FAKE_CU/hangwrites"
+eq "the brief passes" 0 "$RC"
+eq "the start writes use the task the gate read" 1 "$(( $(grep -c '^GET /task/tana001 $' "$FAKE_CU/requests.log") - n ))"
+eq "the budget covers the start writes too" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
+has "which say they wait for clickup-sync" "clickup-sync retries the start writes of tana001" "$ERR"
+eq "the record stays in the queue" 1 "$(nstarts)"
+eq "and none under a dot name" 0 "$(find "$CU/starts" -name '.*' | wc -l)"
+sync_now
+has "clickup-sync makes them" "hive-start:q1:" "$(comments_of tana001)"
+eq "and empties the queue" 0 "$(nstarts)"
+rm -f "$FAKE_PANES/pq1.status"
+section "hive task: a sync while the start writes are made"
+mkdrone q2 pq2 working
+brief "$T/bq2" "# Race" "ClickUp: tana001" "Modules: docs" "Impact: none" "Collision checked: trev001 — other pages"
+echo 1 > "$FAKE_CU/slow"
+( "$HIVE" task q2 "$T/bq2" >/dev/null 2>&1 ) & bg=$!
+while kill -0 "$bg" 2>/dev/null; do sync_now; sleep 0.2; done
+wait "$bg"; rc=$?
+rm -f "$FAKE_CU/slow"; sync_now
+eq "the brief passes" 0 "$rc"
+eq "one start comment, however the syncs fall" 1 "$(comments_of tana001 | grep -c 'hive-start:q2:')"
+eq "one collision comment" 1 "$(comments_of trev001 | grep -c 'drone q2 (front default) on tana001')"
+eq "and nothing left in the queue" "0 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
+rm -f "$FAKE_PANES/pq2.status"
+section "hive task: a token_cmd that hangs"
+cp "$CU/config" "$T/config.ok"
+sed -i "s|^token_cmd = .*|token_cmd = sleep 30; cat $T/token|" "$CU/config"
+mkdrone q3 pq3 working
+brief "$T/bq3" "# Slow token" "ClickUp: tana001" "Modules: docs" "Impact: none" "Collision checked: trev001 — other pages"
+s=$SECONDS; run timeout 200 "$HIVE" task q3 "$T/bq3"; took=$((SECONDS - s))
+cp "$T/config.ok" "$CU/config"
+eq "the brief passes" 0 "$RC"
+eq "token_cmd gets what is left of the budget" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
+has "and ClickUp counts as unreachable" "ClickUp unreachable" "$ERR"
+rm -f "$CU"/starts/*.json "$FAKE_PANES/pq3.status"
+section "clickup-sync: the start queue"
+mktask tq101 backlog "front-default,area-other" "Queue: tags"
+mktask tq102 backlog "front-default,area-other" "Queue: status"
+mktask tq103 backlog "front-default,area-other" "Queue: comment"
+echo '429 4 GET /task/tq101' > "$FAKE_CU/fail"
+queue_start tq101 z1 1001 api; queue_start tq102 z1 1002
+sync_now
+eq "the first record ClickUp fails on stops the replay" 2 "$(nstarts)"
+eq "the later one waits too" 0 "$(ncomments tq102)"
+rm -f "$FAKE_CU/fail" "$CU"/starts/*.json
+for f in "tq101 POST /task/*/tag/* the modules" "tq102 PUT /task/* the status" "tq103 POST /task/*/comment the comment"; do
+  read -r id m p what <<<"$f"
+  echo "401 1 $m $p" > "$FAKE_CU/fail"
+  queue_start "$id" z2 2000 api; sync_now
+  eq "a record stays when ClickUp fails on $what" 1 "$(nstarts)"
+  rm -f "$FAKE_CU/fail"; sync_now
+  eq "and is made on the next run: $what" "0 1 in progress mod-api" \
+    "$(nstarts) $(comments_of "$id" | grep -c 'hive-start:z2:2000') $(task_field "$id" .status.status) $(tags_of "$id" | grep -o mod-api)"
+done
+jq '[{comment_text: "start, reworded by ClickUp\nhive-start:z3:3000", date: "1", user: {username: "tester"}}] + .' \
+  "$FAKE_CU/comments/tq103.json" > "$T/c" && mv "$T/c" "$FAKE_CU/comments/tq103.json"
+n=$(ncomments tq103); queue_start tq103 z3 3000; sync_now
+eq "the marker alone says a start is made, whatever the text around it" "$n" "$(ncomments tq103)"
+queue_start tq103 z4 4000; jq 'del(.at)' "$CU/starts/4000.test.json" > "$T/s" && mv "$T/s" "$CU/starts/4000.test.json"
+echo 'not json' > "$CU/starts/4001.test.json"
+n=$(ncomments tq103); sync_now
+eq "a record without its time or not JSON is dropped" "0 $n" "$(nstarts) $(ncomments tq103)"
+eq "saying the record is unreadable, not the task" 2 "$(grep -c 'dropped (record unreadable)' "$CU/sync.log")"
+section "the retry guard"
+cu_probe() { bash -c '. "$1"; cu_ready && cu_comment tq103 "$2" "$2"' _ "$SK/clickup.sh" "$1"; }
+printf '503 1 POST /task/tq103/comment\n503 9 GET /task/tq103/comment\n' > "$FAKE_CU/fail"
+n=$(grep -c '^GET /task/tq103/comment' "$FAKE_CU/requests.log")
+run cu_probe "guard probe one"
+eq "a guard that fails is one attempt, then the write is retried" "0 1 1" \
+  "$RC $(( $(grep -c '^GET /task/tq103/comment' "$FAKE_CU/requests.log") - n )) $(comments_of tq103 | grep -c 'guard probe one')"
+echo '429 1 POST /task/tq103/comment' > "$FAKE_CU/fail"
+n=$(grep -c '^GET /task/tq103/comment' "$FAKE_CU/requests.log")
+run cu_probe "guard probe two"
+eq "a 429 changed nothing: no guard before its retry" "0 0 1" \
+  "$RC $(( $(grep -c '^GET /task/tq103/comment' "$FAKE_CU/requests.log") - n )) $(comments_of tq103 | grep -c 'guard probe two')"
+rm -f "$FAKE_CU/fail"
 section "hive task: HIVE_NO_CLICKUP"
 n=$(nrequests)
 brief "$T/b4" "# Helper" "Look around."

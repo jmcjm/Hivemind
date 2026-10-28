@@ -9,7 +9,9 @@
 # hangs until curl's --connect-timeout or --max-time, or 300 s without them), $FAKE_CU/429 (holds a
 # count of 429 answers to give), $FAKE_CU/lost (a count of comment POSTs that land but answer 500, as
 # when the answer is lost), $FAKE_CU/refuse (a count of 400 answers to give), $FAKE_CU/slow (seconds
-# every request takes).
+# every request takes), $FAKE_CU/hangwrites (every POST, PUT and DELETE hangs like hang, GETs answer),
+# $FAKE_CU/fail (lines '<code> <count> <METHOD> <path glob>': the first line matching a request, while
+# its count lasts, answers <code> and changes nothing; 401 is a rejected token, 429 a rate limit).
 # argv of every call goes to $FAKE_CU/curl.argv; every request to $FAKE_CU/requests.log.
 set -u
 D=${FAKE_CU:?}
@@ -30,6 +32,7 @@ while [ $# -gt 0 ]; do
 done
 [ -e "$D/down" ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }
 [ -e "$D/hang" ] && { sleep "$limit"; echo "curl: (28) Connection timed out" >&2; exit 28; }
+[ -e "$D/hangwrites" ] && [ "$method" != GET ] && { sleep "$limit"; echo "curl: (28) Connection timed out" >&2; exit 28; }
 [ -s "$D/slow" ] && sleep "$(cat "$D/slow")"
 exec 7>"$D/.lock"; flock 7   # one request at a time: two writers must not lose each other's write
 path=${url#https://api.clickup.com/api/v2}; query=""
@@ -43,6 +46,22 @@ reply() {  # reply <code> <json>
 }
 # ClickUp answers a task id nobody has with 401 OAUTH_027, not 404 (checked on the live API).
 missing() { reply 401 '{"err":"Team not authorized","ECODE":"OAUTH_027"}'; }
+if [ -s "$D/fail" ]; then
+  hit="" rules=""
+  while read -r fcode fcount fmethod fglob; do
+    if [ -z "$hit" ] && [ "$fcount" -gt 0 ] && [ "$fmethod" = "$method" ] && [[ $path == $fglob ]]; then
+      hit=$fcode; fcount=$((fcount - 1))
+    fi
+    rules+="$fcode $fcount $fmethod $fglob"$'\n'
+  done < "$D/fail"
+  printf '%s' "$rules" > "$D/fail"
+  case "$hit" in
+    '') ;;
+    401) reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}' ;;
+    429) reply 429 '{"err":"Rate limit reached"}' ;;
+    *) reply "$hit" '{"err":"Internal"}' ;;
+  esac
+fi
 if [ -s "$D/429" ] && [ "$(cat "$D/429")" -gt 0 ]; then echo $(( $(cat "$D/429") - 1 )) > "$D/429"; reply 429 '{"err":"Rate limit reached"}'; fi
 if [ -s "$D/refuse" ] && [ "$(cat "$D/refuse")" -gt 0 ]; then echo $(( $(cat "$D/refuse") - 1 )) > "$D/refuse"; reply 400 '{"err":"Bad request","ECODE":"INPUT_002"}'; fi
 [ "$auth" = "Authorization: pk_fake_SECRET_TOKEN" ] || reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}'
