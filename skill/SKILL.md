@@ -710,7 +710,8 @@ by a drone whose `meta.json` or brief names it. Rule 1: a task in `stale_testing
 a drone alive or changed within those days names it; off until both keys are set. A person's task
 (assigned to anybody, or with a tag of `stale_human_tags`) is never moved by rule 2, only listed as
 `CHECK` for a person to settle. So is a task the swarm never worked on: no drone's directory names it
-and none of its latest 25 comments has a `hive-start:` or `hive-report:` marker. Only the tasks of the
+and none of its latest 25 comments has a line of its own `hive-start:<drone>:<time>` or
+`hive-report:<drone>:<mtime>`, as the swarm writes them. Only the tasks of the
 caller's front (`HIVE_FRONT`) are candidates. An epic with an open subtask is never stale. `--yes`
 writes through the same client as `apply`: the status, then a comment with the rule and the date of
 the last movement; a task changed in ClickUp since it was read is skipped, and a second run changes

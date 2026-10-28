@@ -1031,7 +1031,7 @@ ct_stale() {
         n_hand=$((n_hand + 1)); continue
       fi
       if ! awk -F'\t' -v i="$id" '$1 == i { f = 1 } END { exit !f }' <<<"$refs" \
-         && ! jq -e 'any(.comments[]?; .comment_text // "" | test("hive-(start|report):"))' <<<"$cj" >/dev/null; then
+         && ! jq -e 'any(.comments[]?; .comment_text // "" | test("(^|\n)hive-(start|report):[^\\s:]+:[0-9]+(\n|$)"))' <<<"$cj" >/dev/null; then
         cu_stale_row CHECK "$id" "$rule" "$st -> $to by hand" "$idle" "never the swarm's work (no drone names it, no hive-start or hive-report comment)" "$name"
         n_hand=$((n_hand + 1)); continue
       fi

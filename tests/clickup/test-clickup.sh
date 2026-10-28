@@ -817,8 +817,8 @@ oldcomment() {  # oldcomment <id> <days> [text] — a comment made that many day
     '[{id: "old", comment_text: $t, date: $d, user: {username: "tester"}}]' > "$FAKE_CU/comments/$1.json"
 }
 swarmtask() {  # swarmtask <id> <status> <tags,comma> <name> <days> — stale, with a drone's start comment
-  mktask "$1" "$2" "$3" "$4"; aged "$1" "$5"; oldcomment "$1" "$(( $5 + 1 ))" "🤖 drone x start: y
-hive-start:x:1"
+  mktask "$1" "$2" "$3" "$4"; aged "$1" "$5"; oldcomment "$1" "$(( $5 + 1 ))" "🤖 drone sd-x (front default) start: $4; modules: docs; impact: none
+hive-start:sd-x:1793175236"
 }
 stale_drone() {  # stale_drone <name> <pane> <status|dead> <task> <days since its files changed> [brief text]
   mkdrone "$1" "$2" "$3"
@@ -844,6 +844,7 @@ mktask st13 testing "front-default,area-other,mod-docs" "Changes meanwhile";    
 mktask st14 "on hold" "front-default,area-other,mod-docs" "Hold not yet stale";     aged st14 10
 swarmtask st16 "on hold" "front-default,area-other,mod-docs" "Stale on hold" 20
 swarmtask st17 "on hold" "front-web,area-other,mod-docs" "Another front's" 20
+swarmtask st22 "on hold" "front-webshop,area-other,mod-docs" "A front named like another" 20
 stale_drone sd-live psd1 working st07 30
 stale_drone sd-old psd2 dead st08 30
 stale_drone sd-recent psd3 dead other 2 "Also look at st09 while at it."
@@ -876,6 +877,7 @@ has "the summary counts" "stale: 4 to change, 3 for a person to check, 0 skipped
 run env HIVE_FRONT=web "$HIVE" ct stale
 has "the other front sees its own" "PLAN   st17" "$OUT"
 hasnt "and not this one's" "st16" "$OUT"
+hasnt "nor one of a front whose name starts with its own" "st22" "$OUT"
 eq "a dry run writes nothing" "$w0" "$(writes)"
 echo "GET /task/st13/comment st13 .date_updated = \"$(( $(date +%s) * 1000 ))\"" > "$FAKE_CU/edit"
 run "$HIVE" ct stale --yes
@@ -915,10 +917,33 @@ eval "set -- $(grep -o "hive ct set st20 --comment .*" <<<"$OUT")"; shift
 run "$HIVE" "$@"
 eq "which adds it word for word" 1 "$(comments_of st20 | grep -cxF "🤖 hive ct stale, rule 2: 'on hold' with no movement since $(date -d "@$(( $(date +%s) - 20 * DAY ))" +%F) (over 14 days), named by no drone's brief → 'cancelled'.")"
 mktask st21 backlog "front-default,area-other,mod-docs" "Reported on, its drone pruned"; aged st21 20
-oldcomment st21 21 "🤖 report of x: done
-hive-report:x:1"
+oldcomment st21 21 "🤖 report of sd-x: done, the marker is \`hive-start:<drone>:<time>\`
+
+report: /tmp/sd-x/report.md
+hive-report:sd-x:1793175174"
 run "$HIVE" ct stale --yes
 eq "a hive-report comment makes it the swarm's work" cancelled "$(task_field st21 .status.status)"
+decoys=("moved the folder to archive-report: see the share" "please do not use the hive-start: marker here"
+  "x hive-start:a:1 inline" "see x hive-start:a:1" "hive-start:a:1 inline" "hive-start: see step:1"
+  "the shape is
+hive-start:<drone>:<time>")
+for i in "${!decoys[@]}"; do
+  mktask "sm0$i" "on hold" "front-default,area-other,mod-docs" "Marker-like comment $i"; aged "sm0$i" 20
+  oldcomment "sm0$i" 21 "${decoys[$i]}"
+done
+mktask sm10 "on hold" "front-default,area-other,mod-docs" "Marker in another field"; aged sm10 20
+oldcomment sm10 21
+jq '.[0].user.username = "hive-start:a:1"' "$FAKE_CU/comments/sm10.json" > "$T/a" && mv "$T/a" "$FAKE_CU/comments/sm10.json"
+swarmtask sm11 "on hold" "front-default,area-other,mod-docs" "Comments unreadable" 20
+echo "500 4 GET /task/sm11/comment" > "$FAKE_CU/fail"
+run "$HIVE" ct stale
+for i in "${!decoys[@]}"; do
+  has "a marker that is not a line of its own does not count: ${decoys[$i]%%$'\n'*}" "CHECK  sm0$i " "$OUT"
+done
+has "a marker in another field than the text does not count" "CHECK  sm10 " "$OUT"
+has "comments that cannot be read (500) skip the task" "SKIP   sm11 " "$OUT"
+has "and say why" "its comments cannot be read — Comments unreadable" "$OUT"
+rm -f "$FAKE_CU/fail"
 run "$HIVE" ct stale --now
 eq "an unknown argument is refused" 1 "$RC"
 sed -i 's/^stale_hold_to = cancelled$/stale_hold_to = nosuch/' "$CU/config"

@@ -48,7 +48,7 @@ verify_exempt = type-analysis
 # stale_hold_to = cancelled
 # A person's task under rule 2 is only listed, to be checked by hand: one assigned to anybody, or with
 # one of these tags. So is a task the swarm never worked on: no drone's directory names it and none of
-# its latest 25 comments has a hive-start: or hive-report: marker.
+# its latest 25 comments has a line of its own hive-start:<drone>:<time> or hive-report:<drone>:<mtime>.
 # stale_human_tags = human
 
 # Tag prefixes: on the command line and in a brief a module, an area, a type or a front may be named
