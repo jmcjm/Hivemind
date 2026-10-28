@@ -20,7 +20,8 @@
 # First run (no state): reports older than HIVE_CLICKUP_SYNC_SINCE seconds (default 24 h) are recorded
 # without a word, and so is every report in the format from before this sync (an 'applied:' line).
 # Reports of drones without a ClickUp task in their meta.json and of muted drones are skipped.
-# Before the reports it replays the start writes 'hive task' could not make (clickup/starts).
+# Before the reports it refreshes the whole task cache when that is CU_REGISTRY_TTL old and replays the
+# start writes 'hive task' could not make (clickup/starts).
 set -uo pipefail
 
 HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
@@ -145,6 +146,20 @@ Once production is checked: hive ct set $task --status $done_st --comment \"<wha
   fi
   return 0
 }
+
+# 'hive task' only catches the cache up with the tasks changed since; the full refresh, which also drops
+# the tasks deleted or moved out of the space, is made here.
+if [ "$(cu_age "$CU_REGISTRY_FULL")" -ge "$CU_REGISTRY_TTL" ]; then
+  { cu_ready && cu_registry_refresh; } 2>/dev/null || log "cache not refreshed — ClickUp unavailable"
+fi
+
+# A start record still under its dot name long after the gate's budget lost its 'hive task' (killed
+# while making the start writes): it joins the queue. The replay never doubles a write already made.
+for start in "$CU_STARTS"/.start.*; do
+  [ -f "$start" ] && [ "$(cu_age "$start")" -gt $(( CU_GATE_BUDGET * 6 )) ] || continue
+  queued="$CU_STARTS/$(stat -c %Y "$start").${start##*.}.json"
+  mv -f "$start" "$queued" && log "start record ${queued##*/} taken up: its 'hive task' died"
+done
 
 # The start writes 'hive task' queued (ClickUp down at the gate, or failing on a write), oldest first,
 # before the reports: a start never lands after the report that ends the work. The first one ClickUp

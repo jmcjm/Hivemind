@@ -635,12 +635,17 @@ it, an early status moves to `status_start`, the task gets a start comment (mark
 `hive-start:<drone>:<time>`), and the drone's `meta.json` records `clickup_task`, `modules` and `impact`.
 ClickUp being down lets the brief through with a warning — an outage must not stop the swarm — with
 collisions counted on the cache as it is and on the drones at work. `hive task` gives ClickUp 10
-seconds in all (token, task, cache refresh and start writes), so a network that drops packets holds
-the coordinator no longer. ClickUp refusing the call itself (any other 4xx) refuses the brief with
-ClickUp's message. The start writes ClickUp could not take in time, all of them while it is down, wait
-in a queue (`~/.herdr-hive/clickup/starts/`), and `clickup-sync.sh` replays them before the reports; a
-record is queued only once `hive task` is done with it, and the marker keeps a replay from doubling
-the start comment.
+seconds in all (token, task, cache catch-up, a look at each colliding task, start writes), so a network
+that drops packets holds the coordinator no longer. The catch-up asks only for the tasks changed since
+the last refresh, closed ones included; the full refresh is `clickup-sync.sh`'s (every 10 minutes at
+most), or the gate's when the cache has not had one for an hour. A task deleted or moved out of the
+space since is in no listing: the gate looks each colliding task up and drops the ones ClickUp no
+longer has. A cache the gate could not catch up is said in its warning. ClickUp refusing the call
+itself (any other 4xx) refuses the brief with ClickUp's message. The start writes ClickUp could not
+take in time, all of them while it is down, wait in a queue (`~/.herdr-hive/clickup/starts/`), and
+`clickup-sync.sh` replays them before the reports; a record is queued only once `hive task` is done
+with it, or as a `hive task` stopped by a signal exits (one killed outright leaves it for the sync to
+take up a minute later), and the marker keeps a replay from doubling the start comment.
 `HIVE_NO_CLICKUP=1` lets a brief without a task through on purpose. The config's `alias_*` keys add
 names for these lines, e.g. in your own language.
 

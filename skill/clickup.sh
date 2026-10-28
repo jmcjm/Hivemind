@@ -21,6 +21,7 @@ CU_DIR="$HIVE_DIR/clickup"
 CU_CONF="$CU_DIR/config"
 CU_TAXONOMY="$CU_DIR/taxonomy.tsv"
 CU_REGISTRY="$CU_DIR/registry.tsv"
+CU_REGISTRY_FULL="$CU_DIR/registry.full"   # its mtime: when the last full refresh of the cache began
 CU_LOG="$CU_DIR/sync.log"
 # clickup-sync's memory of reports, by path and mtime: applied, refused (waiting for 'ct ack'), and
 # failing on ClickUp itself (retried on every run).
@@ -30,11 +31,13 @@ CU_SYNC_RETRY="$CU_DIR/sync.retry"
 # The start writes of a brief let through while ClickUp was down, one file each; clickup-sync replays them.
 CU_STARTS="$CU_DIR/starts"
 CU_COMMENT_MAX=8000                  # ClickUp takes 40000 characters; a report comment stays readable
-CU_REGISTRY_TTL=600                  # 'ct find' refreshes a cache older than this
+CU_REGISTRY_TTL=600                  # 'ct find' refreshes a cache older than this, clickup-sync one not fully refreshed for this long
+CU_REGISTRY_STALE=3600               # 'hive task' refreshes the whole cache, not only its changed tasks, once its last full refresh is older
+CU_REGISTRY_OVERLAP=120              # the changed tasks are those updated since the last refresh began, less this (clock skew)
 CU_GATE_BUDGET=10                    # seconds 'hive task' waits for ClickUp before counting it down
 CU_KINDS="front module area type"
 CU_ROW_HEADER=$'id\tstatus\tfront\tmodules\tarea\tparent\tname\tupdated'
-CU_TMP="" CU_NO_TOKEN=0 CU_LOADED=0 CU_SPACE_TAGS="" CU_DEADLINE=""
+CU_TMP="" CU_NO_TOKEN=0 CU_LOADED=0 CU_SPACE_TAGS="" CU_DEADLINE="" CU_START_PENDING="" CU_START_QUEUED=""
 declare -A CU_CFG=() CU_STATUSES=()
 declare -a CU_JQ_ARGS=() CU_RETRY_GUARD=()
 
@@ -114,7 +117,9 @@ cu_epic_of() { cu_taxonomy | awk -F'\t' -v t="$1" '$1 == "area" && $2 == t { pri
 
 # --- token and transport ------------------------------------------------------
 
+# cu_cleanup — on the way out: a start record still being made goes to the queue, the private directory goes.
 cu_cleanup() {
+  cu_start_publish
   [ -n "$CU_TMP" ] || return 0
   local f
   for f in "$CU_TMP/tok" "$CU_TMP/auth"; do [ -f "$f" ] && shred -u "$f" 2>/dev/null; done
@@ -238,16 +243,56 @@ cu_space_rows() {
   done
 }
 
-# cu_registry_refresh — open tasks plus those closed in the last 30 days, written atomically.
-cu_registry_refresh() {
-  local open closed since tmp
-  since=$(( ($(date +%s) - 30 * 86400) * 1000 ))
-  open=$(cu_space_rows false) || return
-  closed=$(cu_space_rows true "$since") || return
+# cu_registry_write <rows> <began> — the cache from these rows (the first of an id wins), written
+# atomically, its mtime the time the refresh began: the next catch-up starts from there.
+cu_registry_write() {
+  local tmp
   mkdir -p "$CU_DIR"
   tmp=$(mktemp "$CU_DIR/.registry.XXXXXX") || return 1
-  { printf '%s\n' "$CU_ROW_HEADER"; printf '%s\n%s\n' "$open" "$closed" | awk -F'\t' 'NF && !seen[$1]++'; } > "$tmp"
-  mv -f "$tmp" "$CU_REGISTRY"
+  { printf '%s\n' "$CU_ROW_HEADER"; printf '%s\n' "$1" | awk -F'\t' 'NF && !seen[$1]++'; } > "$tmp"
+  touch -d "@$2" "$tmp" && mv -f "$tmp" "$CU_REGISTRY"
+}
+
+# cu_registry_refresh — open tasks plus those closed in the last 30 days.
+cu_registry_refresh() {
+  local open closed began since
+  began=$(date +%s); since=$(( (began - 30 * 86400) * 1000 ))
+  open=$(cu_space_rows false) || return
+  closed=$(cu_space_rows true "$since") || return
+  cu_registry_write "$open"$'\n'"$closed" "$began" && touch -d "@$began" "$CU_REGISTRY_FULL"
+}
+
+# cu_age <file> — seconds since its mtime, a lot when there is no such file.
+cu_age() { [ -f "$1" ] && echo $(( $(date +%s) - $(stat -c %Y "$1") )) || echo 999999999; }
+
+# cu_registry_catchup — the cache brought up to date by the tasks updated since its last refresh, closed
+# ones too; a full refresh when there is no cache or its last full refresh is older than
+# CU_REGISTRY_STALE. A task deleted or moved out of the space is in no listing: it stays in the cache
+# until the next full refresh, so the gate checks a collision with it (cu_vanished).
+cu_registry_catchup() {
+  local began since rows
+  [ -f "$CU_REGISTRY" ] && [ "$(cu_age "$CU_REGISTRY_FULL")" -lt "$CU_REGISTRY_STALE" ] || { cu_registry_refresh; return; }
+  began=$(date +%s); since=$(( ($(stat -c %Y "$CU_REGISTRY") - CU_REGISTRY_OVERLAP) * 1000 ))
+  rows=$(cu_space_rows true "$since") || return
+  cu_registry_write "$rows"$'\n'"$(tail -n +2 "$CU_REGISTRY")" "$began"
+}
+
+# cu_vanished <collisions> — the tasks among them ClickUp no longer has in the space (deleted, or moved
+# out of it since the last full refresh), one id a line, dropped from the cache. A task ClickUp does
+# not answer for stays: a collision is never waived on a guess.
+cu_vanished() {
+  local id st json rc gone=""
+  while IFS=$'\t' read -r id st _; do
+    [ -n "$id" ] && [ "$st" != "?" ] || continue       # '?': only a drone's claim, the cache has no such task
+    json=$(cu_task "$id" 2>/dev/null); rc=$?
+    if [ "$rc" = 3 ] || { [ "$rc" = 0 ] && [ "$(jq -r --arg s "$(cu_cfg space)" '(.space.id // "" | tostring) as $i | $i != "" and $i != $s' <<<"$json")" = true ]; }; then
+      gone+="$id"$'\n'
+    fi
+  done <<<"$1"
+  [ -n "$gone" ] || return 0
+  cu_registry_write "$(awk -F'\t' -v g="$gone" 'BEGIN { n = split(g, x, "\n"); for (i = 1; i <= n; i++) drop[x[i]] }
+                       NR > 1 && !($1 in drop)' "$CU_REGISTRY")" "$(stat -c %Y "$CU_REGISTRY")"
+  printf '%s' "$gone"
 }
 
 # cu_registry_ready <max-age-seconds> — a registry no older than that when ClickUp answers, else the
@@ -518,6 +563,7 @@ cu_settle() {
     cid=${line%%[[:space:]—–:-]*}
     reason=$(sed -E 's/^[^[:space:]—–:-]+//; s/^[[:space:]]*(—|–|-|:)*[[:space:]]*//' <<<"$line")
     if ! grep -qxF -- "$cid" <<<"$(cut -f1 <<<"$col")"; then
+      grep -qxF -- "$cid" <<<"$CU_GONE" && continue      # the task is gone from ClickUp since the brief was written
       CU_GATE_MSG="'Collision checked: $cid' — $cid is not one of the collisions$([ -n "$col" ] && printf ' (%s)' "$(cut -f1 <<<"$col" | paste -sd' ')")"
       return 1
     fi
@@ -537,17 +583,18 @@ Wait for them, or once you checked the work does not clash add one line per task
 
 # --- the 'hive task' gate -----------------------------------------------------
 
-CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_CHECKED="" CU_SETTLED="" CU_CLAIMS=""
+CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_CHECKED="" CU_SETTLED="" CU_CLAIMS="" CU_GONE=""
 # cu_gate <drone> <task> <brief> <front> — may <drone> of <front> start on <task>? 0 yes, 1 no with
 # CU_GATE_MSG saying what to fix. ClickUp being down lets the brief through with CU_GATE_MSG as a
 # warning (an outage must not stop the swarm); collisions are then counted on the cache as it is and
 # on the drones at work. ClickUp gets CU_GATE_BUDGET seconds for the whole of 'hive task': the token,
-# the task, the cache refresh and the start writes (cu_started ends the budget; a write it cuts short
-# waits in the start queue). A network that drops packets must not hold the coordinator for minutes.
+# the task, the cache catch-up (only the tasks changed since the last refresh), a look at each task
+# it collides with, and the start writes (cu_started ends the budget; a write it cuts short waits in
+# the start queue). A network that drops packets must not hold the coordinator for minutes.
 # Leaves the task id in CU_GATE_ID, the task in CU_GATE_TASK and CU_UP=1 when ClickUp answered.
 cu_gate() {
-  local drone=$1 id=$2 brief=$3 front=$4 rc mine fronts areas col warn=""
-  CU_UP=0 CU_GATE_TASK="" CU_GATE_ID=$id CU_GATE_MSG=""
+  local drone=$1 id=$2 brief=$3 front=$4 rc mine fronts areas col err warn=""
+  CU_UP=0 CU_GATE_TASK="" CU_GATE_ID=$id CU_GATE_MSG="" CU_GONE=""
   cu_init 2>/dev/null || { CU_GATE_MSG=$(cu_init 2>&1); return 1; }
   cu_brief_header "$brief" || return 1
   mine=$(cu_front_tag "$front" 2>&1) || { CU_GATE_MSG="front $front has no tag in $CU_TAXONOMY: $mine"; return 1; }
@@ -576,10 +623,17 @@ cu_gate() {
       return 1
     fi
   fi
-  [ "$CU_UP" = 1 ] && { cu_registry_ready 0 2>/dev/null || true; }
+  if [ "$CU_UP" = 1 ] && ! cu_registry_catchup 2>"$CU_TMP/gate.err"; then
+    err=$(tail -1 "$CU_TMP/gate.err" | sed 's/^clickup: //')
+    warn="the cache was not refreshed${err:+ ($err)} — collisions counted on the cache$([ -f "$CU_REGISTRY" ] && date -r "$CU_REGISTRY" '+ from %Y-%m-%d %H:%M' || echo ' (there is none)') and the drones at work"
+  fi
   cu_claims "$front" "$drone"
   col=$(cu_collisions "$id" "$CU_MODS${CU_IMPACT:+,$CU_IMPACT}")
-  cu_settle "$col" || return 1
+  if [ "$CU_UP" = 1 ] && [ -n "$col" ]; then
+    CU_GONE=$(cu_vanished "$col")
+    [ -z "$CU_GONE" ] || col=$(cu_collisions "$id" "$CU_MODS${CU_IMPACT:+,$CU_IMPACT}")
+  fi
+  cu_settle "$col" || { [ -z "$warn" ] || CU_GATE_MSG+=$'\n'"warning: $warn"; return 1; }
   CU_GATE_MSG=$warn
 }
 
@@ -587,22 +641,33 @@ cu_gate() {
 # go right away to ClickUp when it answered the gate, within what is left of the gate's budget. Those
 # ClickUp fails on, or all of them while it is down, go to the start queue for clickup-sync. The record
 # is written under a dot name and published in the queue only then: a sync never replays a start this
-# process is still making. Warns, never fails.
+# process is still making. A process stopped while it makes them publishes the record on its way out
+# (cu_cleanup); one killed outright leaves the dot name, which clickup-sync takes up once it is old.
+# Warns, never fails.
 cu_started() {
   local at tmp rc=2
   at=$(date +%s)
   mkdir -p "$CU_STARTS" && tmp=$(mktemp "$CU_STARTS/.start.XXXXXX") \
-    && jq -n --arg drone "$1" --arg front "$2" --arg title "$3" --arg task "$CU_GATE_ID" --arg mods "$CU_MODS" \
-          --arg impact "$CU_IMPACT" --arg settled "$CU_SETTLED" --arg at "$at" \
-          '{drone: $drone, front: $front, task: $task, title: $title, modules: $mods, impact: $impact, settled: $settled, at: $at}' > "$tmp" \
-    || { rm -f "$tmp"; CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
+    || { CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
+  # Pending from here: a signal waits for jq to finish the record, and the way out publishes it.
+  CU_START_PENDING=$tmp CU_START_QUEUED="$CU_STARTS/$at.${tmp##*.}.json"   # oldest first in a listing
+  jq -n --arg drone "$1" --arg front "$2" --arg title "$3" --arg task "$CU_GATE_ID" --arg mods "$CU_MODS" \
+        --arg impact "$CU_IMPACT" --arg settled "$CU_SETTLED" --arg at "$at" \
+        '{drone: $drone, front: $front, task: $task, title: $title, modules: $mods, impact: $impact, settled: $settled, at: $at}' > "$tmp" \
+    || { CU_START_PENDING=""; rm -f "$tmp"; CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
   [ "$CU_UP" = 1 ] && { cu_start_apply "$tmp" "$CU_GATE_TASK"; rc=$?; }
   CU_DEADLINE=""
-  [ "$rc" = 2 ] || { rm -f "$tmp"; return 0; }
-  mv -f "$tmp" "$CU_STARTS/$at.${tmp##*.}.json" \
-    || { rm -f "$tmp"; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }   # oldest first in a listing
+  [ "$rc" = 2 ] || { CU_START_PENDING=""; rm -f "$tmp"; return 0; }
+  cu_start_publish || { rm -f "$tmp"; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
   [ "$CU_UP" = 1 ] && cu_say "ClickUp failed — clickup-sync retries the start writes of $CU_GATE_ID"
   return 0
+}
+
+# cu_start_publish — moves the start record being made (CU_START_PENDING) into the start queue.
+cu_start_publish() {
+  local f=$CU_START_PENDING; CU_START_PENDING=""
+  [ -n "$f" ] && [ -f "$f" ] || return 0
+  mv -f "$f" "$CU_START_QUEUED"
 }
 
 # cu_start_apply <file> [task-json] — the start writes of a queued brief: the brief's modules the task

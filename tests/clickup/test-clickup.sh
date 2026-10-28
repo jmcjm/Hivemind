@@ -51,7 +51,7 @@ echo '[{"name":"mod-api"}]' > "$FAKE_CU/space-tags.json"
 printf 'pk_fake_SECRET_TOKEN\n' > "$T/token"; chmod 600 "$T/token"
 mktask() {  # mktask <id> <status> <tags,comma> <name> [parent]
   local st; st=$(jq -c --arg s "$2" '.[] | select(.status == $s)' "$FAKE_CU/statuses.json")
-  jq -n --arg id "$1" --argjson st "$st" --arg tags "$3" --arg n "$4" --arg p "${5:-}" --arg du "$(( ($(date +%s) - 86400) * 1000 ))" \
+  jq -n --arg id "$1" --argjson st "$st" --arg tags "$3" --arg n "$4" --arg p "${5:-}" --arg du "$(( $(date +%s) * 1000 ))" \
     '{id: $id, name: $n, url: ("https://app.clickup.com/t/" + $id), status: $st, list: {id: "9012345678"},
       tags: [$tags | split(",")[] | select(. != "") | {name: .}], parent: (if $p == "" then null else $p end),
       text_content: "Description of \($id)", date_updated: $du}' > "$FAKE_CU/tasks/$1.json"
@@ -138,6 +138,7 @@ module	mod-web	the web app		web
 module	mod-db	the database		default
 module	mod-infra	infrastructure		default
 module	mod-docs	documentation		default
+module	mod-cache	the cache		default
 area	area-billing	billing	epbill1	default
 area	area-search	search		web
 area	area-other	other		default
@@ -522,6 +523,105 @@ echo 'not json' > "$CU/starts/4001.test.json"
 n=$(ncomments tq103); sync_now
 eq "a record without its time or not JSON is dropped" "0 $n" "$(nstarts) $(ncomments tq103)"
 eq "saying the record is unreadable, not the task" 2 "$(grep -c 'dropped (record unreadable)' "$CU/sync.log")"
+section "hive task: the cache catches up"
+touched() { jq --arg n "$(( $(date +%s) * 1000 ))" '.date_updated = $n' "$FAKE_CU/tasks/$1.json" > "$T/u" && mv "$T/u" "$FAKE_CU/tasks/$1.json"; }
+closed_now() { jq '.status = {status: "done", type: "closed"}' "$FAKE_CU/tasks/$1.json" > "$T/u" && mv "$T/u" "$FAKE_CU/tasks/$1.json"; }
+mktask tcu000 backlog "front-default,area-other" "Cache: the gate's own task"
+"$HIVE" ct sync >/dev/null 2>&1
+mkdrone e1 pe1 working
+brief "$T/be1" "# Cache" "ClickUp: tcu000" "Modules: cache" "Impact: none"
+mktask tcu001 "in progress" "front-default,area-other,mod-cache" "Cache: changed since the refresh"
+n=$(grep -c '/team/' "$FAKE_CU/curl.argv")
+run "$HIVE" task e1 "$T/be1"
+eq "a task changed since the last refresh collides" 1 "$RC"
+has "by name" "tcu001" "$ERR"
+eq "the gate lists only the tasks changed since, closed ones too" "1 1" \
+  "$(( $(grep -c '/team/' "$FAKE_CU/curl.argv") - n )) $(grep '/team/' "$FAKE_CU/curl.argv" | tail -1 | grep -c 'include_closed=true&date_updated_gt=')"
+closed_now tcu001
+jq '.date_updated = "1000"' "$FAKE_CU/tasks/tcu001.json" > "$T/u" && mv "$T/u" "$FAKE_CU/tasks/tcu001.json"
+run "$HIVE" task e1 "$T/be1"
+eq "a task the listing does not bring keeps its row: the cache is not listed whole" 1 "$RC"
+touched tcu001
+run "$HIVE" task e1 "$T/be1"
+eq "a task closed since releases the collision" 0 "$RC"
+eq "and the cache has it closed" done "$(awk -F'\t' '$1 == "tcu001" { print $2 }' "$CU/registry.tsv")"
+mktask tcu003 "in progress" "front-default,area-other,mod-cache" "Cache: deleted later"
+mktask tcu004 "in progress" "front-default,area-other,mod-cache" "Cache: moved later"
+run "$HIVE" task e1 "$T/be1"
+has "both collide while ClickUp has them" "tcu003" "$ERR"
+rm -f "$FAKE_CU/tasks/tcu003.json"
+jq '.space = {id: "999"}' "$FAKE_CU/tasks/tcu004.json" > "$T/u" && mv "$T/u" "$FAKE_CU/tasks/tcu004.json"
+brief "$T/be1" "# Cache" "ClickUp: tcu000" "Modules: cache" "Impact: none" "Collision checked: tcu003 — written before it was deleted"
+run "$HIVE" task e1 "$T/be1"
+eq "a task deleted or moved out of the space refuses nothing, a line for it neither" 0 "$RC"
+eq "both leave the cache" 0 "$(grep -cE '^tcu00[34]' "$CU/registry.tsv")"
+mktask tcu006 "in progress" "front-default,area-other,mod-cache" "Cache: ClickUp does not answer for it"
+brief "$T/be1" "# Cache" "ClickUp: tcu000" "Modules: cache" "Impact: none"
+run "$HIVE" task e1 "$T/be1"
+echo '401 1 GET /task/tcu006' > "$FAKE_CU/fail"
+run "$HIVE" task e1 "$T/be1"
+eq "a collision ClickUp does not answer for stays" 1 "$RC"
+has "named" "tcu006" "$ERR"
+closed_now tcu006; touched tcu006
+run "$HIVE" task e1 "$T/be1"
+eq "and goes once ClickUp has it closed" 0 "$RC"
+echo '401 1 GET /team/*' > "$FAKE_CU/fail"
+run "$HIVE" task e1 "$T/be1"
+eq "a catch-up ClickUp fails on lets the brief through" 0 "$RC"
+has "telling the caller the cache was used" "warning — the cache was not refreshed" "$ERR"
+rm -f "$FAKE_CU/fail"
+mktask tcu007 "in progress" "front-default,area-other,mod-cache" "Cache: only a full refresh finds it"
+jq '.date_updated = "1000"' "$FAKE_CU/tasks/tcu007.json" > "$T/u" && mv "$T/u" "$FAKE_CU/tasks/tcu007.json"
+run "$HIVE" task e1 "$T/be1"
+eq "a task no listing of changes brings is missed while the full refresh is recent" 0 "$RC"
+touch -d '-2 hours' "$CU/registry.full"
+run "$HIVE" task e1 "$T/be1"
+eq "and found once it is not: the gate refreshes the whole cache" 1 "$RC"
+has "named" "tcu007" "$ERR"
+rm -f "$FAKE_CU/tasks/tcu007.json"; touch -d '-1 hour' "$CU/registry.full"
+sync_now
+eq "clickup-sync refreshes the whole cache once its last full refresh is old" "0 yes" \
+  "$(grep -c '^tcu007' "$CU/registry.tsv") $([ $(( $(date +%s) - $(stat -c %Y "$CU/registry.full") )) -lt 60 ] && echo yes || echo no)"
+section "hive task: stopped while making the start writes"
+for sig in TERM INT; do
+  mkdrone "k${sig,,}" "pk$sig" working
+  touch "$FAKE_CU/hangwrites"
+  # Job control on: a background job of a script otherwise ignores SIGINT, and no trap could catch it.
+  set -m; "$HIVE" task "k${sig,,}" "$T/be1" >/dev/null 2>&1 & bg=$!; set +m
+  for i in $(seq 150); do [ -n "$(find "$CU/starts" -name '.start.*')" ] && break; sleep 0.1; done
+  kill -"$sig" "$bg"; wait "$bg"
+  rm -f "$FAKE_CU/hangwrites"
+  eq "SIG$sig puts the start record being made in the queue" "1 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
+  sync_now
+  eq "where clickup-sync makes it" "0 1" "$(nstarts) $(comments_of tcu000 | grep -c "hive-start:k${sig,,}:")"
+  rm -f "$FAKE_PANES/pk$sig.status"
+done
+mktask tcu008 "in progress" "front-default,area-other,mod-cache" "Cache: a settled collision"
+brief "$T/bk" "# Cache" "ClickUp: tcu000" "Modules: cache" "Impact: none" "Collision checked: tcu008 — other keys"
+mkdrone kk pkk working
+echo 1 > "$FAKE_CU/slow"
+"$HIVE" task kk "$T/bk" >/dev/null 2>&1 & bg=$!
+for i in $(seq 300); do comments_of tcu000 | grep -q 'hive-start:kk:' && break; sleep 0.1; done
+kill -KILL "$bg"; wait "$bg" 2>/dev/null
+rm -f "$FAKE_CU/slow"; sleep 1.5
+rm -rf "${TMPDIR:?}"/hive-cu.*   # a killed process leaves its private directory: not what the token section counts
+sync_now
+eq "SIGKILL leaves the record under its dot name, a young one is left alone" 1 "$(find "$CU/starts" -name '.start.*' | wc -l)"
+touch -d '-2 minutes' "$CU"/starts/.start.*
+sync_now
+eq "an old one clickup-sync takes up and makes" "0 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
+eq "without doubling the start comment made before the kill" 1 "$(comments_of tcu000 | grep -c 'hive-start:kk:')"
+eq "and with the collision comments" "1 1" "$(comments_of tcu000 | grep -c 'drone kk (front default) on tcu000') $(comments_of tcu008 | grep -c 'drone kk (front default) on tcu000')"
+has "saying so" "taken up: its 'hive task' died" "$(cat "$CU/sync.log")"
+rm -f "$FAKE_PANES/pkk.status"
+mkdir -p "$T/badjq"
+printf '#!/usr/bin/env bash\ncase "$*" in *"settled: \\$settled"*) exit 5 ;; esac\nexec %q "$@"\n' "$(command -v jq)" > "$T/badjq/jq"; chmod +x "$T/badjq/jq"
+mkdrone kj pkj working
+run env PATH="$T/badjq:$PATH" "$HIVE" task kj "$T/bk"
+eq "a start record jq cannot write lets the brief through" 0 "$RC"
+has "saying the start writes are lost" "could not queue the start writes of tcu000" "$ERR"
+eq "and leaves no record behind" "0 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
+rm -f "$FAKE_PANES/pkj.status" "$FAKE_PANES/pe1.status"
 section "the retry guard"
 cu_probe() { bash -c '. "$1"; cu_ready && cu_comment tq103 "$2" "$2"' _ "$SK/clickup.sh" "$1"; }
 printf '503 1 POST /task/tq103/comment\n503 9 GET /task/tq103/comment\n' > "$FAKE_CU/fail"
