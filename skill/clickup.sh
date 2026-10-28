@@ -978,14 +978,16 @@ ct_apply() {
 #   rule 1: in stale_testing, not moved for stale_testing_days -> stale_testing_to
 #   rule 2: in stale_hold, not moved for stale_hold_days and named by no brief of a drone alive or
 #           changed within those days -> stale_hold_to. A person's task (assigned to someone, or with
-#           a tag of stale_human_tags) is only listed, to be checked by hand.
-# An epic with an open subtask is never stale. Dry run unless --yes; a task that changed since it was
-# read is skipped, and a second run changes nothing.
+#           a tag of stale_human_tags) is only listed, to be checked by hand; so is a task the swarm
+#           never worked on (no drone's directory names it, no hive-start or hive-report comment).
+# Only the tasks of the caller's front; an epic with an open subtask is never stale. Dry run unless
+# --yes; a task that changed since it was read is skipped, and a second run changes nothing. A comment
+# that fails after its status was set is printed as the command that adds it.
 cu_stale_row() { printf '%-6s %-11s %-4s %-30s %-5s %s — %s\n' "$@"; }   # action id rule change idle reason name
 
 ct_stale() {
   local yes=0 s1 s2 to1 to2 d1 d2 now cut1 cut2 tasks cand refs id rule st upd who tags name
-  local c rep last to cut days since idle named json n_plan=0 n_hand=0 n_skip=0
+  local front cj c rep last to cut days since idle named json text n_plan=0 n_hand=0 n_skip=0
   case "${1:-}" in --yes) yes=1 ;; '') ;; *) cu_die "usage: hive ct stale [--yes]" ;; esac
   s1=$(cu_list stale_testing); s2=$(cu_list stale_hold)
   to1=$(cu_norm_status "$(cu_list stale_testing_to | head -1)"); to2=$(cu_norm_status "$(cu_list stale_hold_to | head -1)")
@@ -993,14 +995,15 @@ ct_stale() {
   [[ "$d1" =~ ^[0-9]+$ && "$d2" =~ ^[0-9]+$ ]] || cu_die "stale_testing_days and stale_hold_days are whole days"
   [ -n "$to1" ] || s1=""; [ -n "$to2" ] || s2=""
   [ -n "$s1$s2" ] || cu_die "no stale rule configured (stale_testing and stale_testing_to, stale_hold and stale_hold_to)"
+  front=$(cu_front_tag "$(front_label "${HIVE_FRONT:-}")") || exit 1
   cu_need
   tasks=$(cu_space_tasks false) || cu_die "cannot list the tasks of the space"
   now=$(( $(date +%s) * 1000 )); cut1=$(( now - d1 * 86400000 )); cut2=$(( now - d2 * 86400000 ))
   cand=$(jq -rs "${CU_JQ_ARGS[@]}" --argjson r1 "$(printf '%s' "$s1" | jq -Rn '[inputs]')" \
            --argjson r2 "$(printf '%s' "$s2" | jq -Rn '[inputs]')" --argjson c1 "$cut1" --argjson c2 "$cut2" \
-           --argjson ht "$(cu_list stale_human_tags | jq -Rn '[inputs]')" "$CU_JQ_DEFS"'
+           --argjson ht "$(cu_list stale_human_tags | jq -Rn '[inputs]')" --arg front "$front" "$CU_JQ_DEFS"'
     [.[] | select(closed | not)] as $open | [$open[].parent // empty] as $parents
-    | $open[] | (.status.status // "" | ascii_downcase) as $s
+    | $open[] | select(tagnames | index($front)) | (.status.status // "" | ascii_downcase) as $s
     | (if ($s | IN($r1[])) then 1 elif ($s | IN($r2[])) then 2 else 0 end) as $rule | select($rule > 0)
     | select(.id | IN($parents[]) | not)
     | select((.date_updated // "0" | tonumber) < (if $rule == 1 then $c1 else $c2 end))
@@ -1013,7 +1016,7 @@ ct_stale() {
   while IFS=$'\037' read -r -u 3 id rule st upd who tags name; do
     [ -n "$id" ] || continue
     if [ "$rule" = 1 ]; then to=$to1 cut=$cut1 days=$d1; else to=$to2 cut=$cut2 days=$d2; fi
-    c=$(cu_api GET "/task/$id/comment" | jq '[.comments[]?.date // "0" | tonumber] | max // 0') \
+    cj=$(cu_api GET "/task/$id/comment") && c=$(jq '[.comments[]?.date // "0" | tonumber] | max // 0' <<<"$cj") \
       || { cu_stale_row SKIP "$id" "$rule" "$st" - "its comments cannot be read" "$name"; n_skip=$((n_skip + 1)); continue; }
     rep=$(awk -F'\t' -v i="$id" '$1 == i && $5 > m { m = $5 } END { print (m ? m "000" : 0) }' <<<"$refs")
     last=$upd; [ "$c" -gt "$last" ] && last=$c; [ "$rep" -gt "$last" ] && last=$rep
@@ -1027,6 +1030,11 @@ ct_stale() {
           "a person's task (${who:+assigned to $who}${who:+${tags:+, }}${tags:+tagged $tags})" "$name"
         n_hand=$((n_hand + 1)); continue
       fi
+      if ! awk -F'\t' -v i="$id" '$1 == i { f = 1 } END { exit !f }' <<<"$refs" \
+         && ! jq -e 'any(.comments[]?; .comment_text // "" | test("hive-(start|report):"))' <<<"$cj" >/dev/null; then
+        cu_stale_row CHECK "$id" "$rule" "$st -> $to by hand" "$idle" "never the swarm's work (no drone names it, no hive-start or hive-report comment)" "$name"
+        n_hand=$((n_hand + 1)); continue
+      fi
     fi
     if [ "$yes" = 1 ]; then
       json=$(cu_task "$id" 2>/dev/null) || { cu_stale_row SKIP "$id" "$rule" "$st" "$idle" "it cannot be read" "$name"; n_skip=$((n_skip + 1)); continue; }
@@ -1038,8 +1046,8 @@ ct_stale() {
     n_plan=$((n_plan + 1))
     [ "$yes" = 1 ] || continue
     cu_set_status "$json" "$to" || { echo "FAILED $id status"; continue; }
-    cu_comment_once "$id" "🤖 hive ct stale, rule $rule: '$st' with no movement since $since (over $days days)$([ "$rule" = 2 ] && echo ", named by no drone's brief") → '$to'." \
-      || echo "FAILED $id comment"
+    text="🤖 hive ct stale, rule $rule: '$st' with no movement since $since (over $days days)$([ "$rule" = 2 ] && echo ", named by no drone's brief") → '$to'."
+    cu_comment_once "$id" "$text" || echo "FAILED $id comment — add it with: hive ct set $id --comment '${text//\'/\'\\\'\'}'"
   done 3< <(tr '\t' '\037' <<<"$cand")
   echo "stale: $n_plan to change, $n_hand for a person to check, $n_skip skipped$([ "$yes" = 1 ] || echo ' — dry run, rerun with --yes to write')"
 }

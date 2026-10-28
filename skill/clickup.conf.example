@@ -33,10 +33,11 @@ verify_exempt = type-analysis
 # 'hive ct todo': the checklist a small step goes to when no --checklist is named.
 # checklist = Small steps
 
-# 'hive ct stale' (run by hand, never on a timer): tasks left lying. A task moved when it was updated,
-# commented on, or reported on by a drone whose meta.json or brief names it. An empty list or target
-# turns its rule off. Rule 1: a task in stale_testing not moved for stale_testing_days goes to
-# stale_testing_to (defaults: status_unverified, 7, status_done).
+# 'hive ct stale' (run by hand, never on a timer): tasks left lying, only those of the caller's front
+# (HIVE_FRONT). A task moved when it was updated, commented on, or reported on by a drone whose
+# meta.json or brief names it. An empty list or target turns its rule off. Rule 1: a task in
+# stale_testing not moved for stale_testing_days goes to stale_testing_to (defaults:
+# status_unverified, 7, status_done).
 # stale_testing = testing
 # stale_testing_days = 7
 # stale_testing_to = done
@@ -46,7 +47,8 @@ verify_exempt = type-analysis
 # stale_hold_days = 14
 # stale_hold_to = cancelled
 # A person's task under rule 2 is only listed, to be checked by hand: one assigned to anybody, or with
-# one of these tags.
+# one of these tags. So is a task the swarm never worked on: no drone's directory names it and none of
+# its latest 25 comments has a hive-start: or hive-report: marker.
 # stale_human_tags = human
 
 # Tag prefixes: on the command line and in a brief a module, an area, a type or a front may be named

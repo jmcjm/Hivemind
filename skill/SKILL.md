@@ -618,7 +618,7 @@ never becomes a tag. On the command line and in a brief a tag may be named witho
 | `hive ct set <id> [--status S] [--comment T\|@F] [--area A] [--module +M,-M] [--type T\|none] [--parent ID] [--front F]` | `--front` hands the task to another front, with a comment |
 | `hive ct check --module M[,M] [--impact M[,M]] [--task ID]` | collisions (below); exit 1 when there are any |
 | `hive ct apply <file.tsv> [--yes]` | bulk changes, a dry run unless `--yes`. Columns: id, front, area, modules, parent, current status, new status, comment. A row whose current status changed in ClickUp is skipped; a wrong field skips only that field; a second run changes nothing |
-| `hive ct stale [--yes]` | tasks left lying (below), a dry run unless `--yes`: a table of candidates with the rule and the reason. Run by hand, never on a timer |
+| `hive ct stale [--yes]` | tasks left lying (below), a dry run unless `--yes`: a table of the caller's front's candidates with the rule and the reason. Run by hand, never on a timer |
 | `hive ct todo <id> "<item>" [--checklist NAME]` | an item on the task's checklist (`checklist` in the config by default), the checklist created when the task has none; an item already there is not added twice |
 | `hive ct sync` | refreshes the cache, creates the taxonomy's missing tags |
 | `hive ct ack <drone> --manual "<reason>"` | a report the sync could not apply, settled by hand; the reason goes to `clickup/sync.log` |
@@ -709,9 +709,13 @@ by a drone whose `meta.json` or brief names it. Rule 1: a task in `stale_testing
 `stale_hold_days` (14) goes to `stale_hold_to` (e.g. `cancelled`), unless the brief or `meta.json` of
 a drone alive or changed within those days names it; off until both keys are set. A person's task
 (assigned to anybody, or with a tag of `stale_human_tags`) is never moved by rule 2, only listed as
-`CHECK` for a person to settle. An epic with an open subtask is never stale. `--yes` writes through the
-same client as `apply`: the status, then a comment with the rule and the date of the last movement; a
-task changed in ClickUp since it was read is skipped, and a second run changes nothing.
+`CHECK` for a person to settle. So is a task the swarm never worked on: no drone's directory names it
+and none of its latest 25 comments has a `hive-start:` or `hive-report:` marker. Only the tasks of the
+caller's front (`HIVE_FRONT`) are candidates. An epic with an open subtask is never stale. `--yes`
+writes through the same client as `apply`: the status, then a comment with the rule and the date of
+the last movement; a task changed in ClickUp since it was read is skipped, and a second run changes
+nothing. A comment that fails after its status was set is printed in the `FAILED` line as the
+`hive ct set <id> --comment '...'` that adds it.
 
 ## Typical flow
 
