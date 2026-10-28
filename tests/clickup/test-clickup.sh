@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/clickup/test-clickup.sh [skill-dir] — ClickUp task tracking: off without a config, the
-# taxonomy, 'hive ct' (find, new, show, set, check, apply, sync, ack), the 'hive task' gate with its
-# collisions, clickup-sync applying reports, drone-ping's subject, 'hive move', and the API token never
-# reaching argv, a letter or a log.
+# taxonomy, 'hive ct' (find, new, show, set, check, apply, stale, todo, sync, ack), the 'hive task'
+# gate with its collisions, clickup-sync applying reports, drone-ping's subject, 'hive move', and the
+# API token never reaching argv, a letter or a log.
 # Nothing real runs: curl is a small ClickUp API over files (fake-bin/curl), herdr and notify-send are
 # the tests/ctx stand-ins. HOME, HIVE_DIR and TMPDIR are throwaway directories. The scripts under test
 # (default: the repo's skill/) are COPIED into a throwaway skill directory.
@@ -123,6 +123,9 @@ status_start = in progress
 status_done = done
 status_unverified = testing
 verify_exempt = type-analysis
+stale_hold = on hold | backlog
+stale_hold_to = cancelled
+stale_human_tags = human
 alias_modules = Components
 alias_impact = Effect
 alias_none = nothing
@@ -802,6 +805,188 @@ eq "--yes applies" "ready area-search,front-web,mod-api,mod-web epbill1" "$(task
 has "the comment too" "only a comment" "$(comments_of apply02)"
 run "$HIVE" ct apply "$T/apply.tsv" --yes
 has "a second run changes nothing" "0 to change" "$OUT"
+
+# =============================================================================
+section "ct stale"
+DAY=86400
+aged() {  # aged <id> <days> — the task last updated that many days ago
+  jq --arg du "$(( ($(date +%s) - $2 * DAY) * 1000 ))" '.date_updated = $du' "$FAKE_CU/tasks/$1.json" > "$T/a" && mv "$T/a" "$FAKE_CU/tasks/$1.json"
+}
+oldcomment() {  # oldcomment <id> <days> [text] — a comment made that many days ago
+  jq -n --arg d "$(( ($(date +%s) - $2 * DAY) * 1000 ))" --arg t "${3:-a word}" \
+    '[{id: "old", comment_text: $t, date: $d, user: {username: "tester"}}]' > "$FAKE_CU/comments/$1.json"
+}
+swarmtask() {  # swarmtask <id> <status> <tags,comma> <name> <days> — stale, with a drone's start comment
+  mktask "$1" "$2" "$3" "$4"; aged "$1" "$5"; oldcomment "$1" "$(( $5 + 1 ))" "🤖 drone sd-x (front default) start: $4; modules: docs; impact: none
+hive-start:sd-x:1793175236"
+}
+stale_drone() {  # stale_drone <name> <pane> <status|dead> <task> <days since its files changed> [brief text]
+  mkdrone "$1" "$2" "$3"
+  local d="$HIVE_DIR/drones/$1"
+  jq --arg t "$4" '. + {clickup_task: $t, modules: "docs", impact: ""}' "$d/meta.json" > "$T/m" && mv "$T/m" "$d/meta.json"
+  printf '# Brief\n%s\n' "${6:-ClickUp: $4}" > "$d/brief.md"
+  touch -d "@$(( $(date +%s) - $5 * DAY ))" "$d/meta.json" "$d/brief.md"
+}
+mktask st01 testing "front-default,area-other,mod-docs" "Stale testing";            aged st01 10
+mktask st02 testing "front-default,area-other,mod-docs" "Fresh testing";            aged st02 3
+mktask st03 testing "front-default,area-other,mod-docs" "Testing commented on";     aged st03 10; oldcomment st03 2
+mktask st04 "on hold" "front-default,area-other,mod-docs" "Never the swarm's";      aged st04 20
+mktask st05 backlog "front-default,area-other,mod-docs" "Assigned backlog";         aged st05 20
+jq '. + {assignees: [{id: 7, username: "alice"}]}' "$FAKE_CU/tasks/st05.json" > "$T/a" && mv "$T/a" "$FAKE_CU/tasks/st05.json"
+mktask st06 "on hold" "front-default,area-other,mod-docs,human" "Tagged human";     aged st06 20
+mktask st07 backlog "front-default,area-other,mod-docs" "Named by a living drone";  aged st07 20
+mktask st08 backlog "front-default,area-other,mod-docs" "Named by an old dead drone"; aged st08 20
+mktask st09 "on hold" "front-default,area-other,mod-docs" "Named by a recent brief"; aged st09 20
+mktask st10 testing "front-default,area-other,mod-docs" "Testing with a fresh report"; aged st10 10
+mktask st11 "on hold" "front-default,area-other,mod-docs" "Epic on hold";           aged st11 20
+mktask st12 "in progress" "front-default,area-other,mod-docs" "Its subtask" st11
+mktask st13 testing "front-default,area-other,mod-docs" "Changes meanwhile";        aged st13 10
+mktask st14 "on hold" "front-default,area-other,mod-docs" "Hold not yet stale";     aged st14 10
+swarmtask st16 "on hold" "front-default,area-other,mod-docs" "Stale on hold" 20
+swarmtask st17 "on hold" "front-web,area-other,mod-docs" "Another front's" 20
+swarmtask st22 "on hold" "front-webshop,area-other,mod-docs" "A front named like another" 20
+stale_drone sd-live psd1 working st07 30
+stale_drone sd-old psd2 dead st08 30
+stale_drone sd-recent psd3 dead other 2 "Also look at st09 while at it."
+stale_drone sd-report psd4 dead st10 30
+printf 'STATUS: DONE\n' > "$HIVE_DIR/drones/sd-report/report.md"; touch -d "@$(( $(date +%s) - DAY ))" "$HIVE_DIR/drones/sd-report/report.md"
+w0=$(writes)
+run "$HIVE" ct stale
+eq "a dry run exits 0" 0 "$RC"
+has "the table has a header" "action id          rule change" "$OUT"
+has "rule 1: testing not moved for over 7 days goes to done" "PLAN   st01        1    testing -> done" "$OUT"
+has "with the reason" "no movement since $(date -d "@$(( $(date +%s) - 10 * DAY ))" +%F) — Stale testing" "$OUT"
+hasnt "testing moved 3 days ago is no candidate" "st02" "$OUT"
+has "a recent comment is movement" "KEEP   st03        1    testing" "$OUT"
+has "rule 2: on hold not moved for over 14 days goes to cancelled" "PLAN   st16        2    on hold -> cancelled" "$OUT"
+has "a task the swarm never worked on is only listed for a person" "CHECK  st04        2    on hold -> cancelled by hand" "$OUT"
+has "and says why" "never the swarm's work (no drone names it, no hive-start or hive-report comment)" "$OUT"
+hasnt "another front's task is no candidate" "st17" "$OUT"
+has "an assigned task is only listed for a person" "CHECK  st05        2    backlog -> cancelled by hand" "$OUT"
+has "and says who" "assigned to alice" "$OUT"
+has "a task with a human tag too" "CHECK  st06" "$OUT"
+has "with the tag" "tagged human" "$OUT"
+has "a task a living drone's meta names stays" "KEEP   st07        2    backlog" "$OUT"
+has "and says which drone" "named by the brief of sd-live" "$OUT"
+has "a dead drone not changed for 30 days does not keep it" "PLAN   st08        2    backlog -> cancelled" "$OUT"
+has "a task named in the text of a recent brief stays" "named by the brief of sd-recent" "$OUT"
+has "a drone's fresh report is movement" "KEEP   st10        1    testing" "$OUT"
+hasnt "an epic with an open subtask is never stale" "st11" "$OUT"
+hasnt "on hold for 10 days is no candidate" "st14" "$OUT"
+has "the summary counts" "stale: 4 to change, 3 for a person to check, 0 skipped — dry run" "$OUT"
+run env HIVE_FRONT=web "$HIVE" ct stale
+has "the other front sees its own" "PLAN   st17" "$OUT"
+hasnt "and not this one's" "st16" "$OUT"
+hasnt "nor one of a front whose name starts with its own" "st22" "$OUT"
+eq "a dry run writes nothing" "$w0" "$(writes)"
+echo "GET /task/st13/comment st13 .date_updated = \"$(( $(date +%s) * 1000 ))\"" > "$FAKE_CU/edit"
+run "$HIVE" ct stale --yes
+eq "--yes exits 0" 0 "$RC"
+eq "rule 1 applied" done "$(task_field st01 .status.status)"
+has "with a comment" "🤖 hive ct stale, rule 1: 'testing' with no movement since" "$(comments_of st01)"
+eq "rule 2 applied" "cancelled cancelled" "$(task_field st16 .status.status) $(task_field st08 .status.status)"
+has "with a comment saying no brief names it" "named by no drone's brief → 'cancelled'." "$(comments_of st16)"
+eq "a person's tasks keep their status" "backlog on hold on hold" "$(task_field st05 .status.status) $(task_field st06 .status.status) $(task_field st04 .status.status)"
+eq "another front's task too" "on hold" "$(task_field st17 .status.status)"
+eq "the kept ones too" "testing backlog testing" "$(task_field st03 .status.status) $(task_field st07 .status.status) $(task_field st10 .status.status)"
+has "a task changed since it was read is skipped" "SKIP   st13" "$OUT"
+eq "and left alone" testing "$(task_field st13 .status.status)"
+has "the summary says so" "stale: 3 to change, 3 for a person to check, 1 skipped" "$OUT"
+w1=$(writes)
+run "$HIVE" ct stale --yes
+has "a second run changes nothing" "stale: 0 to change, 3 for a person to check, 0 skipped" "$OUT"
+eq "and writes nothing" "$w1" "$(writes)"
+eq "no comment is doubled" 1 "$(comments_of st01 | grep -c 'hive ct stale')"
+swarmtask st18 "on hold" "front-default,area-other,mod-docs" "Comment answer lost" 20
+echo 1 > "$FAKE_CU/lost"
+run "$HIVE" ct stale --yes
+eq "a stale comment whose answer was lost (500) is not posted again" "0 cancelled 1" \
+   "$RC $(task_field st18 .status.status) $(comments_of st18 | grep -c 'hive ct stale')"
+hasnt "and is no failure" "FAILED st18" "$OUT"
+swarmtask st19 testing "front-default,area-other,mod-docs" "Comment already there" 10
+oldcomment st19 11 "🤖 hive ct stale, rule 1: 'testing' with no movement since $(date -d "@$(( $(date +%s) - 10 * DAY ))" +%F) (over 7 days) → 'done'."
+run "$HIVE" ct stale --yes
+eq "a stale comment already on the task (another run) is not doubled" "done 1" \
+   "$(task_field st19 .status.status) $(comments_of st19 | grep -c 'hive ct stale')"
+swarmtask st20 "on hold" "front-default,area-other,mod-docs" "Comment refused" 20
+echo "400 1 POST /task/st20/comment" > "$FAKE_CU/fail"
+run "$HIVE" ct stale --yes
+eq "a comment that fails after the status was set" cancelled "$(task_field st20 .status.status)"
+has "is printed as the command that adds it" "FAILED st20 comment — add it with: hive ct set st20 --comment '" "$OUT"
+eval "set -- $(grep -o "hive ct set st20 --comment .*" <<<"$OUT")"; shift
+run "$HIVE" "$@"
+eq "which adds it word for word" 1 "$(comments_of st20 | grep -cxF "🤖 hive ct stale, rule 2: 'on hold' with no movement since $(date -d "@$(( $(date +%s) - 20 * DAY ))" +%F) (over 14 days), named by no drone's brief → 'cancelled'.")"
+mktask st21 backlog "front-default,area-other,mod-docs" "Reported on, its drone pruned"; aged st21 20
+oldcomment st21 21 "🤖 report of sd-x: done, the marker is \`hive-start:<drone>:<time>\`
+
+report: /tmp/sd-x/report.md
+hive-report:sd-x:1793175174"
+run "$HIVE" ct stale --yes
+eq "a hive-report comment makes it the swarm's work" cancelled "$(task_field st21 .status.status)"
+decoys=("moved the folder to archive-report: see the share" "please do not use the hive-start: marker here"
+  "x hive-start:a:1 inline" "see x hive-start:a:1" "hive-start:a:1 inline" "hive-start: see step:1"
+  "the shape is
+hive-start:<drone>:<time>")
+for i in "${!decoys[@]}"; do
+  mktask "sm0$i" "on hold" "front-default,area-other,mod-docs" "Marker-like comment $i"; aged "sm0$i" 20
+  oldcomment "sm0$i" 21 "${decoys[$i]}"
+done
+mktask sm10 "on hold" "front-default,area-other,mod-docs" "Marker in another field"; aged sm10 20
+oldcomment sm10 21
+jq '.[0].user.username = "hive-start:a:1"' "$FAKE_CU/comments/sm10.json" > "$T/a" && mv "$T/a" "$FAKE_CU/comments/sm10.json"
+swarmtask sm11 "on hold" "front-default,area-other,mod-docs" "Comments unreadable" 20
+echo "500 4 GET /task/sm11/comment" > "$FAKE_CU/fail"
+run "$HIVE" ct stale
+for i in "${!decoys[@]}"; do
+  has "a marker that is not a line of its own does not count: ${decoys[$i]%%$'\n'*}" "CHECK  sm0$i " "$OUT"
+done
+has "a marker in another field than the text does not count" "CHECK  sm10 " "$OUT"
+has "comments that cannot be read (500) skip the task" "SKIP   sm11 " "$OUT"
+has "and say why" "its comments cannot be read — Comments unreadable" "$OUT"
+rm -f "$FAKE_CU/fail"
+run "$HIVE" ct stale --now
+eq "an unknown argument is refused" 1 "$RC"
+sed -i 's/^stale_hold_to = cancelled$/stale_hold_to = nosuch/' "$CU/config"
+swarmtask st15 "on hold" "front-default,area-other,mod-docs" "Hold to a missing status" 20
+run "$HIVE" ct stale --yes
+has "a target the list lacks fails that task" "FAILED st15 status" "$OUT"
+eq "which keeps its status" "on hold" "$(task_field st15 .status.status)"
+sed -i 's/^stale_hold_to = nosuch$/stale_hold_to =/; s/^status_unverified = testing$/status_unverified = testing\nstale_testing =/' "$CU/config"
+run "$HIVE" ct stale
+eq "with every rule off it refuses" 1 "$RC"
+has "and says why" "no stale rule configured" "$ERR"
+sed -i 's/^stale_hold_to =$/stale_hold_to = cancelled/; /^stale_testing =$/d' "$CU/config"
+
+# =============================================================================
+section "ct todo"
+mktask td01 ready "front-default,area-other,mod-docs" "Epic without a checklist"
+mktask td02 ready "front-default,area-other,mod-docs" "Epic with a checklist"
+jq '. + {checklists: [{id: "clx", name: "small STEPS", items: [{id: "clx-0", name: "first"}]}]}' "$FAKE_CU/tasks/td02.json" > "$T/a" && mv "$T/a" "$FAKE_CU/tasks/td02.json"
+checklists_of() { jq -r '[.checklists[]? | "\(.name): \([.items[].name] | join(", "))"] | join(" | ")' "$FAKE_CU/tasks/$1.json"; }
+run "$HIVE" ct todo td01 "  write the docs "
+eq "todo exits 0" 0 "$RC"
+has "a task without a checklist gets the default one" "todo: td01 new checklist 'Small steps'" "$OUT"
+eq "with the item, trimmed" "Small steps: write the docs" "$(checklists_of td01)"
+w2=$(writes)
+run "$HIVE" ct todo td01 "write the docs"
+has "an item already there is not added twice" "already has 'write the docs'" "$OUT"
+eq "and nothing is written" "$w2" "$(writes)"
+run "$HIVE" ct todo td01 "bump the version"
+eq "a second item goes to the same checklist" "Small steps: write the docs, bump the version" "$(checklists_of td01)"
+run "$HIVE" ct todo td01 "tag it" --checklist Release
+eq "--checklist names another one" "Small steps: write the docs, bump the version | Release: tag it" "$(checklists_of td01)"
+run "$HIVE" ct todo td02 "second"
+hasnt "an existing checklist is found whatever its case" "new checklist" "$OUT"
+eq "and gets the item" "small STEPS: first, second" "$(checklists_of td02)"
+echo 1 > "$FAKE_CU/lost"
+run "$HIVE" ct todo td02 "third"
+eq "an item whose answer was lost" 0 "$RC"
+eq "is not added again by the retry" "small STEPS: first, second, third" "$(checklists_of td02)"
+run "$HIVE" ct todo nosuch01 "anything"
+eq "an unknown task is refused" 1 "$RC"
+run "$HIVE" ct todo td01
+eq "an item is required" 1 "$RC"
+has "with the usage" 'usage: hive ct todo <id> "<item>"' "$ERR"
 
 # =============================================================================
 section "ct sync and the rate limit"

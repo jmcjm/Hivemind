@@ -46,4 +46,5 @@ The twelve rules that must survive a compacted context. This file is the single 
     current and target status (done only with a `## Prod` section in the report). Never write to ClickUp
     any other way: drone reports reach their tasks by themselves (clickup-sync), and a report the sync
     could not apply comes as a `CLICKUP ✗` letter — settle it by hand, then `hive ct ack <drone> --manual
-    "<what you did>"`.
+    "<what you did>"`. A small step a drone reports is an item on the epic's checklist (`hive ct todo`),
+    not a new task, and tasks left lying are swept by hand with `hive ct stale`.

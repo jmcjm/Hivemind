@@ -30,6 +30,27 @@ status_unverified = testing
 # A tag whose tasks may reach status_done without '## Prod' (e.g. an analysis, done once delivered).
 verify_exempt = type-analysis
 
+# 'hive ct todo': the checklist a small step goes to when no --checklist is named.
+# checklist = Small steps
+
+# 'hive ct stale' (run by hand, never on a timer): tasks left lying, only those of the caller's front
+# (HIVE_FRONT). A task moved when it was updated, commented on, or reported on by a drone whose
+# meta.json or brief names it. An empty list or target turns its rule off. Rule 1: a task in
+# stale_testing not moved for stale_testing_days goes to stale_testing_to (defaults:
+# status_unverified, 7, status_done).
+# stale_testing = testing
+# stale_testing_days = 7
+# stale_testing_to = done
+# Rule 2: a task in stale_hold not moved for stale_hold_days (default 14), and named by no brief of a
+# drone alive or changed within those days, goes to stale_hold_to. Off unless both are set.
+# stale_hold = on hold | backlog
+# stale_hold_days = 14
+# stale_hold_to = cancelled
+# A person's task under rule 2 is only listed, to be checked by hand: one assigned to anybody, or with
+# one of these tags. So is a task the swarm never worked on: no drone's directory names it and none of
+# its latest 25 comments has a line of its own hive-start:<drone>:<time> or hive-report:<drone>:<mtime>.
+# stale_human_tags = human
+
 # Tag prefixes: on the command line and in a brief a module, an area, a type or a front may be named
 # without its prefix ('Modules: api' for the tag mod-api). The front tag is <prefix_front><front name>.
 prefix_front = front-

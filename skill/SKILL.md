@@ -618,6 +618,8 @@ never becomes a tag. On the command line and in a brief a tag may be named witho
 | `hive ct set <id> [--status S] [--comment T\|@F] [--area A] [--module +M,-M] [--type T\|none] [--parent ID] [--front F]` | `--front` hands the task to another front, with a comment |
 | `hive ct check --module M[,M] [--impact M[,M]] [--task ID]` | collisions (below); exit 1 when there are any |
 | `hive ct apply <file.tsv> [--yes]` | bulk changes, a dry run unless `--yes`. Columns: id, front, area, modules, parent, current status, new status, comment. A row whose current status changed in ClickUp is skipped; a wrong field skips only that field; a second run changes nothing |
+| `hive ct stale [--yes]` | tasks left lying (below), a dry run unless `--yes`: a table of the caller's front's candidates with the rule and the reason. Run by hand, never on a timer |
+| `hive ct todo <id> "<item>" [--checklist NAME]` | an item on the task's checklist (`checklist` in the config by default), the checklist created when the task has none; an item already there is not added twice |
 | `hive ct sync` | refreshes the cache, creates the taxonomy's missing tags |
 | `hive ct ack <drone> --manual "<reason>"` | a report the sync could not apply, settled by hand; the reason goes to `clickup/sync.log` |
 
@@ -697,6 +699,24 @@ starts (`status_start`, start comment) → its report with an open PR (`in revie
 it) → merged (`status_unverified`) → deployed and checked in production, a report with `## Prod`
 (`status_done`). A drone moved to another front (`hive move`) takes its task's front along, with a
 comment. A duplicate found later: `hive ct set <id> --status <cancelled> --comment "duplicate of <id>"`.
+A small step found along the way is not a task of its own: the drone names it in its report and the
+coordinator adds it to the epic's checklist (`hive ct todo <epic> "<step>"`).
+
+**Tasks left lying** (`hive ct stale`). A task moved when it was updated, commented on, or reported on
+by a drone whose `meta.json` or brief names it. Rule 1: a task in `stale_testing` (default
+`status_unverified`) not moved for `stale_testing_days` (7) goes to `stale_testing_to` (default
+`status_done`). Rule 2: a task in `stale_hold` (e.g. `on hold | backlog`) not moved for
+`stale_hold_days` (14) goes to `stale_hold_to` (e.g. `cancelled`), unless the brief or `meta.json` of
+a drone alive or changed within those days names it; off until both keys are set. A person's task
+(assigned to anybody, or with a tag of `stale_human_tags`) is never moved by rule 2, only listed as
+`CHECK` for a person to settle. So is a task the swarm never worked on: no drone's directory names it
+and none of its latest 25 comments has a line of its own `hive-start:<drone>:<time>` or
+`hive-report:<drone>:<mtime>`, as the swarm writes them. Only the tasks of the
+caller's front (`HIVE_FRONT`) are candidates. An epic with an open subtask is never stale. `--yes`
+writes through the same client as `apply`: the status, then a comment with the rule and the date of
+the last movement; a task changed in ClickUp since it was read is skipped, and a second run changes
+nothing. A comment that fails after its status was set is printed in the `FAILED` line as the
+`hive ct set <id> --comment '...'` that adds it.
 
 ## Typical flow
 

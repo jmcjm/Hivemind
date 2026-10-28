@@ -63,6 +63,9 @@ cu_init() {
   : "${CU_CFG[status_early]:=to do}" "${CU_CFG[status_active]:=in progress}" "${CU_CFG[status_closed]:=complete | closed}"
   : "${CU_CFG[status_start]:=in progress}" "${CU_CFG[status_done]:=complete}"
   : "${CU_CFG[prefix_front]:=front-}" "${CU_CFG[prefix_module]:=mod-}" "${CU_CFG[prefix_area]:=area-}" "${CU_CFG[prefix_type]:=type-}"
+  : "${CU_CFG[checklist]:=Small steps}" "${CU_CFG[stale_testing_days]:=7}" "${CU_CFG[stale_hold_days]:=14}"
+  # Set but empty turns rule 1 off, so only an absent key takes the default.
+  : "${CU_CFG[stale_testing]=${CU_CFG[status_unverified]:-}}" "${CU_CFG[stale_testing_to]=${CU_CFG[status_done]}}"
   for k in workspace space list; do
     [ -n "${CU_CFG[$k]:-}" ] || { cu_say "$CU_CONF has no '$k'"; return 1; }
   done
@@ -75,8 +78,10 @@ cu_init() {
   CU_LOADED=1
 }
 
+# cu_list <key> — a '|'-separated config value, lower case, one a line.
+cu_list() { cu_cfg "$1" | tr '|' '\n' | while IFS= read -r s; do s=$(cu_trim "${s,,}"); [ -z "$s" ] || echo "$s"; done; }
 # cu_statuses <early|active|closed|start|done|unverified> — the configured statuses, lower case, one a line.
-cu_statuses() { cu_cfg "status_$1" | tr '|' '\n' | while IFS= read -r s; do s=$(cu_trim "${s,,}"); [ -z "$s" ] || echo "$s"; done; }
+cu_statuses() { cu_list "status_$1"; }
 # cu_status_is <status> <group>. A here-string, not a pipe: under pipefail grep -q leaving early
 # would fail the pipe on a match.
 cu_status_is() { grep -qxF -- "$1" <<<"$(cu_statuses "$2")"; }
@@ -229,18 +234,24 @@ cu_jq() { jq -r "${CU_JQ_ARGS[@]}" "$CU_JQ_DEFS $2" <<<"$1"; }   # cu_jq <task-j
 cu_task() { cu_api GET "/task/$1?include_subtasks=true"; }
 cu_status_of() { jq -r '.status.status | ascii_downcase' <<<"$1"; }
 
-# cu_space_rows <include-closed:true|false> [updated-after-ms] — every task of the space as registry rows.
-cu_space_rows() {
+# cu_space_tasks <include-closed:true|false> [updated-after-ms] — every task of the space, one JSON a line.
+cu_space_tasks() {
   local q json n page=0
   q="space_ids%5B%5D=$(cu_cfg space)&subtasks=true&include_closed=$1"
   [ -n "${2:-}" ] && q+="&date_updated_gt=$2"
   while [ "$page" -lt 50 ]; do
     json=$(cu_api GET "/team/$(cu_cfg workspace)/task?$q&page=$page") || return
-    cu_jq "$json" '.tasks[] | row'
+    jq -c '.tasks[]' <<<"$json"
     n=$(jq '.tasks | length' <<<"$json")
     [ "$n" -ge 100 ] && [ "$(jq -r '.last_page // false' <<<"$json")" != true ] || break
     page=$((page + 1))
   done
+}
+
+# cu_space_rows <include-closed:true|false> [updated-after-ms] — every task of the space as registry rows.
+cu_space_rows() {
+  local tasks; tasks=$(cu_space_tasks "$@") || return
+  [ -z "$tasks" ] || jq -r "${CU_JQ_ARGS[@]}" "$CU_JQ_DEFS row" <<<"$tasks"
 }
 
 # cu_registry_write <rows> <began> — the cache from these rows (the first of an id wins), written
@@ -455,6 +466,19 @@ cu_set_front() {
   cu_comment "$id" "🤖 task handed over from ${old:-no front} to $2: $3"
 }
 
+# cu_checklist_id <task-id> <name> — the id of the task's checklist of that name (case does not
+# matter); 1 when it has none, 2 when ClickUp is down.
+cu_checklist_id() {
+  local json; json=$(cu_task "$1") || return 2
+  jq -re --arg n "${2,,}" 'first(.checklists[]? | select((.name // "" | ascii_downcase) == $n) | .id)' <<<"$json"
+}
+
+# cu_checklist_has <task-id> <checklist-id> <item> — 0 when that checklist holds the item.
+cu_checklist_has() {
+  local json; json=$(cu_task "$1") || return 2
+  jq -e --arg c "$2" --arg i "$3" 'any(.checklists[]? | select(.id == $c) | .items[]?; .name == $i)' <<<"$json" >/dev/null
+}
+
 # cu_prs <id> — the pull requests the reports of drones named in the task's comments.
 cu_prs() {
   cu_api GET "/task/$1/comment" 2>/dev/null \
@@ -508,6 +532,28 @@ cu_brief_header() {
 cu_claims() {
   CU_CLAIMS="$CU_TMP/claims"
   if declare -F drone_claims >/dev/null; then drone_claims "${1:-}" "${2:-}" > "$CU_CLAIMS"; else : > "$CU_CLAIMS"; fi
+}
+
+# cu_drone_refs <ids> — the drones of every front whose meta.json or brief names one of these task
+# ids (one a line): id, drone, alive (1 or 0), when its brief, meta or report last changed and when its
+# report did (0: none), in epoch seconds. Empty where hive is not around.
+cu_drone_refs() {
+  local f d pane alive changed reported ids t
+  declare -F front_names >/dev/null || return 0
+  ids=$(grep -v '^$' <<<"$1") || return 0
+  for f in $(front_names); do
+    for d in "$(front_dir "$f")"/drones/*/; do
+      d=${d%/}; [ -d "$d" ] || continue
+      t=$( { jq -r '.clickup_task // empty' "$d/meta.json" 2>/dev/null; grep -owF -- "$ids" "$d/brief.md" 2>/dev/null; } \
+           | grep -xF -- "$ids" | sort -u)
+      [ -n "$t" ] || continue
+      pane=$(jq -r '.pane_id // ""' "$d/meta.json" 2>/dev/null)
+      alive=0; [ -n "$pane" ] && [ "$(pane_status "$pane")" != dead ] && alive=1
+      changed=$(stat -c %Y "$d/brief.md" "$d/meta.json" "$d/report.md" 2>/dev/null | sort -n | tail -1)
+      reported=$(stat -c %Y "$d/report.md" 2>/dev/null) || reported=0
+      awk -v d="${d##*/}" -v a="$alive" -v c="${changed:-0}" -v r="$reported" '{ print $0 "\t" d "\t" a "\t" c "\t" r }' <<<"$t"
+    done
+  done
 }
 
 # cu_collisions <task|-> <modules> — the tasks a drone on <task> working in <modules> would collide with:
@@ -927,6 +973,115 @@ ct_apply() {
   echo "apply: $n_rows rows, $n_change to change, $n_skip skipped$([ "$yes" = 1 ] || echo ' — dry run, rerun with --yes to write')"
 }
 
+# stale [--yes] — tasks left lying; the coordinator runs it by hand, never a timer. Moved means updated,
+# commented on, or reported on by a drone whose meta.json or brief names the task.
+#   rule 1: in stale_testing, not moved for stale_testing_days -> stale_testing_to
+#   rule 2: in stale_hold, not moved for stale_hold_days and named by no brief of a drone alive or
+#           changed within those days -> stale_hold_to. A person's task (assigned to someone, or with
+#           a tag of stale_human_tags) is only listed, to be checked by hand; so is a task the swarm
+#           never worked on (no drone's directory names it, no hive-start or hive-report comment).
+# Only the tasks of the caller's front; an epic with an open subtask is never stale. Dry run unless
+# --yes; a task that changed since it was read is skipped, and a second run changes nothing. A comment
+# that fails after its status was set is printed as the command that adds it.
+cu_stale_row() { printf '%-6s %-11s %-4s %-30s %-5s %s — %s\n' "$@"; }   # action id rule change idle reason name
+
+ct_stale() {
+  local yes=0 s1 s2 to1 to2 d1 d2 now cut1 cut2 tasks cand refs id rule st upd who tags name
+  local front cj c rep last to cut days since idle named json text n_plan=0 n_hand=0 n_skip=0
+  case "${1:-}" in --yes) yes=1 ;; '') ;; *) cu_die "usage: hive ct stale [--yes]" ;; esac
+  s1=$(cu_list stale_testing); s2=$(cu_list stale_hold)
+  to1=$(cu_norm_status "$(cu_list stale_testing_to | head -1)"); to2=$(cu_norm_status "$(cu_list stale_hold_to | head -1)")
+  d1=$(cu_cfg stale_testing_days); d2=$(cu_cfg stale_hold_days)
+  [[ "$d1" =~ ^[0-9]+$ && "$d2" =~ ^[0-9]+$ ]] || cu_die "stale_testing_days and stale_hold_days are whole days"
+  [ -n "$to1" ] || s1=""; [ -n "$to2" ] || s2=""
+  [ -n "$s1$s2" ] || cu_die "no stale rule configured (stale_testing and stale_testing_to, stale_hold and stale_hold_to)"
+  front=$(cu_front_tag "$(front_label "${HIVE_FRONT:-}")") || exit 1
+  cu_need
+  tasks=$(cu_space_tasks false) || cu_die "cannot list the tasks of the space"
+  now=$(( $(date +%s) * 1000 )); cut1=$(( now - d1 * 86400000 )); cut2=$(( now - d2 * 86400000 ))
+  cand=$(jq -rs "${CU_JQ_ARGS[@]}" --argjson r1 "$(printf '%s' "$s1" | jq -Rn '[inputs]')" \
+           --argjson r2 "$(printf '%s' "$s2" | jq -Rn '[inputs]')" --argjson c1 "$cut1" --argjson c2 "$cut2" \
+           --argjson ht "$(cu_list stale_human_tags | jq -Rn '[inputs]')" --arg front "$front" "$CU_JQ_DEFS"'
+    [.[] | select(closed | not)] as $open | [$open[].parent // empty] as $parents
+    | $open[] | select(tagnames | index($front)) | (.status.status // "" | ascii_downcase) as $s
+    | (if ($s | IN($r1[])) then 1 elif ($s | IN($r2[])) then 2 else 0 end) as $rule | select($rule > 0)
+    | select(.id | IN($parents[]) | not)
+    | select((.date_updated // "0" | tonumber) < (if $rule == 1 then $c1 else $c2 end))
+    | [.id, $rule, $s, (.date_updated // "0"), ([.assignees[]? | .username // .email // (.id | tostring)] | join(",")),
+       ([tagnames[] | select(IN($ht[]))] | join(",")), (.name | gsub("[\t\n\r]"; " "))] | @tsv' <<<"$tasks") \
+    || cu_die "cannot read the tasks of the space"
+  refs=$(cu_drone_refs "$(cut -f1 <<<"$cand")")
+  cu_stale_row action id rule change idle reason name
+  # Tab is IFS whitespace: read would merge empty columns, so the columns are split on \037 instead.
+  while IFS=$'\037' read -r -u 3 id rule st upd who tags name; do
+    [ -n "$id" ] || continue
+    if [ "$rule" = 1 ]; then to=$to1 cut=$cut1 days=$d1; else to=$to2 cut=$cut2 days=$d2; fi
+    cj=$(cu_api GET "/task/$id/comment") && c=$(jq '[.comments[]?.date // "0" | tonumber] | max // 0' <<<"$cj") \
+      || { cu_stale_row SKIP "$id" "$rule" "$st" - "its comments cannot be read" "$name"; n_skip=$((n_skip + 1)); continue; }
+    rep=$(awk -F'\t' -v i="$id" '$1 == i && $5 > m { m = $5 } END { print (m ? m "000" : 0) }' <<<"$refs")
+    last=$upd; [ "$c" -gt "$last" ] && last=$c; [ "$rep" -gt "$last" ] && last=$rep
+    since=$(date -d "@$((last / 1000))" +%F); idle="$(( (now - last) / 86400000 ))d"
+    if [ "$last" -ge "$cut" ]; then cu_stale_row KEEP "$id" "$rule" "$st" "$idle" "moved on $since" "$name"; continue; fi
+    if [ "$rule" = 2 ]; then
+      named=$(awk -F'\t' -v i="$id" -v since="$((cut / 1000))" '$1 == i && ($3 == 1 || $4 >= since) { print $2 }' <<<"$refs" | paste -sd, -)
+      if [ -n "$named" ]; then cu_stale_row KEEP "$id" "$rule" "$st" "$idle" "named by the brief of $named" "$name"; continue; fi
+      if [ -n "$who$tags" ]; then
+        cu_stale_row CHECK "$id" "$rule" "$st -> $to by hand" "$idle" \
+          "a person's task (${who:+assigned to $who}${who:+${tags:+, }}${tags:+tagged $tags})" "$name"
+        n_hand=$((n_hand + 1)); continue
+      fi
+      if ! awk -F'\t' -v i="$id" '$1 == i { f = 1 } END { exit !f }' <<<"$refs" \
+         && ! jq -e 'any(.comments[]?; .comment_text // "" | test("(^|\n)hive-(start|report):[^\\s:]+:[0-9]+(\n|$)"))' <<<"$cj" >/dev/null; then
+        cu_stale_row CHECK "$id" "$rule" "$st -> $to by hand" "$idle" "never the swarm's work (no drone names it, no hive-start or hive-report comment)" "$name"
+        n_hand=$((n_hand + 1)); continue
+      fi
+    fi
+    if [ "$yes" = 1 ]; then
+      json=$(cu_task "$id" 2>/dev/null) || { cu_stale_row SKIP "$id" "$rule" "$st" "$idle" "it cannot be read" "$name"; n_skip=$((n_skip + 1)); continue; }
+      if [ "$(cu_status_of "$json")" != "$st" ] || [ "$(jq -r '.date_updated // "0"' <<<"$json")" != "$upd" ]; then
+        cu_stale_row SKIP "$id" "$rule" "$st" "$idle" "changed in ClickUp since it was read" "$name"; n_skip=$((n_skip + 1)); continue
+      fi
+    fi
+    cu_stale_row "$([ "$yes" = 1 ] && echo APPLY || echo PLAN)" "$id" "$rule" "$st -> $to" "$idle" "no movement since $since" "$name"
+    n_plan=$((n_plan + 1))
+    [ "$yes" = 1 ] || continue
+    cu_set_status "$json" "$to" || { echo "FAILED $id status"; continue; }
+    text="🤖 hive ct stale, rule $rule: '$st' with no movement since $since (over $days days)$([ "$rule" = 2 ] && echo ", named by no drone's brief") → '$to'."
+    cu_comment_once "$id" "$text" || echo "FAILED $id comment — add it with: hive ct set $id --comment '${text//\'/\'\\\'\'}'"
+  done 3< <(tr '\t' '\037' <<<"$cand")
+  echo "stale: $n_plan to change, $n_hand for a person to check, $n_skip skipped$([ "$yes" = 1 ] || echo ' — dry run, rerun with --yes to write')"
+}
+
+# todo <id> "<item>" [--checklist NAME] — adds the item to the task's checklist of that name (default:
+# the config's 'checklist'), creating the checklist when the task has none. An item already there is
+# not added twice, and a retry first looks whether the timed-out attempt landed.
+ct_todo() {
+  local id="" item="" name="" cl rc
+  local -a CU_RETRY_GUARD=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --checklist) name=${2:?--checklist needs a name}; shift 2 ;;
+      *) if [ -z "$id" ]; then id=$1; elif [ -z "$item" ]; then item=$1; else cu_die "ct todo: unexpected argument '$1'"; fi; shift ;;
+    esac
+  done
+  item=$(cu_trim "$item"); name=$(cu_trim "${name:-$(cu_cfg checklist)}")
+  [ -n "$id" ] && [ -n "$item" ] && [ -n "$name" ] || cu_die 'usage: hive ct todo <id> "<item>" [--checklist NAME]'
+  cu_need
+  cl=$(cu_checklist_id "$id" "$name"); rc=$?
+  [ "$rc" = 2 ] && exit 1
+  if [ "$rc" != 0 ]; then
+    CU_RETRY_GUARD=(cu_checklist_id "$id" "$name")
+    cu_api POST "/task/$id/checklist" "$(jq -nc --arg n "$name" '{name: $n}')" >/dev/null || cu_die "checklist '$name' not created on $id"
+    CU_RETRY_GUARD=()
+    cl=$(cu_checklist_id "$id" "$name") || cu_die "checklist '$name' not found on $id after creating it"
+    echo "todo: $id new checklist '$name'"
+  fi
+  if cu_checklist_has "$id" "$cl" "$item"; then echo "todo: $id already has '$item' in '$name'"; return 0; fi
+  CU_RETRY_GUARD=(cu_checklist_has "$id" "$cl" "$item")
+  cu_api POST "/checklist/$cl/checklist_item" "$(jq -nc --arg n "$item" '{name: $n}')" >/dev/null || cu_die "item not added to '$name' on $id"
+  echo "todo: $id + '$item' in '$name'"
+}
+
 ct_sync() {  # sync — refreshes the cache and creates the taxonomy's tags missing from the space
   local t
   cu_need
@@ -972,6 +1127,8 @@ ct_main() {
     set)   ct_set   "$@" ;;
     check) ct_check "$@" ;;
     apply) ct_apply "$@" ;;
+    stale) ct_stale "$@" ;;
+    todo)  ct_todo  "$@" ;;
     sync)  ct_sync  "$@" ;;
     ack)   ct_ack   "$@" ;;
     *) cat <<'EOF'
@@ -986,7 +1143,10 @@ Every task has one front, one area and at least one module.
   hive ct check --module M[,M] [--impact M[,M]] [--task ID]   collisions with tasks in progress
   hive ct apply <file.tsv> [--yes]    bulk changes (id, front, area, modules, parent, current status,
                                       new status, comment); a dry run unless --yes
-  hive ct sync                        refresh the cache, create the taxonomy's missing tags
+  hive ct stale [--yes]               tasks left lying in testing or on hold (rules in the config);
+                                      a dry run unless --yes, a person's task only listed
+  hive ct todo <id> "<item>" [--checklist NAME]   an item on the task's checklist (created if missing)
+  hive ct sync                       refresh the cache, create the taxonomy's missing tags
   hive ct ack <drone> --manual "<reason>"   a report clickup-sync could not apply, settled by hand
 EOF
        [ -z "$sub" ] || [ "$sub" = help ] || [ "$sub" = -h ] || [ "$sub" = --help ] || exit 1 ;;
