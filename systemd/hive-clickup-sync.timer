@@ -1,0 +1,9 @@
+[Unit]
+Description=hivemind ClickUp sync every 15 minutes (the safety net: a drone's report is applied the moment it is written)
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -531,7 +531,7 @@ self-scoped to the registered coordinator session:
 
 | File | Hook | What it does |
 |---|---|---|
-| `coord-creed.md` | — | the eleven rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
+| `coord-creed.md` | — | the twelve rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
 | `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, whether the mail watcher is live, drones with a task in flight and their live pane state, how crowded the swarm directory is |
 | `coord-compact-brief.sh` | `PreCompact` | tells the summarizer what must survive — who is spawned and what they were told, unanswered drone questions, decisions pending for the user |
 
@@ -589,6 +589,114 @@ The brief is a contract. The drone knows nothing of your conversation with the u
 - **Required evidence** — test output, query results. Otherwise you get an optimistic
   "done" with nothing behind it.
 - `hive task` appends the reporting protocol itself — do not rewrite it.
+- With ClickUp tracking on, the header lines `ClickUp:`, `Modules:` and `Impact:` (next section).
+
+## Task tracking in ClickUp (optional)
+
+Off until `~/.herdr-hive/clickup/config` exists: without it hive makes no ClickUp call and a brief
+needs no task. To turn it on copy `clickup.conf.example` and `taxonomy.tsv.example` from the skill
+directory to `~/.herdr-hive/clickup/config` and `taxonomy.tsv`, fill them in, and run `hive ct sync`
+(it creates the taxonomy's tags in the space and the search cache). It needs `jq`.
+
+**One writer.** Everything goes through `hive` and its single client (`clickup.sh`): the token comes from
+`token_cmd` or `token_file` straight into a private file, never argv, a log or a letter; four attempts,
+a 429 waited out until the rate limit resets. Drones never write to ClickUp themselves: their reports
+reach the task through `clickup-sync.sh`. The coordinator reads ClickUp freely and writes through
+`hive ct`.
+
+**Categories are tags**, one taxonomy for every front (`taxonomy.tsv`): a task has exactly one *front*
+(`front-<name>`, the front whose coordinator leads it), at least one *module* (the systems it touches),
+exactly one *area* (what the work is for; its epic is suggested as the parent) and at most one *type*
+(e.g. an analysis). A tag outside the taxonomy is refused with the list of the right ones, so a typo
+never becomes a tag. On the command line and in a brief a tag may be named without its prefix.
+
+| Command | Does |
+|---|---|
+| `hive ct find <words> [--module M] [--area A] [--front F] [--closed]` | searches the cache (open tasks and those closed in 30 days, refreshed when older than 10 min); filters by tag on the hive side |
+| `hive ct new --area A --module M[,M] --name "…" [--type T] [--parent ID] [--desc FILE] [--status S] [--not-dup ID,…]` | creates in the caller's front; first refuses while tasks in the same area or modules look alike. `--not-dup` = "checked, not these" and lands as a comment |
+| `hive ct show <id>` | status, tags by kind, parent, subtasks, PRs from report comments, description, latest comments — a drone's first command |
+| `hive ct set <id> [--status S] [--comment T\|@F] [--area A] [--module +M,-M] [--type T\|none] [--parent ID] [--front F]` | `--front` hands the task to another front, with a comment |
+| `hive ct check --module M[,M] [--impact M[,M]] [--task ID]` | collisions (below); exit 1 when there are any |
+| `hive ct apply <file.tsv> [--yes]` | bulk changes, a dry run unless `--yes`. Columns: id, front, area, modules, parent, current status, new status, comment. A row whose current status changed in ClickUp is skipped; a wrong field skips only that field; a second run changes nothing |
+| `hive ct sync` | refreshes the cache, creates the taxonomy's missing tags |
+| `hive ct ack <drone> --manual "<reason>"` | a report the sync could not apply, settled by hand; the reason goes to `clickup/sync.log` |
+
+**The brief's header** — `hive task` refuses a brief without it:
+```
+ClickUp: abc123def
+Modules: api, db
+Impact: web            (or "Impact: none")
+```
+The gate checks, in order: the task exists (ClickUp answers a task id nobody has with 401 `OAUTH_027`,
+not 404 — told apart from a rejected token, `OAUTH_025`); it is open; its one front is the briefing
+coordinator's (a task of another front is taken over only on purpose: `hive ct set <id> --front <mine>`);
+it has one area; no collision is left unsettled. Then the brief's modules the task lacks are added to
+it, an early status moves to `status_start`, the task gets a start comment (marked
+`hive-start:<drone>:<time>`), and the drone's `meta.json` records `clickup_task`, `modules` and `impact`.
+ClickUp being down lets the brief through with a warning — an outage must not stop the swarm — with
+collisions counted on the cache as it is and on the drones at work. `hive task` gives ClickUp 10
+seconds in all (token, task, cache catch-up, a look at each colliding task, start writes), so a network
+that drops packets holds the coordinator no longer. The catch-up asks only for the tasks changed since
+the last refresh, closed ones included; the full refresh is `clickup-sync.sh`'s (every 10 minutes at
+most), or the gate's when the cache has not had one for an hour. A task deleted or moved out of the
+space since is in no listing: the gate looks each colliding task up and drops the ones ClickUp no
+longer has. A cache the gate could not catch up is said in its warning. ClickUp refusing the call
+itself (any other 4xx) refuses the brief with ClickUp's message. The start writes ClickUp could not
+take in time, all of them while it is down, wait in a queue (`~/.herdr-hive/clickup/starts/`), and
+`clickup-sync.sh` replays them before the reports; a record is queued only once `hive task` is done
+with it, or as a `hive task` stopped by a signal exits (one killed outright leaves it for the sync to
+take up a minute later), and the marker keeps a replay from doubling the start comment.
+`HIVE_NO_CLICKUP=1` lets a brief without a task through on purpose. The config's `alias_*` keys add
+names for these lines, e.g. in your own language.
+
+**Collisions.** The modules checked are those of `Modules:` and `Impact:`. Another task collides when it
+is in an active status (`status_active`), shares a module, is not the task itself, an ancestor or a
+subtask, and is not an epic (a task with subtasks; epics gather work and would always collide). Every
+drone at work, in every front, counts too, with the modules of its brief, whatever its task's open
+status. A drone is not at work when its pane is dead, when the cache has its task closed, or when
+its report, newer than its brief, says `DONE` or `FAILED`; a `BLOCKED` drone still holds its modules. Each
+collision is listed with its status, front, shared modules, drone and PRs. The only way through is one
+line per colliding task, with a reason:
+```
+Collision checked: abc124xyz — other files and tables, the PR does not touch the planner
+```
+A line without a reason, or for a task that does not collide, is refused. Each accepted line becomes a
+comment on both tasks, so the other front sees who entered its module and why. A drone that finds it
+must touch a module outside its brief runs `hive ct check --module X --task <its task>` and stops at a
+collision, writing to the coordinator before it commits there.
+
+**Reports reach the task by themselves.** The protocol asks every tracked drone for:
+```
+## ClickUp
+task: abc123def
+status: <proposed>
+comment: <1-3 sentences>
+pr: <URL>          (one per line, optional)
+branch: <name>     (optional; the protocol asks for '<task id>-<slug>')
+## Prod
+<what was checked in production after the deploy>   (required for status_done)
+```
+`drone-ping.sh` runs `clickup-sync.sh` the moment the report is written (in the background), and the
+end-of-turn letter's subject says how it went: `ClickUp <id> → <status> ✓` or `✗ <why>`. A systemd user
+timer (`hive-clickup-sync.timer`, every 15 minutes) is the safety net. The sync adds one comment — the
+drone's STATUS, the proposed status, comment, PRs, branch and the `## Result` section (cut at 8000
+characters, pointing at the report; ClickUp itself takes 40000) — and sets the status: `done` and
+`complete` mean `status_done`; with `status_unverified` set, `status_done` without a `## Prod` section
+lands there instead, unless the task carries the `verify_exempt` tag (an analysis is done once
+delivered). A closed task is never reopened. The comment ends with `hive-report:<drone>:<mtime>`, looked
+for before commenting and again before a retry of the comment (an attempt that timed out may have
+landed), so neither a lost state nor a lost answer doubles it; `flock` keeps the hook and the timer
+apart. The
+coordinator gets a `CLICKUP` letter only when a person is needed: no section, no task, a task that does
+not exist, a status the list lacks, `status_done` lowered for want of `## Prod`, ClickUp failing (once;
+the report is retried on every run). Reports in an older format (with an `applied:` line) and those of
+drones holding no task are left alone.
+
+**A task's life:** created by `hive ct new` (`status_early` or the given status, tags, parent) → a drone
+starts (`status_start`, start comment) → its report with an open PR (`in review` or what your list calls
+it) → merged (`status_unverified`) → deployed and checked in production, a report with `## Prod`
+(`status_done`). A drone moved to another front (`hive move`) takes its task's front along, with a
+comment. A duplicate found later: `hive ct set <id> --status <cancelled> --comment "duplicate of <id>"`.
 
 ## Typical flow
 

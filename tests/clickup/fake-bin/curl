@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Stand-in for curl in tests/clickup: a small ClickUp API v2 over files in $FAKE_CU.
+#   tasks/<id>.json      a task (id, name, status{status,type}, tags[{name}], parent, list{id}, date_updated, ...)
+#   comments/<id>.json   its comments, newest first
+#   space-tags.json      the space's tags;  statuses.json  the list's statuses
+# Like the live API: an unknown task id is 401 OAUTH_027, a bad token 401 OAUTH_025, a comment over
+# 40000 characters 413 COMM_160.
+# Faults: $FAKE_CU/down (connection refused), $FAKE_CU/hang (a network that drops packets: the call
+# hangs until curl's --connect-timeout or --max-time, or 300 s without them), $FAKE_CU/429 (holds a
+# count of 429 answers to give), $FAKE_CU/lost (a count of comment POSTs that land but answer 500, as
+# when the answer is lost), $FAKE_CU/refuse (a count of 400 answers to give), $FAKE_CU/slow (seconds
+# every request takes), $FAKE_CU/hangwrites (every POST, PUT and DELETE hangs like hang, GETs answer),
+# $FAKE_CU/fail (lines '<code> <count> <METHOD> <path glob>': the first line matching a request, while
+# its count lasts, answers <code> and changes nothing; 401 is a rejected token, 429 a rate limit).
+# argv of every call goes to $FAKE_CU/curl.argv; every request to $FAKE_CU/requests.log.
+set -u
+D=${FAKE_CU:?}
+printf '%s\n' "$*" >> "$D/curl.argv"
+method=GET hdrout=/dev/null out=/dev/stdout wfmt="" data="" auth="" url="" limit=300
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method=$2; shift 2 ;;
+    -D) hdrout=$2; shift 2 ;;
+    -o) out=$2; shift 2 ;;
+    -w) wfmt=$2; shift 2 ;;
+    -H) case "$2" in @*) auth=$(cat "${2#@}") ;; esac; shift 2 ;;
+    --data-binary) data=$(cat "${2#@}"); shift 2 ;;
+    --max-time|--connect-timeout) [ "$2" -lt "$limit" ] && limit=$2; shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[ -e "$D/down" ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }
+[ -e "$D/hang" ] && { sleep "$limit"; echo "curl: (28) Connection timed out" >&2; exit 28; }
+[ -e "$D/hangwrites" ] && [ "$method" != GET ] && { sleep "$limit"; echo "curl: (28) Connection timed out" >&2; exit 28; }
+[ -s "$D/slow" ] && sleep "$(cat "$D/slow")"
+exec 7>"$D/.lock"; flock 7   # one request at a time: two writers must not lose each other's write
+path=${url#https://api.clickup.com/api/v2}; query=""
+case "$path" in *\?*) query=${path#*\?}; path=${path%%\?*} ;; esac
+printf '%s %s %s\n' "$method" "$path" "$data" >> "$D/requests.log"
+reply() {  # reply <code> <json>
+  printf 'HTTP/1.1 %s\r\nx-ratelimit-reset: %s\r\n\r\n' "$1" "$(date +%s)" > "$hdrout"
+  printf '%s' "$2" > "$out"
+  [ -n "$wfmt" ] && printf '%s' "$1"
+  exit 0
+}
+# ClickUp answers a task id nobody has with 401 OAUTH_027, not 404 (checked on the live API).
+missing() { reply 401 '{"err":"Team not authorized","ECODE":"OAUTH_027"}'; }
+if [ -s "$D/fail" ]; then
+  hit="" rules=""
+  while read -r fcode fcount fmethod fglob; do
+    if [ -z "$hit" ] && [ "$fcount" -gt 0 ] && [ "$fmethod" = "$method" ] && [[ $path == $fglob ]]; then
+      hit=$fcode; fcount=$((fcount - 1))
+    fi
+    rules+="$fcode $fcount $fmethod $fglob"$'\n'
+  done < "$D/fail"
+  printf '%s' "$rules" > "$D/fail"
+  case "$hit" in
+    '') ;;
+    401) reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}' ;;
+    429) reply 429 '{"err":"Rate limit reached"}' ;;
+    *) reply "$hit" '{"err":"Internal"}' ;;
+  esac
+fi
+if [ -s "$D/429" ] && [ "$(cat "$D/429")" -gt 0 ]; then echo $(( $(cat "$D/429") - 1 )) > "$D/429"; reply 429 '{"err":"Rate limit reached"}'; fi
+if [ -s "$D/refuse" ] && [ "$(cat "$D/refuse")" -gt 0 ]; then echo $(( $(cat "$D/refuse") - 1 )) > "$D/refuse"; reply 400 '{"err":"Bad request","ECODE":"INPUT_002"}'; fi
+[ "$auth" = "Authorization: pk_fake_SECRET_TOKEN" ] || reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}'
+now=$(( $(date +%s) * 1000 ))
+T="$D/tasks"; C="$D/comments"; mkdir -p "$T" "$C"
+touch_task() { jq --arg n "$now" '.date_updated = $n' "$T/$1.json" > "$T/$1.tmp" && mv "$T/$1.tmp" "$T/$1.json"; }
+case "$method $path" in
+  "GET /task/"*/comment)
+    id=${path#/task/}; id=${id%/comment}; [ -f "$T/$id.json" ] || missing
+    reply 200 "$(jq -c '{comments: .[:25]}' "$C/$id.json" 2>/dev/null || echo '{"comments":[]}')" ;;
+  "POST /task/"*/comment)
+    id=${path#/task/}; id=${id%/comment}; [ -f "$T/$id.json" ] || missing
+    [ "$(jq '.comment_text | length' <<<"$data")" -le 40000 ] \
+      || reply 413 '{"err":"Comment content exceeds maximum allowed length of 40000 characters","ECODE":"COMM_160"}'
+    [ -f "$C/$id.json" ] || echo '[]' > "$C/$id.json"
+    jq --argjson b "$data" --arg n "$now" '[{id: ("c" + $n + (length|tostring)), comment_text: $b.comment_text, date: $n, user: {username: "tester"}}] + .' \
+      "$C/$id.json" > "$C/$id.tmp" && mv "$C/$id.tmp" "$C/$id.json"
+    if [ -s "$D/lost" ] && [ "$(cat "$D/lost")" -gt 0 ]; then echo $(( $(cat "$D/lost") - 1 )) > "$D/lost"; reply 500 '{"err":"Internal"}'; fi
+    reply 200 '{"id":"c1"}' ;;
+  "POST /task/"*/tag/*|"DELETE /task/"*/tag/*)
+    id=${path#/task/}; id=${id%%/*}; tag=$(printf '%b' "${path##*/tag/}" | sed 's/%20/ /g')
+    [ -f "$T/$id.json" ] || missing
+    if [ "$method" = POST ]; then f='.tags = ((.tags // []) + [{name: $t}] | unique_by(.name))'; else f='.tags = [(.tags // [])[] | select(.name != $t)]'; fi
+    jq --arg t "$tag" "$f" "$T/$id.json" > "$T/$id.tmp" && mv "$T/$id.tmp" "$T/$id.json"; touch_task "$id"
+    reply 200 '{}' ;;
+  "GET /task/"*)
+    id=${path#/task/}; [ -f "$T/$id.json" ] || missing
+    reply 200 "$(jq -c --slurpfile all <(cat "$T"/*.json) '. as $t | . + {subtasks: [$all[] | select(.parent == $t.id)]}' "$T/$id.json")" ;;
+  "PUT /task/"*)
+    id=${path#/task/}; [ -f "$T/$id.json" ] || missing
+    if jq -e '.status' <<<"$data" >/dev/null; then
+      jq -e --argjson b "$data" 'any(.[]; .status == $b.status)' "$D/statuses.json" >/dev/null || reply 400 '{"err":"Status does not exist","ECODE":"CRTSK_001"}'
+    fi
+    jq --argjson b "$data" --slurpfile st "$D/statuses.json" \
+       '(if $b.status then .status = ($st[0][] | select(.status == $b.status)) else . end) | (if $b.parent then .parent = $b.parent else . end)' \
+       "$T/$id.json" > "$T/$id.tmp" && mv "$T/$id.tmp" "$T/$id.json"; touch_task "$id"
+    reply 200 "$(cat "$T/$id.json")" ;;
+  "DELETE /task/"*) rm -f "$T/${path#/task/}.json"; reply 204 '' ;;
+  "POST /list/"*/task)
+    n=$(( $(cat "$D/seq" 2>/dev/null || echo 100) + 1 )); echo "$n" > "$D/seq"; id="t$n"
+    jq -n --argjson b "$data" --arg id "$id" --arg l "$(p=${path#/list/}; echo "${p%/task}")" --arg n "$now" --slurpfile st "$D/statuses.json" \
+      '{id: $id, name: $b.name, url: ("https://app.clickup.com/t/" + $id), parent: ($b.parent // null), list: {id: $l},
+        status: ($st[0][] | select(.status == ($b.status // $st[0][0].status))), tags: [($b.tags // [])[] | {name: .}],
+        text_content: ($b.markdown_content // ""), date_updated: $n}' > "$T/$id.json"
+    reply 200 "$(cat "$T/$id.json")" ;;
+  "GET /list/"*) reply 200 "$(jq -c '{id: "list", statuses: .}' "$D/statuses.json")" ;;
+  "GET /space/"*/tag) reply 200 "$(jq -c '{tags: .}' "$D/space-tags.json")" ;;
+  "POST /space/"*/tag)
+    jq --argjson b "$data" '. + [$b.tag]' "$D/space-tags.json" > "$D/st.tmp" && mv "$D/st.tmp" "$D/space-tags.json"; reply 200 '{}' ;;
+  "GET /team/"*/task)
+    page=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^page=//p'); [ "${page:-0}" = 0 ] || reply 200 '{"tasks":[],"last_page":true}'
+    tag=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^tags%5B%5D=//p' | sed 's/%20/ /g')
+    closed=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^include_closed=//p')
+    since=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^date_updated_gt=//p')
+    reply 200 "$(cat "$T"/*.json 2>/dev/null | jq -sc --arg t "$tag" --arg c "$closed" --arg s "${since:-0}" \
+      '{tasks: [.[] | select(($t == "" or any(.tags[]?; .name == $t)) and ($c == "true" or .status.type != "closed")
+                            and ((.date_updated | tonumber) > ($s | tonumber)))], last_page: true}')" ;;
+esac
+reply 404 '{"err":"Route not found"}'

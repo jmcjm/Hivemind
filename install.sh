@@ -46,7 +46,8 @@ echo "== 2/9 Skill files =="
 mkdir -p "$SKILL_DST"
 for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-inject.sh \
          coord-compact-brief.sh coord-context-guard.sh coord-creed.md drone-settings.json \
-         coord-settings.json coord-CLAUDE.md accounts.conf.example SKILL.md; do
+         coord-settings.json coord-CLAUDE.md accounts.conf.example SKILL.md \
+         clickup.sh clickup-sync.sh clickup.conf.example taxonomy.tsv.example; do
   if [ -e "$SKILL_DST/$f" ] && ! cmp -s "$SRC/skill/$f" "$SKILL_DST/$f"; then
     cp "$SKILL_DST/$f" "$SKILL_DST/$f.bak-$STAMP"
     warn "existing $f archived as $f.bak-$STAMP"
@@ -55,8 +56,15 @@ for f in hive drone-ping.sh coord-mail-check.sh coord-scope.sh coord-creed-injec
 done
 chmod +x "$SKILL_DST/hive" "$SKILL_DST/drone-ping.sh" "$SKILL_DST/coord-mail-check.sh" \
          "$SKILL_DST/coord-creed-inject.sh" "$SKILL_DST/coord-compact-brief.sh" \
-         "$SKILL_DST/coord-context-guard.sh"
+         "$SKILL_DST/coord-context-guard.sh" "$SKILL_DST/clickup-sync.sh"
 ok "skill in $SKILL_DST"
+# Optional: ClickUp task tracking is off until ~/.herdr-hive/clickup/config exists, and needs jq.
+if [ -f "$HOME/.herdr-hive/clickup/config" ]; then
+  command -v jq >/dev/null && ok "ClickUp task tracking on (~/.herdr-hive/clickup/config)" \
+    || warn "ClickUp task tracking is configured but jq is missing — install jq"
+else
+  ok "ClickUp task tracking off — to turn it on see 'Task tracking in ClickUp' in SKILL.md"
+fi
 
 echo "== 3/9 hive in PATH =="
 mkdir -p "$BIN_DST"
@@ -161,6 +169,15 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
     ok "hive-sweep.timer active (every 5 min)"
   else
     warn "could not enable hive-sweep.timer — run: systemctl --user enable --now hive-sweep.timer"
+  fi
+  # The ClickUp sync's safety net: a report is applied the moment it is written, the timer catches
+  # what failed. Without the ClickUp config the sync does nothing.
+  cp "$SRC/systemd/hive-clickup-sync.service" "$SRC/systemd/hive-clickup-sync.timer" "$HOME/.config/systemd/user/"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now hive-clickup-sync.timer >/dev/null 2>&1; then
+    ok "hive-clickup-sync.timer active (every 15 min; a no-op without ~/.herdr-hive/clickup/config)"
+  else
+    warn "could not enable hive-clickup-sync.timer — run: systemctl --user enable --now hive-clickup-sync.timer"
   fi
 else
   # cron starts its jobs without the session bus, and without it notify-send cannot reach the

@@ -1,0 +1,16 @@
+# ~/.herdr-hive/clickup/taxonomy.tsv — the tags hive accepts, one taxonomy for every front.
+# Tab-separated: kind, tag, definition, epic (area only: the epic 'ct new' suggests as parent), default front.
+# kind: front (exactly one per task), module (at least one), area (exactly one), type (at most one).
+# A new module or area is one line here; 'hive ct sync' creates the tags missing from the space.
+kind	tag	definition	epic	default front
+front	front-default	Tasks the default front's coordinator leads.		default
+front	front-web	Tasks the web front's coordinator leads.		web
+module	mod-api	The public HTTP API and its workers.		default
+module	mod-web	The web frontend.		web
+module	mod-db	Database schema, migrations and data repairs.		default
+module	mod-infra	Clusters, deployment, secrets and helper services.		default
+area	area-billing	Invoices, payments and refunds end to end.	abc123def	default
+area	area-search	Product search: indexing, ranking and the search page.		web
+area	area-platform	Shared plumbing: builds, deployment, observability.		default
+area	area-other	Work with no lasting area.		default
+type	type-analysis	An analysis: done once delivered, it points at or creates the tasks that carry it out.

@@ -1,0 +1,45 @@
+# ~/.herdr-hive/clickup/config — turns ClickUp task tracking on (see "Task tracking in ClickUp" in
+# SKILL.md). Without this file hive makes no ClickUp call and a brief needs no task.
+# Format: key = value, one a line; lines starting with # are comments. Lists are separated by '|'.
+
+# Where the swarm's tasks live: the workspace (team) id, the space and the list new tasks go to.
+workspace = 1234567
+space = 7654321
+list = 9012345678
+
+# The API token: a command printing it on stdout (preferred — a password manager or a secret store),
+# or a file holding it (mode 0600). hive reads it once per command into a private directory; it never
+# reaches argv, a log or a letter.
+token_cmd = pass show clickup/api-token
+# token_file = ~/.config/clickup/token
+
+# Statuses, as the list names them (case does not matter).
+# early: a drone starting on such a task moves it to status_start.
+status_early = backlog | to do | ready
+# active: a task in one of these collides on its modules.
+status_active = ready | in progress | in review | testing
+# closed: the sync never reopens one.
+status_closed = done | cancelled
+# start: where 'hive task' moves an early task.
+status_start = in progress
+# done: what a drone's 'done' or 'complete' means.
+status_done = done
+# With status_unverified set, status_done needs a '## Prod' section in the report (what was checked
+# in production); without one the task lands here instead and the coordinator gets a letter.
+status_unverified = testing
+# A tag whose tasks may reach status_done without '## Prod' (e.g. an analysis, done once delivered).
+verify_exempt = type-analysis
+
+# Tag prefixes: on the command line and in a brief a module, an area, a type or a front may be named
+# without its prefix ('Modules: api' for the tag mod-api). The front tag is <prefix_front><front name>.
+prefix_front = front-
+prefix_module = mod-
+prefix_area = area-
+prefix_type = type-
+
+# Extra names for the brief's lines, e.g. in your own language: 'Modules:', 'Impact:', 'none' and
+# 'Collision checked:' always work.
+# alias_modules = Modul
+# alias_impact = Wirkung
+# alias_none = keine
+# alias_collision = Kollision geprueft
