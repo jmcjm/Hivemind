@@ -667,6 +667,15 @@ comment on both tasks, so the other front sees who entered its module and why. A
 must touch a module outside its brief runs `hive ct check --module X --task <its task>` and stops at a
 collision, writing to the coordinator before it commits there.
 
+**Read-only briefs skip the collisions.** A drone that only analyses or reviews changes no code, so it
+cannot clash with anybody. The config's `read_only_rules` lists the boundary blocks that mark such a
+brief (e.g. `read_only_rules = analysis | review`). A brief whose `Rules:` lines name one of them is
+read-only, whatever other blocks they name (`Rules: repo review` too). For it the gate checks no
+collision. Its `Collision checked:` lines are ignored: they refuse nothing and comment on no task.
+Everything else stays: the `ClickUp:`, `Modules:` and `Impact:` lines, the task's checks (open, front,
+one area), the start writes on its own task, `meta.json` and the report sync. With the key empty or
+absent every brief is checked as above.
+
 **Reports reach the task by themselves.** The protocol asks every tracked drone for:
 ```
 ## ClickUp

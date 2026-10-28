@@ -42,7 +42,8 @@ The twelve rules that must survive a compacted context. This file is the single 
     `~/.herdr-hive/clickup/config` exists.) Before a brief: `hive ct find` (create only through
     `hive ct new`, which refuses look-alikes) and `hive ct check --module …`. The brief carries
     `ClickUp: <id>`, `Modules: …` and `Impact: …|none`; a collision needs its own
-    `Collision checked: <id> — <reason>` line or the brief is refused. A deploy brief states the task's
+    `Collision checked: <id> — <reason>` line or the brief is refused (a read-only brief, one whose
+    `Rules:` name a block of the config's `read_only_rules`, skips the collisions). A deploy brief states the task's
     current and target status (done only with a `## Prod` section in the report). Never write to ClickUp
     any other way: drone reports reach their tasks by themselves (clickup-sync), and a report the sync
     could not apply comes as a `CLICKUP ✗` letter — settle it by hand, then `hive ct ack <drone> --manual

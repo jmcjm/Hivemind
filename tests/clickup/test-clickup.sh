@@ -130,6 +130,7 @@ alias_modules = Components
 alias_impact = Effect
 alias_none = nothing
 alias_collision = Clash checked
+read_only_rules = analysis | review
 EOF
 cat > "$CU/taxonomy.tsv" <<'EOF'
 # test taxonomy
@@ -418,6 +419,59 @@ run "$HIVE" task d4 "$T/b4r"
 eq "ClickUp refusing the task (a 4xx) refuses the brief" 1 "$RC"
 has "with ClickUp's word" "HTTP 400 (Bad request INPUT_002)" "$ERR"
 rm -f "$FAKE_PANES/p4.status"
+section "hive task: a read-only brief"
+for b in repo review analysis; do echo "- $b only" > "$HIVE_RULES_DIR/$b.md"; done
+ro_key() { grep -v '^read_only_rules' "$T/config.good" > "$CU/config"; [ "$#" = 0 ] || echo "read_only_rules = $1" >> "$CU/config"; }
+ro_brief() { local f=$1; shift; printf '%s\n' "$@" > "$f"; }   # its boundaries come from the 'Rules:' lines
+others() { echo "$(ncomments tinv001) $(ncomments tsrch01) $(ncomments tref001)"; }
+mktask trdo001 backlog "front-default,area-other,mod-api" "Review: refunds"
+mkdrone d5 p5 working
+base=$(others); read -r a b c <<<"$base"; plus1="$((a + 1)) $((b + 1)) $((c + 1))"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "Rules: repo review"
+run "$HIVE" task d5 "$T/b5r"
+eq "a brief naming a read-only block passes its collisions" 0 "$RC"
+eq "without a comment on the tasks it collides with" "$base" "$(others)"
+has "its own task gets the start comment" "drone d5 (front default) start: Review refunds; modules: api" "$(comments_of trdo001)"
+hasnt "and no collision comment" "collision checked" "$(comments_of trdo001)"
+eq "the boundaries are still expanded" "1 1" "$(grep -c '^- repo only' "$HIVE_DIR/drones/d5/brief.md") $(grep -c '^- review only' "$HIVE_DIR/drones/d5/brief.md")"
+eq "the drone holds its task and modules" "trdo001 api" "$(meta_of d5 clickup_task) $(meta_of d5 modules)"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "- **Rules:** \`analysis\`." \
+  "Collision checked: tinv001 — reads only" "Collision checked: thold01" "Collision checked: tsrch01"
+run "$HIVE" task d5 "$T/b5r"
+eq "its 'Collision checked' lines are ignored: wrong ones refuse nothing (a list item names the block)" 0 "$RC"
+eq "and right ones comment nowhere" "$base" "$(others)"
+hasnt "not on its own task either" "collision checked" "$(comments_of trdo001)"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "Rules: repo"
+run "$HIVE" task d5 "$T/b5r"
+eq "a brief without a read-only block is refused" 1 "$RC"
+has "listing the collisions" "tinv001" "$ERR"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "Rules: repo" '```' "Rules: review" '```'
+run "$HIVE" task d5 "$T/b5r"
+eq "nor does a 'Rules:' line in a code fence count" 1 "$RC"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "Rules: repo review"
+ro_key ""
+run "$HIVE" task d5 "$T/b5r"
+eq "an empty read_only_rules: the gate as before" 1 "$RC"
+has "with the way through" "Collision checked: <id>" "$ERR"
+ro_key
+run "$HIVE" task d5 "$T/b5r"
+eq "and without the key" 1 "$RC"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "Rules: repo review" \
+  "Collision checked: tinv001 — reads only" "Collision checked: tsrch01 — reads only" "Collision checked: tref001 — reads only"
+run "$HIVE" task d5 "$T/b5r"
+eq "where its settled collisions pass" 0 "$RC"
+eq "and comment on the other tasks" "$plus1" "$(others)"
+ro_key "Analysis | REVIEW"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Modules: api" "Impact: none" "Rules: review"
+run "$HIVE" task d5 "$T/b5r"
+eq "the config's block names are matched in any case" 0 "$RC"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: tsrch01" "Modules: api" "Impact: none" "Rules: review"
+run "$HIVE" task d5 "$T/b5r"
+has "the rest of the gate still holds: a task of another front" "hive ct set tsrch01 --front default" "$ERR"
+ro_brief "$T/b5r" "# Review refunds" "ClickUp: trdo001" "Impact: none" "Rules: review"
+run "$HIVE" task d5 "$T/b5r"
+has "and the brief's header" "no 'Modules:" "$ERR"
+cp "$T/config.good" "$CU/config"; rm -f "$FAKE_PANES/p5.status"
 section "hive task: ClickUp down"
 mkdrone d3 p3 working
 touch "$FAKE_CU/down"

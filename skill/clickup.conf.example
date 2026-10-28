@@ -51,6 +51,12 @@ verify_exempt = type-analysis
 # its latest 25 comments has a line of its own hive-start:<drone>:<time> or hive-report:<drone>:<mtime>.
 # stale_human_tags = human
 
+# Boundary blocks that make a brief read-only (an analysis, a review): a brief whose 'Rules:' lines
+# name one of them, whatever other blocks they name, skips the collision check and its
+# 'Collision checked:' lines are ignored, so it comments on no other task. The rest of the gate stays.
+# Empty or absent: every brief is checked for collisions.
+# read_only_rules = analysis | review
+
 # Tag prefixes: on the command line and in a brief a module, an area, a type or a front may be named
 # without its prefix ('Modules: api' for the tag mod-api). The front tag is <prefix_front><front name>.
 prefix_front = front-

@@ -527,6 +527,27 @@ cu_brief_header() {
   CU_CHECKED=$(cu_brief_values "$1" "Collision checked" alias_collision)
 }
 
+# cu_brief_rules <brief> — the boundary blocks its 'Rules:' lines name, lower case, one a line: the
+# lines hive's rules_expand reads (a list item too, never one in a code fence).
+cu_brief_rules() {
+  awk -v kw='rules' '
+    /^ ? ? ?(```|~~~)/ { f = $0; sub(/^ +/, "", f); f = substr(f, 1, 3)
+      if (fence == "") { fence = f; next }
+      if (f == fence) { fence = ""; next } }
+    fence != "" { next }
+    { low = tolower($0); re = "^ ? ? ?([>*_-]+[[:space:]]*)*(" kw ")[*_]*[[:space:]]*:[*_]*[[:space:]]*"
+      if (!match(low, re)) next
+      arg = substr(low, RLENGTH + 1); gsub(/^[ *_`.]+|[ *_`.]+$/, "", arg)
+      n = split(arg, a, /[[:space:],;`]+/); for (i = 1; i <= n; i++) if (a[i] != "") print a[i] }' "$1"
+}
+
+# cu_read_only <brief> — 0 when its 'Rules:' lines name a block of read_only_rules (e.g. an analysis or
+# a review, whatever other blocks they name): its drone changes no code, so it collides with nobody.
+cu_read_only() {
+  local ro; ro=$(cu_list read_only_rules)
+  [ -n "$ro" ] && grep -qxF -- "$ro" <<<"$(cu_brief_rules "$1")"
+}
+
 # cu_claims [except-front except-drone] — CU_CLAIMS: the drones at work on a task (hive's
 # drone_claims: front, drone, task, modules), every front. Empty where hive is not around.
 cu_claims() {
@@ -639,7 +660,8 @@ CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_
 # on the drones at work. ClickUp gets CU_GATE_BUDGET seconds for the whole of 'hive task': the token,
 # the task, the cache catch-up (only the tasks changed since the last refresh), a look at each task
 # it collides with, and the start writes (cu_started ends the budget; a write it cuts short waits in
-# the start queue). A network that drops packets must not hold the coordinator for minutes.
+# the start queue). A network that drops packets must not hold the coordinator for minutes. A
+# read-only brief (cu_read_only) is checked for all of it but the collisions.
 # Leaves the task id in CU_GATE_ID, the task in CU_GATE_TASK and CU_UP=1 when ClickUp answered.
 cu_gate() {
   local drone=$1 id=$2 brief=$3 front=$4 rc mine fronts areas col err warn=""
@@ -672,6 +694,9 @@ cu_gate() {
       return 1
     fi
   fi
+  # A read-only brief skips the collisions: its 'Collision checked' lines are ignored, so no comment
+  # lands on another task.
+  if cu_read_only "$brief"; then CU_SETTLED=""; CU_GATE_MSG=$warn; return 0; fi
   if [ "$CU_UP" = 1 ] && ! cu_registry_catchup 2>"$CU_TMP/gate.err"; then
     err=$(tail -1 "$CU_TMP/gate.err" | sed 's/^clickup: //')
     warn="the cache was not refreshed${err:+ ($err)} — collisions counted on the cache$([ -f "$CU_REGISTRY" ] && date -r "$CU_REGISTRY" '+ from %Y-%m-%d %H:%M' || echo ' (there is none)') and the drones at work"
