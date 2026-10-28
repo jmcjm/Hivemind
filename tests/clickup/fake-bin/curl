@@ -7,11 +7,15 @@
 # 40000 characters 413 COMM_160.
 # Faults: $FAKE_CU/down (connection refused), $FAKE_CU/hang (a network that drops packets: the call
 # hangs until curl's --connect-timeout or --max-time, or 300 s without them), $FAKE_CU/429 (holds a
-# count of 429 answers to give), $FAKE_CU/lost (a count of comment POSTs that land but answer 500, as
-# when the answer is lost), $FAKE_CU/refuse (a count of 400 answers to give), $FAKE_CU/slow (seconds
-# every request takes), $FAKE_CU/hangwrites (every POST, PUT and DELETE hangs like hang, GETs answer),
-# $FAKE_CU/fail (lines '<code> <count> <METHOD> <path glob>': the first line matching a request, while
-# its count lasts, answers <code> and changes nothing; 401 is a rejected token, 429 a rate limit).
+# count of 429 answers to give), $FAKE_CU/lost (a count of comment and checklist item POSTs that land
+# but answer 500, as when the answer is lost), $FAKE_CU/refuse (a count of 400 answers to give),
+# $FAKE_CU/slow (seconds every request takes), $FAKE_CU/hangwrites (every POST, PUT and DELETE hangs
+# like hang, GETs answer), $FAKE_CU/fail (lines '<code> <count> <METHOD> <path glob>': the first line
+# matching a request, while its count lasts, answers <code> and changes nothing; 401 is a rejected
+# token, 429 a rate limit).
+# Edits: $FAKE_CU/edit (lines '<METHOD> <path glob> <task id> <jq filter>': the first request matching
+# a line applies the filter to that task, as a change somebody made meanwhile, and the line goes).
+# Checklists live in the task: .checklists[{id, name, items[{id, name}]}].
 # argv of every call goes to $FAKE_CU/curl.argv; every request to $FAKE_CU/requests.log.
 set -u
 D=${FAKE_CU:?}
@@ -46,6 +50,15 @@ reply() {  # reply <code> <json>
 }
 # ClickUp answers a task id nobody has with 401 OAUTH_027, not 404 (checked on the live API).
 missing() { reply 401 '{"err":"Team not authorized","ECODE":"OAUTH_027"}'; }
+if [ -s "$D/edit" ]; then
+  left=""
+  while read -r emethod eglob eid efilter; do
+    if [ "$emethod" = "$method" ] && [[ $path == $eglob ]] && [ -f "$D/tasks/$eid.json" ]; then
+      jq "$efilter" "$D/tasks/$eid.json" > "$D/tasks/$eid.tmp" && mv "$D/tasks/$eid.tmp" "$D/tasks/$eid.json"
+    else left+="$emethod $eglob $eid $efilter"$'\n'; fi
+  done < "$D/edit"
+  printf '%s' "$left" > "$D/edit"
+fi
 if [ -s "$D/fail" ]; then
   hit="" rules=""
   while read -r fcode fcount fmethod fglob; do
@@ -81,6 +94,19 @@ case "$method $path" in
       "$C/$id.json" > "$C/$id.tmp" && mv "$C/$id.tmp" "$C/$id.json"
     if [ -s "$D/lost" ] && [ "$(cat "$D/lost")" -gt 0 ]; then echo $(( $(cat "$D/lost") - 1 )) > "$D/lost"; reply 500 '{"err":"Internal"}'; fi
     reply 200 '{"id":"c1"}' ;;
+  "POST /task/"*/checklist)
+    id=${path#/task/}; id=${id%/checklist}; [ -f "$T/$id.json" ] || missing
+    cid="cl$id$(jq '.checklists // [] | length' "$T/$id.json")"
+    jq --argjson b "$data" --arg c "$cid" '.checklists = ((.checklists // []) + [{id: $c, name: $b.name, items: []}])' \
+      "$T/$id.json" > "$T/$id.tmp" && mv "$T/$id.tmp" "$T/$id.json"; touch_task "$id"
+    reply 200 "$(jq -c --arg c "$cid" '{checklist: (.checklists[] | select(.id == $c))}' "$T/$id.json")" ;;
+  "POST /checklist/"*/checklist_item)
+    cid=${path#/checklist/}; cid=${cid%/checklist_item}
+    f=$(grep -lF "\"$cid\"" "$T"/*.json | head -1); [ -n "$f" ] || reply 404 '{"err":"Checklist not found","ECODE":"CHECK_004"}'
+    jq --argjson b "$data" --arg c "$cid" '.checklists |= map(if .id == $c then .items += [{id: ($c + "-" + (.items | length | tostring)), name: $b.name}] else . end)' \
+      "$f" > "$f.tmp" && mv "$f.tmp" "$f"; id=$(basename "$f" .json); touch_task "$id"
+    if [ -s "$D/lost" ] && [ "$(cat "$D/lost")" -gt 0 ]; then echo $(( $(cat "$D/lost") - 1 )) > "$D/lost"; reply 500 '{"err":"Internal"}'; fi
+    reply 200 "$(jq -c --arg c "$cid" '{checklist: (.checklists[] | select(.id == $c))}' "$f")" ;;
   "POST /task/"*/tag/*|"DELETE /task/"*/tag/*)
     id=${path#/task/}; id=${id%%/*}; tag=$(printf '%b' "${path##*/tag/}" | sed 's/%20/ /g')
     [ -f "$T/$id.json" ] || missing
