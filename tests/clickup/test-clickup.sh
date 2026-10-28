@@ -570,6 +570,14 @@ run "$HIVE" task e1 "$T/be1"
 eq "a catch-up ClickUp fails on lets the brief through" 0 "$RC"
 has "telling the caller the cache was used" "warning — the cache was not refreshed" "$ERR"
 rm -f "$FAKE_CU/fail"
+mktask tcu005 "in progress" "front-default,area-other,mod-cache" "Cache: collides while the catch-up fails"
+run "$HIVE" task e1 "$T/be1"
+echo '401 1 GET /team/*' > "$FAKE_CU/fail"
+run "$HIVE" task e1 "$T/be1"
+eq "a collision on a cache the gate could not refresh refuses" 1 "$RC"
+has "saying the cache was not refreshed" "warning: the cache was not refreshed" "$ERR"
+rm -f "$FAKE_CU/fail"; closed_now tcu005; touched tcu005
+run "$HIVE" task e1 "$T/be1"
 mktask tcu007 "in progress" "front-default,area-other,mod-cache" "Cache: only a full refresh finds it"
 jq '.date_updated = "1000"' "$FAKE_CU/tasks/tcu007.json" > "$T/u" && mv "$T/u" "$FAKE_CU/tasks/tcu007.json"
 run "$HIVE" task e1 "$T/be1"
@@ -578,18 +586,35 @@ touch -d '-2 hours' "$CU/registry.full"
 run "$HIVE" task e1 "$T/be1"
 eq "and found once it is not: the gate refreshes the whole cache" 1 "$RC"
 has "named" "tcu007" "$ERR"
-rm -f "$FAKE_CU/tasks/tcu007.json"; touch -d '-1 hour' "$CU/registry.full"
+rm -f "$FAKE_CU/tasks/tcu007.json"; touch -d '-20 minutes' "$CU/registry.full"
 sync_now
-eq "clickup-sync refreshes the whole cache once its last full refresh is old" "0 yes" \
+eq "clickup-sync refreshes the whole cache once its last full refresh is 10 minutes old" "0 yes" \
   "$(grep -c '^tcu007' "$CU/registry.tsv") $([ $(( $(date +%s) - $(stat -c %Y "$CU/registry.full") )) -lt 60 ] && echo yes || echo no)"
+section "hive task: a catch-up overlapping a slow full refresh of clickup-sync"
+# The catch-up's cache is 50 s old and has the task in progress; a full refresh began 200 s ago, when the
+# task was still in the backlog, and writes its cache, stamped then, while the catch-up lists the changes.
+RACE="$T/race/clickup"; mkdir -p "$RACE"; now=$(date +%s)
+racerows() { head -1 "$CU/registry.tsv"; printf 'tcu009\t%s\t\t\tcache\t\tCache: a race\t-\n' "$1"; }
+racerows "in progress" > "$RACE/registry.tsv"; touch -d "@$((now - 50))" "$RACE/registry.tsv"
+racerows backlog > "$RACE/sync.tsv"; touch -d "@$((now - 200))" "$RACE/sync.tsv" "$RACE/registry.full"
+HIVE_DIR="$T/race" bash -c '. "$1"; cu_space_rows() { mv -f "$CU_DIR/sync.tsv" "$CU_REGISTRY"; }; cu_registry_catchup' _ "$SK/clickup.sh"
+eq "the cache written meanwhile does not bring the task's old status back" "in progress" \
+  "$(awk -F'\t' '$1 == "tcu009" { print $2 }' "$RACE/registry.tsv")"
 section "hive task: stopped while making the start writes"
-for sig in TERM INT; do
+for sig in HUP TERM INT; do
   mkdrone "k${sig,,}" "pk$sig" working
   touch "$FAKE_CU/hangwrites"
   # Job control on: a background job of a script otherwise ignores SIGINT, and no trap could catch it.
   set -m; "$HIVE" task "k${sig,,}" "$T/be1" >/dev/null 2>&1 & bg=$!; set +m
-  for i in $(seq 150); do [ -n "$(find "$CU/starts" -name '.start.*')" ] && break; sleep 0.1; done
-  kill -"$sig" "$bg"; wait "$bg"
+  # Signalled once a write hangs: the trap waits for it to end, the shell's own exit on the signal would not.
+  for i in $(seq 150); do
+    [ -n "$(find "$CU/starts" -name '.start.*')" ] && tail -1 "$FAKE_CU/curl.argv" | grep -qE -- '-X (POST|PUT|DELETE)' && break
+    sleep 0.1
+  done
+  kill -"$sig" "$bg"; sleep 0.2
+  eq "SIG$sig waits for the write under way, the record out of the queue until it ends" "alive 0" \
+    "$(kill -0 "$bg" 2>/dev/null && echo alive || echo gone) $(nstarts)"
+  wait "$bg"
   rm -f "$FAKE_CU/hangwrites"
   eq "SIG$sig puts the start record being made in the queue" "1 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
   sync_now

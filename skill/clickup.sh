@@ -269,12 +269,15 @@ cu_age() { [ -f "$1" ] && echo $(( $(date +%s) - $(stat -c %Y "$1") )) || echo 9
 # ones too; a full refresh when there is no cache or its last full refresh is older than
 # CU_REGISTRY_STALE. A task deleted or moved out of the space is in no listing: it stays in the cache
 # until the next full refresh, so the gate checks a collision with it (cu_vanished).
+# The rows it starts from and their time come from one opening of the cache: one written meanwhile (a slow
+# full refresh of clickup-sync, stamped when it began) is never merged under this catch-up's later time.
 cu_registry_catchup() {
-  local began since rows
+  local began since rows base
   [ -f "$CU_REGISTRY" ] && [ "$(cu_age "$CU_REGISTRY_FULL")" -lt "$CU_REGISTRY_STALE" ] || { cu_registry_refresh; return; }
-  began=$(date +%s); since=$(( ($(stat -c %Y "$CU_REGISTRY") - CU_REGISTRY_OVERLAP) * 1000 ))
+  began=$(date +%s)
+  { since=$(( ($(stat -L -c %Y /dev/stdin) - CU_REGISTRY_OVERLAP) * 1000 )); base=$(tail -n +2); } < "$CU_REGISTRY"
   rows=$(cu_space_rows true "$since") || return
-  cu_registry_write "$rows"$'\n'"$(tail -n +2 "$CU_REGISTRY")" "$began"
+  cu_registry_write "$rows"$'\n'"$base" "$began"
 }
 
 # cu_vanished <collisions> — the tasks among them ClickUp no longer has in the space (deleted, or moved
