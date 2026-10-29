@@ -1315,6 +1315,7 @@ t_revive_reopens_the_drone_in_a_tab() {
 t_failed_start_closes_only_its_tab() {
   FAKE_AGENT_START_FAIL=1 spawn_home kafka > "$T/out" 2>&1 && fail "a failed launch reported success"
   assert_contains "$T/out" "failed to start the agent"
+  assert_count "$FAKE_HERDR_LOG" "agent start kafka" 1   # only agent_pane_busy is retried
   assert_contains "$FAKE_HERDR_LOG" "tab close w1:t9"
   assert_not_contains "$FAKE_HERDR_LOG" "workspace close"
 }
