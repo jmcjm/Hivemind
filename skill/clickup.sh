@@ -191,7 +191,7 @@ cu_api() {
   fi
   for (( attempt = 1; attempt <= CU_TRIES; attempt++ )); do
     max=$(cu_time 30); [ "$max" -gt 0 ] || break
-    if [ "$attempt" -gt 1 ] && [ "$code" != 429 ] && [ ${#guard[@]} -gt 0 ] && CU_TRIES=1 "${guard[@]}" 2>/dev/null; then
+    if [ "$attempt" -gt 1 ] && [ "$code" != 429 ] && [ ${#guard[@]} -gt 0 ] && CU_TRIES=1 "${guard[@]}" >/dev/null 2>&1; then
       rm -f "$out" "$hdr" "$data"; return 0
     fi
     code=$(curl "${args[@]}" --connect-timeout "$(( max < 5 ? max : 5 ))" --max-time "$max" "$CU_API$path" 2>/dev/null) || code=000
@@ -1224,8 +1224,8 @@ cu_decisions() {
 # cu_decision_match <name> <front-tag> — reads decisions, prints the id of a waiting one of that front
 # with that question; 1 when there is none.
 cu_decision_match() {
-  cu_jq_lines --arg n "${1,,}" --arg f "$2" \
-    'select((closed | not) and (.name | ascii_downcase) == $n and any(tagnames[]; . == $f)) | .id' | grep -m1 .
+  cu_jq_lines --arg n "$1" --arg f "$2" \
+    'select((closed | not) and (.name | ascii_downcase) == ($n | ascii_downcase) and any(tagnames[]; . == $f)) | .id' | grep -m1 .
 }
 cu_decision_waiting() { local all; all=$(cu_decisions) || return; cu_decision_match "$@" <<<"$all"; }
 cu_jq_lines() { local -a a=("$@"); local f=${a[-1]}; unset 'a[-1]'; jq -r "${CU_JQ_ARGS[@]}" "${a[@]}" "$CU_JQ_DEFS $f"; }
@@ -1274,7 +1274,7 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
 }
 
 ct_decision_answer() {  # decision answer <id> --comment TEXT|@FILE
-  local id="" comment="" st answered json task when
+  local id="" comment="" st answered json task
   while [ $# -gt 0 ]; do
     case "$1" in
       --comment) comment=${2:?--comment needs a text}; shift 2 ;;
@@ -1288,13 +1288,12 @@ ct_decision_answer() {  # decision answer <id> --comment TEXT|@FILE
   json=$(cu_task "$id") || exit 1
   [ "$(jq -r '.list.id // ""' <<<"$json")" = "$(cu_decision_list)" ] || cu_die "$id is not on the decision list"
   st=$(cu_decision_statuses) || exit 1; answered=$(tail -1 <<<"$st")
-  when=$(date +%F)
-  cu_comment_once "$id" "🤖 answer ($when, front $(front_label "${HIVE_FRONT:-}")): $comment" || cu_die "answer not added to $id"
+  cu_comment_once "$id" "🤖 answer: $comment" || cu_die "answer not added to $id"
   cu_set_status "$json" "$answered" || cu_die "status of $id not set"
   echo "decision: $id $answered"
   while IFS= read -r task; do
     [ -n "$task" ] || continue
-    cu_comment_once "$task" "🤖 decision $id answered ($when): $(jq -r .name <<<"$json") — $comment" \
+    cu_comment_once "$task" "🤖 decision $id answered: $(jq -r .name <<<"$json") — $comment" \
       && echo "decision: answer noted on $task" || cu_say "the answer not noted on $task"
   done < <(jq -r --arg me "$id" '.linked_tasks[]? | [.task_id, .link_id] | map(select(. != $me))[]' <<<"$json" | awk '!seen[$0]++')
 }

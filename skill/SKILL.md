@@ -531,7 +531,7 @@ self-scoped to the registered coordinator session:
 
 | File | Hook | What it does |
 |---|---|---|
-| `coord-creed.md` | — | the twelve rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
+| `coord-creed.md` | — | the thirteen rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
 | `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, whether the mail watcher is live, drones with a task in flight and their live pane state, how crowded the swarm directory is |
 | `coord-compact-brief.sh` | `PreCompact` | tells the summarizer what must survive — who is spawned and what they were told, unanswered drone questions, decisions pending for the user |
 

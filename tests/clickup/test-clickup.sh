@@ -1191,7 +1191,7 @@ DEC=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
 eq "on the decision list, waiting, with the caller's front" "9012345600 waiting front-default" \
   "$(task_field "$DEC" .list.id) $(task_field "$DEC" .status.status) $(tags_of "$DEC")"
 eq "the description from --desc" "## Context|Two layouts." "$(jq -j .text_content "$FAKE_CU/tasks/$DEC.json" | paste -sd'|')"
-eq "linked to its task" "$DEC" "$(task_field tdec01 '.linked_tasks[0].task_id')"
+eq "linked to its task" "$DEC" "$(task_field tdec01 '.linked_tasks[0].link_id')"
 has "and the task's history says it waits" "🤖 decision waiting: $DEC Which layout do we ship?" "$(comments_of tdec01)"
 run "$HIVE" ct decision new --name "which layout do we ship?" --task tdec01
 eq "the same question waiting in the front is refused" 1 "$RC"
@@ -1200,6 +1200,15 @@ run env HIVE_FRONT=web "$HIVE" ct decision new --name "Which layout do we ship?"
 eq "another front may ask it, without a task" 0 "$RC"
 DECW=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
 eq "in its front" "front-web" "$(tags_of "$DECW")"
+echo 1 > "$FAKE_CU/lost"
+run "$HIVE" ct decision new --name "Łączymy?"
+eq "a decision whose answer was lost (500)" 0 "$RC"
+DECL=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
+eq "is not created again by the retry" 1 "$(cat "$FAKE_CU"/tasks/*.json | jq -s '[.[] | select(.name == "Łączymy?")] | length')"
+run "$HIVE" ct decision new --name "Łączymy?"
+eq "a question with an uppercase letter beyond ASCII is a duplicate too" 1 "$RC"
+has "naming that decision" "decision $DECL already waits" "$ERR"
+rm -f "$FAKE_CU/tasks/$DECL.json"
 run "$HIVE" ct decision new --name "Anything?" --task nosuch01
 eq "an unknown task is refused" 1 "$RC"
 run "$HIVE" ct decision new --name $'Two\nlines'
@@ -1225,11 +1234,16 @@ hasnt "and out of 'ct find'" "$DEC" "$OUT"
 run "$HIVE" ct decision answer "$DEC" --comment "  Layout B, the owner said. "
 eq "answer exits 0" 0 "$RC"
 eq "the decision is answered" answered "$(task_field "$DEC" .status.status)"
-has "with the answer as a comment" "🤖 answer ($(date +%F), front default): Layout B, the owner said." "$(comments_of "$DEC")"
-has "noted on the linked task" "🤖 decision $DEC answered ($(date +%F)): Which layout do we ship? — Layout B, the owner said." "$(comments_of tdec01)"
+has "with the answer as a comment" "🤖 answer: Layout B, the owner said." "$(comments_of "$DEC")"
+has "noted on the linked task" "🤖 decision $DEC answered: Which layout do we ship? — Layout B, the owner said." "$(comments_of tdec01)"
 n=$(ncomments "$DEC")
 run "$HIVE" ct decision answer "$DEC" --comment "Layout B, the owner said."
 eq "the same answer again changes nothing" "0 $n 2" "$RC $(ncomments "$DEC") $(ncomments tdec01)"
+mkdir -p "$T/tomorrow"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = +%%F ] && { echo 2099-01-02; exit 0; }; done\nexec /usr/bin/date "$@"\n' > "$T/tomorrow/date"
+chmod +x "$T/tomorrow/date"
+run env PATH="$T/tomorrow:$PATH" HIVE_FRONT=web "$HIVE" ct decision answer "$DEC" --comment "Layout B, the owner said."
+eq "nor on another day, from another front" "0 $n 2" "$RC $(ncomments "$DEC") $(ncomments tdec01)"
 run "$HIVE" ct decision list --open
 eq "--open leaves the answered one out" "no decisions" "$OUT"
 run "$HIVE" ct decision list

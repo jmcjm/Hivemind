@@ -5,12 +5,13 @@
 #                        comment named by start_id (start and start_id of a page's last comment)
 #   space-tags.json      the space's tags;  statuses.json  the list's statuses, statuses-<list>.json
 #                        those of a list with statuses of its own
-#   linked_tasks         a task's links {task_id, link_id}; POST /task/<id>/link/<other> adds one to both
+#   linked_tasks         a task's links; POST /task/<id>/link/<other> adds {task_id: <other>, link_id: <id>}
+#                        to both, the direction the live API writes
 # Like the live API: an unknown task id is 401 OAUTH_027, a bad token 401 OAUTH_025, a comment over
 # 40000 characters 413 COMM_160.
 # Faults: $FAKE_CU/down (connection refused), $FAKE_CU/hang (a network that drops packets: the call
 # hangs until curl's --connect-timeout or --max-time, or 300 s without them), $FAKE_CU/429 (holds a
-# count of 429 answers to give), $FAKE_CU/lost (a count of comment and checklist item POSTs that land
+# count of 429 answers to give), $FAKE_CU/lost (a count of comment, checklist item and task POSTs that land
 # but answer 500, as when the answer is lost), $FAKE_CU/refuse (a count of 400 answers to give),
 # $FAKE_CU/slow (seconds every request takes), $FAKE_CU/stall (lines '<seconds> <METHOD> <path glob>':
 # a matching request takes that long, then answers), $FAKE_CU/hangwrites (every POST, PUT and DELETE hangs
@@ -141,11 +142,11 @@ case "$method $path" in
     id=${path#/task/}; id=${id%%/*}; other=${path##*/link/}
     [ -f "$T/$id.json" ] && [ -f "$T/$other.json" ] || missing
     for x in "$id" "$other"; do
-      jq --arg a "$id" --arg b "$other" '.linked_tasks = ((.linked_tasks // []) + [{task_id: $a, link_id: $b}] | unique)' \
+      jq --arg a "$id" --arg b "$other" '.linked_tasks = ((.linked_tasks // []) + [{task_id: $b, link_id: $a}] | unique)' \
         "$T/$x.json" > "$T/$x.tmp" && mv "$T/$x.tmp" "$T/$x.json"; touch_task "$x"
     done
     reply 200 "$(jq -c '{task: .}' "$T/$id.json")" ;;
-  "DELETE /task/"*)rm -f "$T/${path#/task/}.json"; reply 204 '' ;;
+  "DELETE /task/"*) rm -f "$T/${path#/task/}.json"; reply 204 '' ;;
   "POST /list/"*/task)
     n=$(( $(cat "$D/seq" 2>/dev/null || echo 100) + 1 )); echo "$n" > "$D/seq"; id="t$n"
     l=${path#/list/}; l=${l%/task}
@@ -156,6 +157,7 @@ case "$method $path" in
       '{id: $id, name: $b.name, url: ("https://app.clickup.com/t/" + $id), parent: ($b.parent // null), list: {id: $l},
         status: ($st[0][] | select(.status == ($b.status // $st[0][0].status))), tags: [($b.tags // [])[] | {name: .}],
         text_content: ($b.markdown_content // ""), date_updated: $n, date_created: $n}' > "$T/$id.json"
+    if [ -s "$D/lost" ] && [ "$(cat "$D/lost")" -gt 0 ]; then echo $(( $(cat "$D/lost") - 1 )) > "$D/lost"; reply 500 '{"err":"Internal"}'; fi
     reply 200 "$(cat "$T/$id.json")" ;;
   "GET /list/"*/task)
     l=${path#/list/}; l=${l%/task}

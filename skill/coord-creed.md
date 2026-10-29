@@ -1,6 +1,6 @@
 # Coordinator creed
 
-The twelve rules that must survive a compacted context. This file is the single source of truth:
+The thirteen rules that must survive a compacted context. This file is the single source of truth:
 `coord-creed-inject.sh` prints it verbatim into the coordinator's context after compaction, and
 `SKILL.md` explains the reasoning behind each rule at length. Edit the discipline here, nowhere else.
 
