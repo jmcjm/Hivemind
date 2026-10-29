@@ -17,7 +17,7 @@
 # a matching request takes that long, then answers), $FAKE_CU/hangwrites (every POST, PUT and DELETE hangs
 # like hang, GETs answer), $FAKE_CU/fail (lines '<code> <count> <METHOD> <path glob>': the first line
 # matching a request, while its count lasts, answers <code> and changes nothing; 401 is a rejected
-# token, 429 a rate limit).
+# token, 429 a rate limit, - lets the request through as usual: the line after it hits the next one).
 # Edits: $FAKE_CU/edit (lines '<METHOD> <path glob> <task id> <jq filter>': the first request matching
 # a line applies the filter to that task, as a change somebody made meanwhile, and the line goes).
 # Checklists live in the task: .checklists[{id, name, items[{id, name}]}].
@@ -78,7 +78,7 @@ if [ -s "$D/fail" ]; then
   done < "$D/fail"
   printf '%s' "$rules" > "$D/fail"
   case "$hit" in
-    '') ;;
+    ''|-) ;;
     401) reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}' ;;
     429) reply 429 '{"err":"Rate limit reached"}' ;;
     *) reply "$hit" '{"err":"Internal"}' ;;

@@ -1196,9 +1196,11 @@ ct_ack() {
 # decisions never show up in 'ct find', duplicates or collisions.
 # A decision's number is hive's, never a person's: 'D-<n> ' in front of the question, one counter for
 # the whole list (every front, open and closed) and $CU_DIR/decision.last, the highest number this
-# machine gave, so the number of a deleted or archived decision does not come back either. The read of
-# the highest number, the POST and decision.last hold a lock in $CU_DIR: two fronts on this machine
-# never draw the same number (a coordinator on another machine is not covered).
+# machine gave, so the number of a deleted or archived decision does not come back either. A number
+# goes to decision.last before the POST or PUT that gives it: a write that fails leaves a gap, never a
+# number given twice. The read of the highest number, decision.last and the POST hold a lock in
+# $CU_DIR: two fronts on this machine never draw the same number (a coordinator on another machine is
+# not covered).
 
 cu_decision_list() { cu_cfg decision_list; }
 cu_need_decisions() {
@@ -1279,6 +1281,7 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
   json=$(cu_decisions) || cu_die "cannot read the decision list — not creating"
   id=$(cu_decision_match "$name" "$front" <<<"$json") && cu_die "decision $id already waits with this question — hive ct show $id"
   n=$(cu_decision_next <<<"$json") || cu_die "cannot number the decision — not creating"
+  cu_decision_mark "$n" || cu_die "D-$n not written to $CU_DIR/decision.last — not creating"
   body=$(jq -nc --arg n "D-$n $name" --arg f "$front" --arg s "$waiting" --rawfile d "${desc:-/dev/null}" \
            '{name: $n, tags: [$f], status: $s} + (if $d != "" then {markdown_content: $d} else {} end)')
   # A POST that timed out may have landed: before a retry the guard looks for the decision.
@@ -1290,7 +1293,6 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
   else
     id=$(jq -r .id <<<"$json")
   fi
-  cu_decision_mark "$n" || cu_say "D-$n not written to $CU_DIR/decision.last"
   exec 9>&-
   echo "decision: D-$n $id https://app.clickup.com/t/$id"
   [ -n "$task" ] || return 0
@@ -1362,7 +1364,7 @@ ct_decision_list() {  # decision list [--front F|--all] [--open]
 # decision number [--yes] — numbers the decisions without a number, oldest first, after the highest
 # number on the list or in decision.last, and drops a hand-made '[...] ' from the front of the name. A dry
 # run unless --yes; a decision renamed in ClickUp since it was read is skipped, a rename ClickUp refuses
-# fails the run. A second run changes nothing.
+# fails the run and leaves its number unused. A second run changes nothing.
 ct_decision_number() {
   local yes=0 json plan row id old new n_plan=0 n_skip=0 n_fail=0
   case "${1:-}" in --yes) yes=1 ;; '') ;; *) cu_die "usage: hive ct decision number [--yes]" ;; esac
@@ -1381,9 +1383,9 @@ ct_decision_number() {
       if ! json=$(cu_task "$id" 2>/dev/null) || [ "$(jq -r .name <<<"$json")" != "$old" ]; then
         printf '%-5s %-11s %s (renamed or gone since it was read)\n' SKIP "$id" "$old"; n_skip=$((n_skip + 1)); continue
       fi
+      cu_decision_mark "$(jq -r .n <<<"$row")" || cu_die "${new%% *} not written to $CU_DIR/decision.last — stopping"
       cu_api PUT "/task/$id" "$(jq -nc --arg n "$new" '{name: $n}')" >/dev/null \
         || { printf '%-5s %-11s %s (not renamed)\n' FAIL "$id" "$old"; n_fail=$((n_fail + 1)); continue; }
-      cu_decision_mark "$(jq -r .n <<<"$row")" || cu_say "${new%% *} not written to $CU_DIR/decision.last"
     fi
     printf '%-5s %-11s %s -> %s\n' "$([ "$yes" = 1 ] && echo DONE || echo PLAN)" "$id" "$old" "$new"
     n_plan=$((n_plan + 1))

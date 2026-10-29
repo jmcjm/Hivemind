@@ -1322,6 +1322,9 @@ rm -f "$FAKE_CU/tasks/tdd1.json" "$FAKE_CU/tasks/tdd2.json" "$FAKE_CU/tasks/tdd3
 run "$HIVE" ct decision answer d-2 --comment "No."
 eq "answer takes the number" "0 answered" "$RC $(task_field "$DECW" .status.status)"
 has "and answers that decision" "🤖 answer: No." "$(comments_of "$DECW")"
+n=$(ncomments "$DECW")
+run "$HIVE" ct decision answer D-2 --comment "No."
+eq "the same answer by number again changes nothing" "0 answered $n" "$RC $(task_field "$DECW" .status.status) $(ncomments "$DECW")"
 
 mkdec tdn1 waiting front-default "[3b] First?" 1700000002000
 mkdec tdn2 waiting front-web "[QA] Second?" 1700000001000
@@ -1350,10 +1353,10 @@ eq "a rename ClickUp refuses fails the run" 1 "$RC"
 eq "and is left as it was" "Renamed?" "$(task_field tdn1 .name)"
 has "named" "$(printf '%-5s %-11s %s' FAIL tdn1 'Renamed? (not renamed)')" "$OUT"
 has "and counted as failed, not skipped" "0 to number, 0 skipped, 1 failed" "$OUT"
-eq "its number is not kept" 7 "$(cat "$CU/decision.last")"
+eq "its number is taken all the same: a gap, never a number given twice" 8 "$(cat "$CU/decision.last")"
 rm -f "$FAKE_CU/fail"
 run "$HIVE" ct decision number --yes
-eq "the next run numbers it after the highest" "0 D-8 Renamed?" "$RC $(task_field tdn1 .name)"
+eq "the next run numbers it after the highest" "0 D-9 Renamed?" "$RC $(task_field tdn1 .name)"
 w=$(writes)
 run "$HIVE" ct decision number --yes
 eq "and a run after that changes nothing" "0 $w" "$RC $(writes)"
@@ -1368,6 +1371,34 @@ wait; rm -f "$FAKE_CU/stall"
 eq "number and new at once never share a number" "" \
   "$(cat "$FAKE_CU"/tasks/*.json | jq -rs '[.[] | select(.list.id == "9012345600") | .name | capture("^D-(?<n>[0-9]+) ").n] | group_by(.) | map(select(length > 1) | .[0]) | join(",")')"
 rm -f "$FAKE_CU/tasks/tlk1.json" "$FAKE_CU/tasks/$(decid).json"
+echo "7x" > "$CU/decision.last"
+run "$HIVE" ct decision new --name "With a mark gone bad?"
+eq "a decision.last that is no number counts as none" "0 D-3 With a mark gone bad?" "$RC $(task_field "$(decid)" .name)"
+rm -f "$FAKE_CU/tasks/$(decid).json"
+mkdir "$CU/decision.last.tmp"; w=$(writes)
+run "$HIVE" ct decision new --name "With the mark unwritable?"
+eq "a decision.last it cannot write creates nothing" "1 $w" "$RC $(writes)"
+mkdec tpr1 waiting front-default "Probe unnumbered?" 1700000009000
+run "$HIVE" ct decision number --yes
+eq "a decision.last it cannot write renames nothing" "1 Probe unnumbered?" "$RC $(task_field tpr1 .name)"
+rmdir "$CU/decision.last.tmp"; rm -f "$FAKE_CU/tasks/tpr1.json"
+printf -- '- 1 GET /list/*/task\n- 1 POST /list/*/task\n500 1 GET /list/*/task\n400 1 POST /list/*/task\n' > "$FAKE_CU/fail"
+echo 1 > "$FAKE_CU/lost"
+run "$HIVE" ct decision new --name "Landed unseen?"
+rm -f "$FAKE_CU/fail"
+DECU=$(cat "$FAKE_CU"/tasks/*.json | jq -rs '.[] | select(.name == "D-4 Landed unseen?") | .id')
+eq "a POST that landed, but failed all the same, fails new while ClickUp has the decision" "1 1" "$RC $(grep -c . <<<"$DECU")"
+rm -f "$FAKE_CU/tasks/$DECU.json"
+run "$HIVE" ct decision new --name "After the unseen one?"
+eq "its number does not come back once it is off the list" "D-5 After the unseen one?" "$(task_field "$(decid)" .name)"
+rm -f "$FAKE_CU/tasks/$(decid).json" "$CU/decision.last"
+mkdec tdk1 answered front-web "D-20 Closed high?" 1700000000000
+mkdec tdk2 waiting front-default "D-6 Open low?" 1700000001000
+mkdec tdk3 waiting front-default "Open unnumbered?" 1700000002000
+run "$HIVE" ct decision number --yes
+eq "number without decision.last goes after a closed decision above the open ones" "0 D-21 Open unnumbered?" \
+  "$RC $(task_field tdk3 .name)"
+rm -f "$FAKE_CU"/tasks/tdk[1-3].json
 printf '[{"status":"waiting","type":"open"}]' > "$FAKE_CU/statuses-9012345600.json"
 run "$HIVE" ct decision new --name "Without a closed status?"
 eq "a decision list without a closed status is refused" 1 "$RC"

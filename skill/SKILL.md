@@ -625,7 +625,7 @@ never becomes a tag. On the command line and in a brief a tag may be named witho
 | `hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]` | a decision the coordinator waits on from the owner, on the decision list (below): named `D-<n> <question>` with the next number hive gives, waiting, with the caller's front (or `--front`), linked to the task it is about, whose history gets a line that it waits. A question numbered by hand (`[…]` or `D-<n>` in front) is refused, and so is the same question waiting in the front, whatever its number |
 | `hive ct decision answer <D-n\|id> --comment TEXT\|@FILE` | the owner's answer as a comment, the decision answered, the answer noted on the linked task; a number on no decision or on two is refused before anything is written; a second run changes nothing |
 | `hive ct decision list [--front F\|--all] [--open]` | the caller's front's decisions (or that front's, or every front's), oldest first: number, status, age, task, question |
-| `hive ct decision number [--yes]` | numbers the decisions that have no number yet, oldest first, after the highest number given (below), and drops a hand-made `[…] ` from the front of the name; a dry run unless `--yes`, a decision renamed since it was read is skipped, a rename ClickUp refuses is counted as failed and the run exits non-zero, a second run changes nothing |
+| `hive ct decision number [--yes]` | numbers the decisions that have no number yet, oldest first, after the highest number given (below), and drops a hand-made `[…] ` from the front of the name; a dry run unless `--yes`, a decision renamed since it was read is skipped, a rename ClickUp refuses is counted as failed, leaves its number unused (a gap) and the run exits non-zero, a second run changes nothing |
 
 **The brief's header** — `hive task` refuses a brief without it:
 ```
@@ -742,9 +742,11 @@ deleted or archived (archived tasks are not on the list): the file remembers it 
 the file the highest number on the list counts. A question with a number of its own in front (`[…]` or
 `D-<n>`) is refused; two questions are two decisions, never `5a` and `5b`. The owner answers by number
 ("D-7 ok"), and `answer`, `list` and the duplicate check go by it or by the question without it.
-`new` reads the highest number, creates the decision and writes `decision.last` under a lock in
-`~/.herdr-hive/clickup/`, so two fronts on one machine never draw the same number; coordinators on two
-machines are not covered, neither by the lock nor by the file.
+`new` reads the highest number, writes it to `decision.last` and only then creates the decision, all
+under a lock in `~/.herdr-hive/clickup/`, so two fronts on one machine never draw the same number;
+coordinators on two machines are not covered, neither by the lock nor by the file. A number is taken
+before ClickUp is asked: a create or a rename that fails leaves a gap in the numbers, and gaps are
+fine, a number given twice is not.
 Decisions made before the numbering get theirs with `hive ct decision number` (a dry run, then `--yes`).
 
 **Tasks left lying** (`hive ct stale`). A task moved when it was updated, commented on, or reported on
