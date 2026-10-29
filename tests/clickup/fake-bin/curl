@@ -3,7 +3,9 @@
 #   tasks/<id>.json      a task (id, name, status{status,type}, tags[{name}], parent, list{id}, date_updated, ...)
 #   comments/<id>.json   its comments, newest first; a GET gives 25 of them, older ones after the
 #                        comment named by start_id (start and start_id of a page's last comment)
-#   space-tags.json      the space's tags;  statuses.json  the list's statuses
+#   space-tags.json      the space's tags;  statuses.json  the list's statuses, statuses-<list>.json
+#                        those of a list with statuses of its own
+#   linked_tasks         a task's links {task_id, link_id}; POST /task/<id>/link/<other> adds one to both
 # Like the live API: an unknown task id is 401 OAUTH_027, a bad token 401 OAUTH_025, a comment over
 # 40000 characters 413 COMM_160.
 # Faults: $FAKE_CU/down (connection refused), $FAKE_CU/hang (a network that drops packets: the call
@@ -86,6 +88,8 @@ if [ -s "$D/refuse" ] && [ "$(cat "$D/refuse")" -gt 0 ]; then echo $(( $(cat "$D
 [ "$auth" = "Authorization: pk_fake_SECRET_TOKEN" ] || reply 401 '{"err":"Token invalid","ECODE":"OAUTH_025"}'
 now=$(( $(date +%s) * 1000 ))
 T="$D/tasks"; C="$D/comments"; mkdir -p "$T" "$C"
+stfile() { if [ -f "$D/statuses-$1.json" ]; then echo "$D/statuses-$1.json"; else echo "$D/statuses.json"; fi; }
+listof() { jq -r '.list.id // ""' "$T/$1.json"; }
 touch_task() { jq --arg n "$now" '.date_updated = $n' "$T/$1.json" > "$T/$1.tmp" && mv "$T/$1.tmp" "$T/$1.json"; }
 case "$method $path" in
   "GET /task/"*/comment)
@@ -127,21 +131,39 @@ case "$method $path" in
   "PUT /task/"*)
     id=${path#/task/}; [ -f "$T/$id.json" ] || missing
     if jq -e '.status' <<<"$data" >/dev/null; then
-      jq -e --argjson b "$data" 'any(.[]; .status == $b.status)' "$D/statuses.json" >/dev/null || reply 400 '{"err":"Status does not exist","ECODE":"CRTSK_001"}'
+      jq -e --argjson b "$data" 'any(.[]; .status == $b.status)' "$(stfile "$(listof "$id")")" >/dev/null || reply 400 '{"err":"Status does not exist","ECODE":"CRTSK_001"}'
     fi
-    jq --argjson b "$data" --slurpfile st "$D/statuses.json" \
+    jq --argjson b "$data" --slurpfile st "$(stfile "$(listof "$id")")" \
        '(if $b.status then .status = ($st[0][] | select(.status == $b.status)) else . end) | (if $b.parent then .parent = $b.parent else . end)' \
        "$T/$id.json" > "$T/$id.tmp" && mv "$T/$id.tmp" "$T/$id.json"; touch_task "$id"
     reply 200 "$(cat "$T/$id.json")" ;;
-  "DELETE /task/"*) rm -f "$T/${path#/task/}.json"; reply 204 '' ;;
+  "POST /task/"*/link/*)
+    id=${path#/task/}; id=${id%%/*}; other=${path##*/link/}
+    [ -f "$T/$id.json" ] && [ -f "$T/$other.json" ] || missing
+    for x in "$id" "$other"; do
+      jq --arg a "$id" --arg b "$other" '.linked_tasks = ((.linked_tasks // []) + [{task_id: $a, link_id: $b}] | unique)' \
+        "$T/$x.json" > "$T/$x.tmp" && mv "$T/$x.tmp" "$T/$x.json"; touch_task "$x"
+    done
+    reply 200 "$(jq -c '{task: .}' "$T/$id.json")" ;;
+  "DELETE /task/"*)rm -f "$T/${path#/task/}.json"; reply 204 '' ;;
   "POST /list/"*/task)
     n=$(( $(cat "$D/seq" 2>/dev/null || echo 100) + 1 )); echo "$n" > "$D/seq"; id="t$n"
-    jq -n --argjson b "$data" --arg id "$id" --arg l "$(p=${path#/list/}; echo "${p%/task}")" --arg n "$now" --slurpfile st "$D/statuses.json" \
+    l=${path#/list/}; l=${l%/task}
+    if jq -e '.status' <<<"$data" >/dev/null; then
+      jq -e --argjson b "$data" 'any(.[]; .status == $b.status)' "$(stfile "$l")" >/dev/null || reply 400 '{"err":"Status does not exist","ECODE":"CRTSK_001"}'
+    fi
+    jq -n --argjson b "$data" --arg id "$id" --arg l "$l" --arg n "$now" --slurpfile st "$(stfile "$l")" \
       '{id: $id, name: $b.name, url: ("https://app.clickup.com/t/" + $id), parent: ($b.parent // null), list: {id: $l},
         status: ($st[0][] | select(.status == ($b.status // $st[0][0].status))), tags: [($b.tags // [])[] | {name: .}],
-        text_content: ($b.markdown_content // ""), date_updated: $n}' > "$T/$id.json"
+        text_content: ($b.markdown_content // ""), date_updated: $n, date_created: $n}' > "$T/$id.json"
     reply 200 "$(cat "$T/$id.json")" ;;
-  "GET /list/"*) reply 200 "$(jq -c '{id: "list", statuses: .}' "$D/statuses.json")" ;;
+  "GET /list/"*/task)
+    l=${path#/list/}; l=${l%/task}
+    page=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^page=//p'); [ "${page:-0}" = 0 ] || reply 200 '{"tasks":[],"last_page":true}'
+    closed=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^include_closed=//p')
+    reply 200 "$(cat "$T"/*.json 2>/dev/null | jq -sc --arg l "$l" --arg c "$closed" \
+      '{tasks: [.[] | select(.list.id == $l and ($c == "true" or .status.type != "closed"))], last_page: true}')" ;;
+  "GET /list/"*) l=${path#/list/}; reply 200 "$(jq -c --arg l "$l" '{id: $l, statuses: .}' "$(stfile "$l")")" ;;
   "GET /space/"*/tag) reply 200 "$(jq -c '{tags: .}' "$D/space-tags.json")" ;;
   "POST /space/"*/tag)
     jq --argjson b "$data" '. + [$b.tag]' "$D/space-tags.json" > "$D/st.tmp" && mv "$D/st.tmp" "$D/space-tags.json"; reply 200 '{}' ;;

@@ -3300,6 +3300,7 @@ ClickUp task tracking — on when ~/.herdr-hive/clickup/config exists ('hive ct 
   hive ct todo <id> "<item>" [--checklist NAME]  an item on the task's checklist (created if missing)
   hive ct sync                       refresh the cache, create the taxonomy's missing tags
   hive ct ack <drone> --manual "<reason>"  a report clickup-sync could not apply, settled by hand
+  hive ct decision new|answer|list ...   decisions waited on from the owner, on the decision list
 
 Fronts — independent swarms, one coordinator each (the gate, accounts and rules are shared):
   hive --front <front> <command>     act on that front (also HIVE_FRONT; without either: the front whose

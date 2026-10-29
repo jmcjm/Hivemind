@@ -242,7 +242,7 @@ cu_space_tasks() {
   [ -n "${2:-}" ] && q+="&date_updated_gt=$2"
   while [ "$page" -lt 50 ]; do
     json=$(cu_api GET "/team/$(cu_cfg workspace)/task?$q&page=$page") || return
-    jq -c '.tasks[]' <<<"$json"
+    jq -c --arg d "$(cu_cfg decision_list)" '.tasks[] | select($d == "" or .list.id != $d)' <<<"$json"   # decisions are no tasks
     n=$(jq '.tasks | length' <<<"$json")
     [ "$n" -ge 100 ] && [ "$(jq -r '.last_page // false' <<<"$json")" != true ] || break
     page=$((page + 1))
@@ -1188,6 +1188,153 @@ ct_ack() {
   echo "ack: $name — clickup-sync stops retrying this report"
 }
 
+# --- decisions ----------------------------------------------------------------
+# A decision a coordinator waits on from the owner is a task on its own list (decision_list in the
+# config): its name the question, its description the context and the options, one front tag, a link
+# to the task it is about. The list's first open status means waiting, its first closed one answered;
+# the answer lands as a comment on the decision and on that task. The list stays out of the cache, so
+# decisions never show up in 'ct find', duplicates or collisions.
+
+cu_decision_list() { cu_cfg decision_list; }
+cu_need_decisions() {
+  [ -n "$(cu_decision_list)" ] || cu_die "no decision list — set 'decision_list' in $CU_CONF"
+  cu_need
+}
+
+# cu_decision_statuses — two lines: the decision list's waiting (first open) and answered (first closed) status.
+cu_decision_statuses() {
+  local json; json=$(cu_api GET "/list/$(cu_decision_list)") || return
+  jq -re '[.statuses[]? | {s: (.status | ascii_downcase), t: .type}] as $st
+          | [first($st[] | select(.t == "open") | .s), first($st[] | select(.t == "closed") | .s)] | select(length == 2) | .[]' <<<"$json" \
+    || { cu_say "the decision list $(cu_decision_list) needs an open and a closed status"; return 1; }
+}
+
+# cu_decisions — every decision of the list, closed ones included, one JSON a line, oldest first.
+cu_decisions() {
+  local json n page=0
+  while [ "$page" -lt 50 ]; do
+    json=$(cu_api GET "/list/$(cu_decision_list)/task?include_closed=true&subtasks=true&page=$page") || return
+    jq -c '.tasks[]' <<<"$json"
+    n=$(jq '.tasks | length' <<<"$json")
+    [ "$n" -ge 100 ] && [ "$(jq -r '.last_page // false' <<<"$json")" != true ] || break
+    page=$((page + 1))
+  done | jq -sc 'sort_by(.date_created // "0" | tonumber)[]'
+}
+
+# cu_decision_match <name> <front-tag> — reads decisions, prints the id of a waiting one of that front
+# with that question; 1 when there is none.
+cu_decision_match() {
+  cu_jq_lines --arg n "${1,,}" --arg f "$2" \
+    'select((closed | not) and (.name | ascii_downcase) == $n and any(tagnames[]; . == $f)) | .id' | grep -m1 .
+}
+cu_decision_waiting() { local all; all=$(cu_decisions) || return; cu_decision_match "$@" <<<"$all"; }
+cu_jq_lines() { local -a a=("$@"); local f=${a[-1]}; unset 'a[-1]'; jq -r "${CU_JQ_ARGS[@]}" "${a[@]}" "$CU_JQ_DEFS $f"; }
+
+ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front F]
+  local name="" task="" desc="" front="" st waiting tjson="" tname="" body json id
+  local -a CU_RETRY_GUARD=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name=$(cu_trim "${2:?--name needs a question}"); shift 2 ;;
+      --task) task=${2:?--task needs a task id}; shift 2 ;;
+      --desc) desc=${2:?--desc needs a file}; shift 2 ;;
+      --front) front=$(cu_front_tag "${2:?--front needs a value}") || exit 1; shift 2 ;;
+      *) cu_die "ct decision new: unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$name" ] || cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F]'
+  [[ "$name" != *$'\n'* ]] || cu_die "the name is the question in one line; the rest goes to --desc"
+  [ -z "$desc" ] || [ -r "$desc" ] || cu_die "cannot read $desc"
+  [ -n "$front" ] || front=$(cu_front_tag "$(front_label "${HIVE_FRONT:-}")") || exit 1
+  cu_need_decisions
+  st=$(cu_decision_statuses) || exit 1; waiting=$(head -1 <<<"$st")
+  if [ -n "$task" ]; then
+    tjson=$(cu_task "$task") || cu_die "no task $task"
+    tname=$(jq -r .name <<<"$tjson")
+  fi
+  json=$(cu_decisions) || cu_die "cannot read the decision list — not creating"
+  id=$(cu_decision_match "$name" "$front" <<<"$json") && cu_die "decision $id already waits with this question — hive ct show $id"
+  cu_ensure_tag "$front" || cu_die "cannot create the tag '$front' in the space"
+  body=$(jq -nc --arg n "$name" --arg f "$front" --arg s "$waiting" --rawfile d "${desc:-/dev/null}" \
+           '{name: $n, tags: [$f], status: $s} + (if $d != "" then {markdown_content: $d} else {} end)')
+  # A POST that timed out may have landed: before a retry the guard looks for the decision.
+  CU_RETRY_GUARD=(cu_decision_waiting "$name" "$front")
+  json=$(cu_api POST "/list/$(cu_decision_list)/task" "$body") || cu_die "decision not created"
+  CU_RETRY_GUARD=()
+  if [ -z "$json" ]; then
+    id=$(cu_decision_waiting "$name" "$front") || cu_die "decision created, but not found afterwards"
+  else
+    id=$(jq -r .id <<<"$json")
+  fi
+  echo "decision: $id https://app.clickup.com/t/$id"
+  [ -n "$task" ] || return 0
+  cu_api POST "/task/$id/link/$task" >/dev/null || cu_die "decision $id not linked to $task — link it by hand"
+  cu_comment_once "$task" "🤖 decision waiting: $id $name" || cu_die "the note on $task not added"
+  echo "decision: $id linked to $task ($tname)"
+}
+
+ct_decision_answer() {  # decision answer <id> --comment TEXT|@FILE
+  local id="" comment="" st answered json task when
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --comment) comment=${2:?--comment needs a text}; shift 2 ;;
+      *) [ -z "$id" ] || cu_die "ct decision answer: unexpected argument '$1'"; id=$1; shift ;;
+    esac
+  done
+  if [ "${comment:0:1}" = @ ]; then comment=$(cat -- "${comment:1}") || cu_die "cannot read ${comment:1}"; fi
+  comment=$(cu_trim "$comment")
+  [ -n "$id" ] && [ -n "$comment" ] || cu_die 'usage: hive ct decision answer <id> --comment "<the answer>"|@FILE'
+  cu_need_decisions
+  json=$(cu_task "$id") || exit 1
+  [ "$(jq -r '.list.id // ""' <<<"$json")" = "$(cu_decision_list)" ] || cu_die "$id is not on the decision list"
+  st=$(cu_decision_statuses) || exit 1; answered=$(tail -1 <<<"$st")
+  when=$(date +%F)
+  cu_comment_once "$id" "🤖 answer ($when, front $(front_label "${HIVE_FRONT:-}")): $comment" || cu_die "answer not added to $id"
+  cu_set_status "$json" "$answered" || cu_die "status of $id not set"
+  echo "decision: $id $answered"
+  while IFS= read -r task; do
+    [ -n "$task" ] || continue
+    cu_comment_once "$task" "🤖 decision $id answered ($when): $(jq -r .name <<<"$json") — $comment" \
+      && echo "decision: answer noted on $task" || cu_say "the answer not noted on $task"
+  done < <(jq -r --arg me "$id" '.linked_tasks[]? | [.task_id, .link_id] | map(select(. != $me))[]' <<<"$json" | awk '!seen[$0]++')
+}
+
+ct_decision_list() {  # decision list [--front F|--all] [--open]
+  local front="" open=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --front) front=$(cu_front_tag "${2:?--front needs a value}") || exit 1; shift 2 ;;
+      --all) front=all; shift ;;
+      --open) open=true; shift ;;
+      *) cu_die "ct decision list: unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$front" ] || front=$(cu_front_tag "$(front_label "${HIVE_FRONT:-}")") || exit 1
+  cu_need_decisions
+  local rows; rows=$(cu_decisions) || exit 1
+  rows=$(cu_jq_lines --arg f "$front" --argjson open "$open" --arg now "$(date +%s)" '
+    select(($f == "all" or any(tagnames[]; . == $f)) and ($open == false or (closed | not)))
+    | ((($now | tonumber) - ((.date_created // "0") | tonumber / 1000)) / 3600 | floor) as $h
+    | .id as $me | def dash: if . == "" then "-" else . end;
+    [.id, (.status.status // "" | ascii_downcase), (short("front") | join(",") | dash),
+     (if $h < 48 then "\($h)h" else "\($h / 24 | floor)d" end),
+     ([.linked_tasks[]? | .task_id, .link_id] | map(select(. != null and . != $me)) | unique | join(",") | dash),
+     (.name | gsub("[\t\n\r]"; " "))] | @tsv' <<<"$rows")
+  [ -n "$rows" ] || { echo "no decisions"; return 0; }
+  { echo "id status front age task question" | tr ' ' '\t'; printf '%s\n' "$rows"; } \
+    | awk -F'\t' '{ printf "%-11s %-14s %-10s %-5s %-11s %s\n", $1, $2, $3, $4, $5, $6 }'
+}
+
+ct_decision() {
+  local sub=${1:-}; shift || true
+  case "$sub" in
+    new) ct_decision_new "$@" ;;
+    answer) ct_decision_answer "$@" ;;
+    list) ct_decision_list "$@" ;;
+    *) cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F] | answer <id> --comment TEXT|@FILE | list [--front F|--all] [--open]' ;;
+  esac
+}
+
 ct_main() {
   local sub=${1:-}; shift || true
   case "$sub" in
@@ -1205,6 +1352,7 @@ ct_main() {
     todo)  ct_todo  "$@" ;;
     sync)  ct_sync  "$@" ;;
     ack)   ct_ack   "$@" ;;
+    decision) ct_decision "$@" ;;
     *) cat <<'EOF'
 hive ct — the swarm's ClickUp tasks (configured in ~/.herdr-hive/clickup/config and taxonomy.tsv).
 Every task has one front, one area and at least one module.
@@ -1222,6 +1370,10 @@ Every task has one front, one area and at least one module.
   hive ct todo <id> "<item>" [--checklist NAME]   an item on the task's checklist (created if missing)
   hive ct sync                       refresh the cache, create the taxonomy's missing tags
   hive ct ack <drone> --manual "<reason>"   a report clickup-sync could not apply, settled by hand
+  hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]
+                                      a decision the owner is asked for, on the decision list
+  hive ct decision answer <id> --comment TEXT|@FILE   the answer, noted on the linked task too
+  hive ct decision list [--front F|--all] [--open]   the caller's front's decisions, oldest first
 EOF
        [ -z "$sub" ] || [ "$sub" = help ] || [ "$sub" = -h ] || [ "$sub" = --help ] || exit 1 ;;
   esac

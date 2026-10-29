@@ -49,3 +49,10 @@ The twelve rules that must survive a compacted context. This file is the single 
     could not apply comes as a `CLICKUP ✗` letter — settle it by hand, then `hive ct ack <drone> --manual
     "<what you did>"`. A small step a drone reports is an item on the epic's checklist (`hive ct todo`),
     not a new task, and tasks left lying are swept by hand with `hive ct stale`.
+13. **A decision you wait on from the user goes on the decision list.** (With `decision_list` in the
+    ClickUp config.) The moment you put a question to the user, file it: `hive ct decision new --name
+    "<the question>" --task <id> --desc <file>` (context, numbered options with your recommendation,
+    what happens without a decision, the report). Once they answer, in ClickUp or in the conversation:
+    `hive ct decision answer <id> --comment "<the answer>"`. At session start and after a compaction,
+    read your front's open ones (`hive ct decision list --open`) before anything else: they are the
+    questions you still owe the user an answer to, not the summary.
