@@ -1231,10 +1231,16 @@ has "saying the number is hive's" "'[3b]' in front of the question: the number i
 run "$HIVE" ct decision new --name "D-7 Ship now?"
 eq "and so is one in hive's form" 1 "$RC"
 has "naming it" "'D-7 ' in front of the question" "$ERR"
+run "$HIVE" ct decision new --name "d-7 Ship now?"
+eq "in lowercase too" 1 "$RC"
+run "$HIVE" ct decision new --name "D-0 Ship now?"
+eq "and with a number no decision has" 1 "$RC"
+run "$HIVE" ct decision new --name "D-05 Ship now?"
+eq "or with a leading zero" 1 "$RC"
 eq "and nothing is written" "$w" "$(writes)"
 run "$HIVE" ct decision new --name "D-day or not?"
 eq "a question that only starts like a number is no number" 0 "$RC"
-eq "and is numbered" "D-3 D-day or not?" "$(task_field "$(decid)" .name)"
+eq "and is numbered" "D-4 D-day or not?" "$(task_field "$(decid)" .name)"
 rm -f "$FAKE_CU/tasks/$(decid).json"
 printf '1 POST /list/*/task\n' > "$FAKE_CU/stall"
 "$HIVE" ct decision new --name "Race one?" > "$T/race1" 2>&1 &
@@ -1242,13 +1248,20 @@ sleep 0.3
 run env HIVE_FRONT=web "$HIVE" ct decision new --name "Race two?"
 wait
 rm -f "$FAKE_CU/stall"
-eq "two fronts at once never draw the same number" "D-3 Race one? D-4 Race two?" \
+eq "two fronts at once never draw the same number" "D-5 Race one? D-6 Race two?" \
   "$(cat "$FAKE_CU"/tasks/*.json | jq -rs '[.[] | select(.name | test("Race")) | .name] | sort | join(" ")')"
 for id in $(cat "$FAKE_CU"/tasks/*.json | jq -rs '.[] | select(.name | test("Race")) | .id'); do rm -f "$FAKE_CU/tasks/$id.json"; done
 mkdec tdec09 answered front-web "D-9 An old question?" 1700000000000
 run "$HIVE" ct decision new --name "After the old one?"
 eq "the number of an answered decision does not come back" "D-10 After the old one?" "$(task_field "$(decid)" .name)"
 rm -f "$FAKE_CU/tasks/$(decid).json" "$FAKE_CU/tasks/tdec09.json"
+run "$HIVE" ct decision new --name "After an archived one?"
+eq "nor does the number of one archived or deleted since" "D-11 After an archived one?" "$(task_field "$(decid)" .name)"
+eq "the highest number given is kept" 11 "$(cat "$CU/decision.last")"
+rm -f "$FAKE_CU/tasks/$(decid).json" "$CU/decision.last"
+run "$HIVE" ct decision new --name "Without the mark?"
+eq "without it the highest on the list counts" "D-3 Without the mark?" "$(task_field "$(decid)" .name)"
+rm -f "$FAKE_CU/tasks/$(decid).json"
 
 run "$HIVE" ct decision list
 eq "list shows the caller's front" 1 "$(grep -c '^D-' <<<"$OUT")"
@@ -1258,6 +1271,11 @@ has "--front another one" "$DECW" "$OUT"
 hasnt "only that one" "$DEC " "$OUT"
 run "$HIVE" ct decision list --all
 eq "--all every front" 2 "$(grep -c '^D-' <<<"$OUT")"
+mkdec tdq1 waiting front-default "Merge after D-3 lands?" 1700000000000
+run "$HIVE" ct decision list
+has "a number inside a question is part of it" "$(printf '%-6s %-11s' - tdq1) waiting" "$OUT"
+has "and kept" "Merge after D-3 lands?" "$OUT"
+rm -f "$FAKE_CU/tasks/tdq1.json"
 
 run "$HIVE" ct sync
 eq "sync refreshes the cache" 0 "$RC"
@@ -1312,30 +1330,44 @@ mkdec tdn4 waiting front-default "[X]" 1700000004000
 w=$(writes)
 run "$HIVE" ct decision number
 eq "number is a dry run without --yes" "0 $w [3b] First?" "$RC $(writes) $(task_field tdn1 .name)"
-has "planning the oldest first, its bracket dropped" "$(printf '%-5s %-11s %s' PLAN tdn2 '[QA] Second? -> D-3 Second?')" "$OUT"
-has "then the next" "$(printf '%-5s %-11s %s' PLAN tdn1 '[3b] First? -> D-4 First?')" "$OUT"
-has "an answered one too" "$(printf '%-5s %-11s %s' PLAN tdn3 'Third? -> D-5 Third?')" "$OUT"
-has "a name that is only a bracket keeps it" "$(printf '%-5s %-11s %s' PLAN tdn4 '[X] -> D-6 [X]')" "$OUT"
-has "and says it is a dry run" "4 to number, 0 skipped — dry run" "$OUT"
+has "planning the oldest first after the highest number given, its bracket dropped" \
+  "$(printf '%-5s %-11s %s' PLAN tdn2 '[QA] Second? -> D-4 Second?')" "$OUT"
+has "then the next" "$(printf '%-5s %-11s %s' PLAN tdn1 '[3b] First? -> D-5 First?')" "$OUT"
+has "an answered one too" "$(printf '%-5s %-11s %s' PLAN tdn3 'Third? -> D-6 Third?')" "$OUT"
+has "a name that is only a bracket keeps it" "$(printf '%-5s %-11s %s' PLAN tdn4 '[X] -> D-7 [X]')" "$OUT"
+has "and says it is a dry run" "4 to number, 0 skipped, 0 failed — dry run" "$OUT"
+eq "which keeps the highest number given as it was" 3 "$(cat "$CU/decision.last")"
 printf 'GET /task/tdn1 tdn1 .name = "Renamed?"\n' > "$FAKE_CU/edit"
 run "$HIVE" ct decision number --yes
-eq "--yes numbers them" "0|D-3 Second?|D-5 Third?|D-6 [X]" \
+eq "--yes numbers them" "0|D-4 Second?|D-6 Third?|D-7 [X]" \
   "$RC|$(task_field tdn2 .name)|$(task_field tdn3 .name)|$(task_field tdn4 .name)"
 eq "but not one renamed since it was read" "Renamed?" "$(task_field tdn1 .name)"
-has "which it skips" "3 to number, 1 skipped" "$OUT"
+has "which it skips" "3 to number, 1 skipped, 0 failed" "$OUT"
+eq "and keeps the highest number it gave" 7 "$(cat "$CU/decision.last")"
 printf '400 1 PUT /task/tdn1\n' > "$FAKE_CU/fail"
 run "$HIVE" ct decision number --yes
-eq "a rename ClickUp refuses is left as it was" "Renamed?" "$(task_field tdn1 .name)"
-has "and named" "$(printf '%-5s %-11s %s' FAIL tdn1 'Renamed? (not renamed)')" "$OUT"
-has "and not counted as numbered" "0 to number, 1 skipped" "$OUT"
+eq "a rename ClickUp refuses fails the run" 1 "$RC"
+eq "and is left as it was" "Renamed?" "$(task_field tdn1 .name)"
+has "named" "$(printf '%-5s %-11s %s' FAIL tdn1 'Renamed? (not renamed)')" "$OUT"
+has "and counted as failed, not skipped" "0 to number, 0 skipped, 1 failed" "$OUT"
+eq "its number is not kept" 7 "$(cat "$CU/decision.last")"
 rm -f "$FAKE_CU/fail"
 run "$HIVE" ct decision number --yes
-eq "the next run numbers it after the highest" "D-7 Renamed?" "$(task_field tdn1 .name)"
+eq "the next run numbers it after the highest" "0 D-8 Renamed?" "$RC $(task_field tdn1 .name)"
 w=$(writes)
 run "$HIVE" ct decision number --yes
 eq "and a run after that changes nothing" "0 $w" "$RC $(writes)"
-has "saying so" "0 to number, 0 skipped" "$OUT"
+has "saying so" "0 to number, 0 skipped, 0 failed" "$OUT"
 rm -f "$FAKE_CU"/tasks/tdn[1-4].json
+mkdec tlk1 waiting front-default "[1] Locked?" 1600000000000
+printf '2 PUT /task/*\n' > "$FAKE_CU/stall"
+"$HIVE" ct decision number --yes > "$T/numlk" 2>&1 &
+sleep 0.5
+run env HIVE_FRONT=web "$HIVE" ct decision new --name "Fresh one?"
+wait; rm -f "$FAKE_CU/stall"
+eq "number and new at once never share a number" "" \
+  "$(cat "$FAKE_CU"/tasks/*.json | jq -rs '[.[] | select(.list.id == "9012345600") | .name | capture("^D-(?<n>[0-9]+) ").n] | group_by(.) | map(select(length > 1) | .[0]) | join(",")')"
+rm -f "$FAKE_CU/tasks/tlk1.json" "$FAKE_CU/tasks/$(decid).json"
 printf '[{"status":"waiting","type":"open"}]' > "$FAKE_CU/statuses-9012345600.json"
 run "$HIVE" ct decision new --name "Without a closed status?"
 eq "a decision list without a closed status is refused" 1 "$RC"

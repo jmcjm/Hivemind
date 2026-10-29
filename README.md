@@ -314,7 +314,9 @@ With `decision_list` in the config, the questions a coordinator waits on from th
 list of their own (`hive ct decision`). hive numbers each one `D-<n>`: one counter for every front, never
 reused, not even after the answer, so the owner answers "D-7 ok". A question numbered by hand is
 refused, and decisions from before the numbering get theirs with `hive ct decision number --yes`. The
-counter is locked per machine; coordinators on two machines are not covered.
+next number is the highest on the list or the highest kept in `~/.herdr-hive/clickup/decision.last`,
+so a deleted or archived decision does not give its number back. The counter and that file are per
+machine; coordinators on two machines are not covered.
 
 ## Watching outside sources
 
