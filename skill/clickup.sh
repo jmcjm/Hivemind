@@ -444,20 +444,22 @@ cu_comment() {
 
 # cu_comments <id> [enough] — the task's comments, newest first, as {comments, more}. ClickUp gives
 # 25 a page; the next page starts from the oldest comment of the one before (start, start_id). Pages
-# are read until one comes short, the comments so far meet the jq filter enough, or 20 pages; more is
-# true when older comments were left unread. 2 when ClickUp fails on a page or the budget runs out:
+# are read until one comes short, the comments so far meet the jq filter enough, or 20 pages (500
+# comments, well past what a task gathers, so a runaway task costs at most 20 calls); more is true
+# when older comments were left unread. 2 when ClickUp fails on a page or the budget runs out:
 # the comments read so far are printed all the same.
 cu_comments() {
   local id=$1 enough=${2:-false} q="" json all='[]' state="more" page rc=0
   for (( page = 0; page < 20; page++ )); do
     [ "$page" = 0 ] || ! cu_spent || { rc=2; break; }
     json=$(cu_api GET "/task/$id/comment$q") || { rc=2; break; }
-    # A page may begin with the comment it starts from: one seen already is not taken twice.
-    json=$(jq -c --argjson all "$all" '($all | map(.id // empty)) as $seen
+    # A page may begin with the comment it starts from: one seen already is not taken twice. The
+    # comments so far go on stdin, not argv: a page of long comments outgrows the 128 KB of one argument.
+    json=$(printf '%s\n%s' "$all" "$json" | jq -sc '.[0] as $all | .[1] | ($all | map(.id // empty)) as $seen
         | [.comments[]? | select(.id == null or (.id | IN($seen[])) == false)] as $new | ($all + $new) as $a
         | {a: $a, state: (if (.comments // [] | length) < 25 or ($new | length) == 0 then "end"
                           elif ($a | '"$enough"') then "enough" else "more" end),
-           q: ($a[-1] | "?start=\(.date // "")&start_id=\(.id // "" | @uri)")}' <<<"$json") || { rc=2; break; }
+           q: ($a[-1] | "?start=\(.date // "")&start_id=\(.id // "" | @uri)")}') || { rc=2; break; }
     all=$(jq -c .a <<<"$json"); state=$(jq -r .state <<<"$json"); q=$(jq -r .q <<<"$json")
     [ "$state" = more ] || break
   done

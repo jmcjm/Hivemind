@@ -261,6 +261,10 @@ jq -n "$notes + [range(40) | {id: \"h\(.)\", comment_text: \"history \(.)\", dat
 run "$HIVE" ct show tshow01
 has "pages stop once eight comments are in" "history 7" "$OUT"
 has "and the count says how far it looked" "(30 collision notes not shown among the 50 latest comments, the latest 2023-11-14 22:23)" "$OUT"
+jq 'map(.comment_text += " " + ("x" * 6000))' "$FAKE_CU/comments/tshow01.json" > "$T/c" && mv "$T/c" "$FAKE_CU/comments/tshow01.json"
+run "$HIVE" ct show tshow01
+eq "a page of long comments (over the 128 KB of one argument) reads all the same" 0 "$RC$ERR"
+has "every page of it" "(30 collision notes not shown among the 50 latest comments" "$OUT"
 run "$HIVE" ct show tnone01
 eq "an unknown task fails" 1 "$RC"
 rm -f "$FAKE_CU/tasks/tshow01.json"
@@ -410,12 +414,14 @@ n=$(ncomments tsrch01); brief "$T/b1x" "# Fix refunds again" "ClickUp: tref001" 
   "Collision checked: tinv001 — other files" "Collision checked: tsrch01 — ranking code, reworded"
 run "$HIVE" task d1 "$T/b1x"
 eq "the same drone briefed again adds no note to the other task" "0 $n" "$RC $(ncomments tsrch01)"
-jq --arg d "$(( $(date +%s) * 1000 + 1000 ))" '[range(30) | {id: "fill\(.)", comment_text: "filler \(.)", date: $d, user: {username: "tester"}}] + .' \
+jq --arg d "$(( $(date +%s) * 1000 + 1000 ))" '[range(30) | {id: "fill\(.)", comment_text: "filler \(.) \("x" * 6000)", date: $d, user: {username: "tester"}}] + .' \
   "$FAKE_CU/comments/tsrch01.json" > "$T/c" && mv "$T/c" "$FAKE_CU/comments/tsrch01.json"
 n=$(ncomments tsrch01); : > "$FAKE_CU/curl.argv"
 run "$HIVE" task d1 "$T/b1x"
 eq "30 newer comments later the note is still found, not doubled" "0 $n" "$RC $(ncomments tsrch01)"
 has "on an older page of comments" "/task/tsrch01/comment?start=" "$(cat "$FAKE_CU/curl.argv")"
+hasnt "a page of long comments (over the 128 KB of one argument) reads all the same" "Argument list too long" "$ERR"
+eq "and leaves nothing queued" 0 "$(nstarts)"
 eq "meta.json holds the task, modules and impact" "tref001 api -" "$(meta_of d1 clickup_task) $(meta_of d1 modules) $(meta_of d1 impact || true)-"
 B=$(cat "$HIVE_DIR/drones/d1/brief.md")
 has "the protocol asks for the ClickUp section" "task: tref001" "$B"
@@ -598,6 +604,18 @@ for slow in 1 0.6; do
 done
 rm -f "$FAKE_CU"/tasks/tmany0?.json
 "$HIVE" ct sync >/dev/null 2>&1
+section "hive task: the budget runs out while a note is looked for"
+mkdrone q6 pq6 working
+brief "$T/bq6" "# Late look" "ClickUp: tana001" "Modules: docs" "Impact: none" "Collision checked: trev001 — other pages"
+echo "11 GET /task/trev001/comment" > "$FAKE_CU/stall"
+run timeout 200 "$HIVE" task q6 "$T/bq6"
+rm -f "$FAKE_CU/stall"
+eq "the brief passes" 0 "$RC"
+has "one line says why the note waits" "budget ran out — clickup-sync retries the start writes of tana001" "$ERR"
+hasnt "the look that took the budget is not followed by a post it has no time for" "ClickUp unavailable" "$ERR"
+sync_now
+eq "clickup-sync makes the note, once" 1 "$(comments_of trev001 | grep -c "hive-collision:q6:tana001")"
+rm -f "$FAKE_PANES/pq6.status"
 section "hive task: a token_cmd that hangs"
 cp "$CU/config" "$T/config.ok"
 sed -i "s|^token_cmd = .*|token_cmd = sleep 30; cat $T/token|" "$CU/config"
