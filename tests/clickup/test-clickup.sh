@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/clickup/test-clickup.sh [skill-dir] — ClickUp task tracking: off without a config, the
-# taxonomy, 'hive ct' (find, new, show, set, check, apply, stale, todo, sync, ack), the 'hive task'
+# taxonomy, 'hive ct' (find, new, show, set, check, apply, stale, todo, sync, ack, decision), the 'hive task'
 # gate with its collisions, clickup-sync applying reports, drone-ping's subject, 'hive move', and the
 # API token never reaching argv, a letter or a log.
 # Nothing real runs: curl is a small ClickUp API over files (fake-bin/curl), herdr and notify-send are
@@ -1173,6 +1173,92 @@ eq "an unknown task is refused" 1 "$RC"
 run "$HIVE" ct todo td01
 eq "an item is required" 1 "$RC"
 has "with the usage" 'usage: hive ct todo <id> "<item>"' "$ERR"
+
+# =============================================================================
+section "ct decision"
+run "$HIVE" ct decision list
+eq "without decision_list the decisions are refused" 1 "$RC"
+has "saying which key" "set 'decision_list'" "$ERR"
+echo "decision_list = 9012345600" >> "$CU/config"
+cat > "$FAKE_CU/statuses-9012345600.json" <<'EOF'
+[{"status":"waiting","type":"open"},{"status":"answered","type":"closed"}]
+EOF
+mktask tdec01 "in progress" "front-default,area-other,mod-docs" "Docs: the new layout"
+printf '## Context\nTwo layouts.\n' > "$T/dq"
+run "$HIVE" ct decision new --name "Which layout do we ship?" --task tdec01 --desc "$T/dq"
+eq "new exits 0" 0 "$RC"
+DEC=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
+eq "on the decision list, waiting, with the caller's front" "9012345600 waiting front-default" \
+  "$(task_field "$DEC" .list.id) $(task_field "$DEC" .status.status) $(tags_of "$DEC")"
+eq "the description from --desc" "## Context|Two layouts." "$(jq -j .text_content "$FAKE_CU/tasks/$DEC.json" | paste -sd'|')"
+eq "linked to its task" "$DEC" "$(task_field tdec01 '.linked_tasks[0].link_id')"
+has "and the task's history says it waits" "🤖 decision waiting: $DEC Which layout do we ship?" "$(comments_of tdec01)"
+run "$HIVE" ct decision new --name "which layout do we ship?" --task tdec01
+eq "the same question waiting in the front is refused" 1 "$RC"
+has "naming the decision" "decision $DEC already waits" "$ERR"
+run env HIVE_FRONT=web "$HIVE" ct decision new --name "Which layout do we ship?"
+eq "another front may ask it, without a task" 0 "$RC"
+DECW=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
+eq "in its front" "front-web" "$(tags_of "$DECW")"
+echo 1 > "$FAKE_CU/lost"
+run "$HIVE" ct decision new --name "Łączymy?"
+eq "a decision whose answer was lost (500)" 0 "$RC"
+DECL=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
+eq "is not created again by the retry" 1 "$(cat "$FAKE_CU"/tasks/*.json | jq -s '[.[] | select(.name == "Łączymy?")] | length')"
+run "$HIVE" ct decision new --name "Łączymy?"
+eq "a question with an uppercase letter beyond ASCII is a duplicate too" 1 "$RC"
+has "naming that decision" "decision $DECL already waits" "$ERR"
+rm -f "$FAKE_CU/tasks/$DECL.json"
+run "$HIVE" ct decision new --name "Anything?" --task nosuch01
+eq "an unknown task is refused" 1 "$RC"
+run "$HIVE" ct decision new --name $'Two\nlines'
+eq "a question of two lines is refused" 1 "$RC"
+run "$HIVE" ct decision new --name "Ship now?" --front nosuch
+eq "an unknown front is refused" 1 "$RC"
+
+run "$HIVE" ct decision list
+eq "list shows the caller's front" 1 "$(grep -c '^t' <<<"$OUT")"
+has "with its task and its age" "$(printf '%-11s %-14s %-10s %-5s %-11s %s' "$DEC" waiting default 0h tdec01 "Which layout do we ship?")" "$OUT"
+run "$HIVE" ct decision list --front web
+has "--front another one" "$DECW" "$OUT"
+hasnt "only that one" "$DEC " "$OUT"
+run "$HIVE" ct decision list --all
+eq "--all every front" 2 "$(grep -c '^t' <<<"$OUT")"
+
+run "$HIVE" ct sync
+eq "sync refreshes the cache" 0 "$RC"
+eq "decisions stay out of the task cache" 0 "$(grep -cE "^($DEC|$DECW)"$'\t' "$CU/registry.tsv")"
+run "$HIVE" ct find layout
+hasnt "and out of 'ct find'" "$DEC" "$OUT"
+
+run "$HIVE" ct decision answer "$DEC" --comment "  Layout B, the owner said. "
+eq "answer exits 0" 0 "$RC"
+eq "the decision is answered" answered "$(task_field "$DEC" .status.status)"
+has "with the answer as a comment" "🤖 answer: Layout B, the owner said." "$(comments_of "$DEC")"
+has "noted on the linked task" "🤖 decision $DEC answered: Which layout do we ship? — Layout B, the owner said." "$(comments_of tdec01)"
+n=$(ncomments "$DEC")
+run "$HIVE" ct decision answer "$DEC" --comment "Layout B, the owner said."
+eq "the same answer again changes nothing" "0 $n 2" "$RC $(ncomments "$DEC") $(ncomments tdec01)"
+mkdir -p "$T/tomorrow"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = +%%F ] && { echo 2099-01-02; exit 0; }; done\nexec /usr/bin/date "$@"\n' > "$T/tomorrow/date"
+chmod +x "$T/tomorrow/date"
+run env PATH="$T/tomorrow:$PATH" HIVE_FRONT=web "$HIVE" ct decision answer "$DEC" --comment "Layout B, the owner said."
+eq "nor on another day, from another front" "0 $n 2" "$RC $(ncomments "$DEC") $(ncomments tdec01)"
+run "$HIVE" ct decision list --open
+eq "--open leaves the answered one out" "no decisions" "$OUT"
+run "$HIVE" ct decision list
+has "without --open it is listed" "$DEC" "$OUT"
+run "$HIVE" ct decision answer tdec01 --comment "yes"
+eq "a task off the decision list is no decision" 1 "$RC"
+has "and says so" "not on the decision list" "$ERR"
+run "$HIVE" ct decision answer "$DECW"
+eq "an answer is required" 1 "$RC"
+printf '[{"status":"waiting","type":"open"}]' > "$FAKE_CU/statuses-9012345600.json"
+run "$HIVE" ct decision new --name "Without a closed status?"
+eq "a decision list without a closed status is refused" 1 "$RC"
+has "saying what it needs" "needs an open and a closed status" "$ERR"
+rm -f "$FAKE_CU/statuses-9012345600.json" "$FAKE_CU/tasks/$DEC.json" "$FAKE_CU/tasks/$DECW.json" "$FAKE_CU/tasks/tdec01.json"
+sed -i '/^decision_list = /d' "$CU/config"
 
 # =============================================================================
 section "ct sync and the rate limit"

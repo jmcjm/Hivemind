@@ -68,7 +68,7 @@ If no notification arrived — see "Diagnostics" below.
 | `~/.claude/skills/hivemind/SKILL.md` | doctrine for the coordinator, loaded automatically |
 | `~/.claude/skills/hivemind/hive` | swarm CLI (a wrapper around `herdr`) |
 | `~/.claude/skills/hivemind/drone-ping.sh` | drone hook: reports end of turn / needed decision |
-| `~/.claude/skills/hivemind/coord-creed.md` | the twelve coordinator rules — single source of truth |
+| `~/.claude/skills/hivemind/coord-creed.md` | the thirteen coordinator rules — single source of truth |
 | `~/.claude/skills/hivemind/coord-creed-inject.sh` | `SessionStart` hook: after a compaction, re-injects the creed + the live board |
 | `~/.claude/skills/hivemind/coord-compact-brief.sh` | `PreCompact` hook: tells the summarizer which coordination state must survive |
 | `~/.claude/skills/hivemind/coord-scope.sh` | shared scoping helper — the coordinator hooks fire in one session only |

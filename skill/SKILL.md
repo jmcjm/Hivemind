@@ -531,7 +531,7 @@ self-scoped to the registered coordinator session:
 
 | File | Hook | What it does |
 |---|---|---|
-| `coord-creed.md` | — | the twelve rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
+| `coord-creed.md` | — | the thirteen rules, **the single source of truth**. The section below explains them; edit the discipline there, not here |
 | `coord-creed-inject.sh` | `SessionStart` (`compact\|resume\|clear\|fork`) | prints the creed back into the rebuilt context, followed by the board read from `$HIVE_DIR` at that moment: unread coordinator mail, whether the mail watcher is live, drones with a task in flight and their live pane state, how crowded the swarm directory is |
 | `coord-compact-brief.sh` | `PreCompact` | tells the summarizer what must survive — who is spawned and what they were told, unanswered drone questions, decisions pending for the user |
 
@@ -622,6 +622,9 @@ never becomes a tag. On the command line and in a brief a tag may be named witho
 | `hive ct todo <id> "<item>" [--checklist NAME]` | an item on the task's checklist (`checklist` in the config by default), the checklist created when the task has none; an item already there is not added twice |
 | `hive ct sync` | refreshes the cache, creates the taxonomy's missing tags |
 | `hive ct ack <drone> --manual "<reason>"` | a report the sync could not apply, settled by hand; the reason goes to `clickup/sync.log` |
+| `hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]` | a decision the coordinator waits on from the owner, on the decision list (below): waiting, with the caller's front (or `--front`), linked to the task it is about, whose history gets a line that it waits. The same question waiting in the front is refused |
+| `hive ct decision answer <id> --comment TEXT\|@FILE` | the owner's answer as a comment, the decision answered, the answer noted on the linked task; a second run changes nothing |
+| `hive ct decision list [--front F\|--all] [--open]` | the caller's front's decisions (or that front's, or every front's), oldest first: status, age, task, question |
 
 **The brief's header** — `hive task` refuses a brief without it:
 ```
@@ -716,6 +719,19 @@ it) → merged (`status_unverified`) → deployed and checked in production, a r
 comment. A duplicate found later: `hive ct set <id> --status <cancelled> --comment "duplicate of <id>"`.
 A small step found along the way is not a task of its own: the drone names it in its report and the
 coordinator adds it to the epic's checklist (`hive ct todo <epic> "<step>"`).
+
+**Decisions** (`hive ct decision`, on with `decision_list` in the config). A question only the owner can
+answer lives on a list of its own, not in the conversation, where it is lost with the next compaction.
+The list's first open status means waiting, its first closed one answered; name them as you like (e.g.
+a red *waiting* and a green *answered*). A decision is a task of that list: its name the question in
+one sentence, one front tag, a link to the task it is about, and a description in four parts:
+- **Context**: what is being decided and why now, with a link to the report;
+- **Options**: numbered, each with its cost, and the coordinator's **recommendation**;
+- **Without a decision**: what happens or stays blocked meanwhile;
+- **Report**: the path of the report the options come from.
+
+The answer is a comment written by `answer` (dated, with the front), whatever way the owner gave it.
+Decisions stay out of the cache: they never show up in `ct find`, duplicates, collisions or `ct stale`.
 
 **Tasks left lying** (`hive ct stale`). A task moved when it was updated, commented on, or reported on
 by a drone whose `meta.json` or brief names it. Rule 1: a task in `stale_testing` (default

@@ -33,6 +33,11 @@ status_unverified = testing
 # A tag whose tasks may reach status_done without '## Prod' (e.g. an analysis, done once delivered).
 verify_exempt = type-analysis
 
+# 'hive ct decision': the list of the decisions the coordinators wait on from the owner, next to the
+# tasks' list. Its first open status means waiting, its first closed one answered. Without it the
+# decision commands are off.
+# decision_list = 9012345679
+
 # 'hive ct todo': the checklist a small step goes to when no --checklist is named.
 # checklist = Small steps
 
