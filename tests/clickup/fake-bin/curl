@@ -135,7 +135,7 @@ case "$method $path" in
       jq -e --argjson b "$data" 'any(.[]; .status == $b.status)' "$(stfile "$(listof "$id")")" >/dev/null || reply 400 '{"err":"Status does not exist","ECODE":"CRTSK_001"}'
     fi
     jq --argjson b "$data" --slurpfile st "$(stfile "$(listof "$id")")" \
-       '(if $b.status then .status = ($st[0][] | select(.status == $b.status)) else . end) | (if $b.parent then .parent = $b.parent else . end)' \
+       '(if $b.status then .status = ($st[0][] | select(.status == $b.status)) else . end) | (if $b.parent then .parent = $b.parent else . end) | (if $b.name then .name = $b.name else . end)' \
        "$T/$id.json" > "$T/$id.tmp" && mv "$T/$id.tmp" "$T/$id.json"; touch_task "$id"
     reply 200 "$(cat "$T/$id.json")" ;;
   "POST /task/"*/link/*)

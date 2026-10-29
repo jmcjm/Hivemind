@@ -1185,26 +1185,35 @@ cat > "$FAKE_CU/statuses-9012345600.json" <<'EOF'
 EOF
 mktask tdec01 "in progress" "front-default,area-other,mod-docs" "Docs: the new layout"
 printf '## Context\nTwo layouts.\n' > "$T/dq"
+decid() { sed -n 's/^decision: D-[0-9]* \([^ ]*\) https.*/\1/p' <<<"$OUT"; }
+mkdec() {  # mkdec <id> <status> <front-tag> <name> <date_created>
+  jq -n --arg id "$1" --arg s "$2" --arg f "$3" --arg n "$4" --arg dc "$5" --slurpfile st "$FAKE_CU/statuses-9012345600.json" \
+    '{id: $id, name: $n, status: ($st[0][] | select(.status == $s)), list: {id: "9012345600"}, tags: [{name: $f}],
+      date_created: $dc, date_updated: $dc}' > "$FAKE_CU/tasks/$1.json"
+}
 run "$HIVE" ct decision new --name "Which layout do we ship?" --task tdec01 --desc "$T/dq"
 eq "new exits 0" 0 "$RC"
-DEC=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
+DEC=$(decid)
+has "with its number and id" "decision: D-1 $DEC https://app.clickup.com/t/$DEC" "$OUT"
+eq "the first decision is D-1, in front of the question" "D-1 Which layout do we ship?" "$(task_field "$DEC" .name)"
 eq "on the decision list, waiting, with the caller's front" "9012345600 waiting front-default" \
   "$(task_field "$DEC" .list.id) $(task_field "$DEC" .status.status) $(tags_of "$DEC")"
 eq "the description from --desc" "## Context|Two layouts." "$(jq -j .text_content "$FAKE_CU/tasks/$DEC.json" | paste -sd'|')"
 eq "linked to its task" "$DEC" "$(task_field tdec01 '.linked_tasks[0].link_id')"
-has "and the task's history says it waits" "🤖 decision waiting: $DEC Which layout do we ship?" "$(comments_of tdec01)"
+has "and the task's history says it waits" "🤖 decision waiting: D-1 Which layout do we ship? ($DEC)" "$(comments_of tdec01)"
 run "$HIVE" ct decision new --name "which layout do we ship?" --task tdec01
 eq "the same question waiting in the front is refused" 1 "$RC"
 has "naming the decision" "decision $DEC already waits" "$ERR"
 run env HIVE_FRONT=web "$HIVE" ct decision new --name "Which layout do we ship?"
 eq "another front may ask it, without a task" 0 "$RC"
-DECW=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
+DECW=$(decid)
 eq "in its front" "front-web" "$(tags_of "$DECW")"
+eq "the counter is one for every front" "D-2 Which layout do we ship?" "$(task_field "$DECW" .name)"
 echo 1 > "$FAKE_CU/lost"
 run "$HIVE" ct decision new --name "Łączymy?"
 eq "a decision whose answer was lost (500)" 0 "$RC"
-DECL=$(sed -n 's/^decision: \([^ ]*\) https.*/\1/p' <<<"$OUT")
-eq "is not created again by the retry" 1 "$(cat "$FAKE_CU"/tasks/*.json | jq -s '[.[] | select(.name == "Łączymy?")] | length')"
+DECL=$(decid)
+eq "is not created again by the retry" 1 "$(cat "$FAKE_CU"/tasks/*.json | jq -s '[.[] | select(.name == "D-3 Łączymy?")] | length')"
 run "$HIVE" ct decision new --name "Łączymy?"
 eq "a question with an uppercase letter beyond ASCII is a duplicate too" 1 "$RC"
 has "naming that decision" "decision $DECL already waits" "$ERR"
@@ -1215,15 +1224,40 @@ run "$HIVE" ct decision new --name $'Two\nlines'
 eq "a question of two lines is refused" 1 "$RC"
 run "$HIVE" ct decision new --name "Ship now?" --front nosuch
 eq "an unknown front is refused" 1 "$RC"
+w=$(writes)
+run "$HIVE" ct decision new --name "[3b] Ship now?"
+eq "a number of one's own in brackets is refused" 1 "$RC"
+has "saying the number is hive's" "'[3b]' in front of the question: the number is hive's" "$ERR"
+run "$HIVE" ct decision new --name "D-7 Ship now?"
+eq "and so is one in hive's form" 1 "$RC"
+has "naming it" "'D-7 ' in front of the question" "$ERR"
+eq "and nothing is written" "$w" "$(writes)"
+run "$HIVE" ct decision new --name "D-day or not?"
+eq "a question that only starts like a number is no number" 0 "$RC"
+eq "and is numbered" "D-3 D-day or not?" "$(task_field "$(decid)" .name)"
+rm -f "$FAKE_CU/tasks/$(decid).json"
+printf '1 POST /list/*/task\n' > "$FAKE_CU/stall"
+"$HIVE" ct decision new --name "Race one?" > "$T/race1" 2>&1 &
+sleep 0.3
+run env HIVE_FRONT=web "$HIVE" ct decision new --name "Race two?"
+wait
+rm -f "$FAKE_CU/stall"
+eq "two fronts at once never draw the same number" "D-3 Race one? D-4 Race two?" \
+  "$(cat "$FAKE_CU"/tasks/*.json | jq -rs '[.[] | select(.name | test("Race")) | .name] | sort | join(" ")')"
+for id in $(cat "$FAKE_CU"/tasks/*.json | jq -rs '.[] | select(.name | test("Race")) | .id'); do rm -f "$FAKE_CU/tasks/$id.json"; done
+mkdec tdec09 answered front-web "D-9 An old question?" 1700000000000
+run "$HIVE" ct decision new --name "After the old one?"
+eq "the number of an answered decision does not come back" "D-10 After the old one?" "$(task_field "$(decid)" .name)"
+rm -f "$FAKE_CU/tasks/$(decid).json" "$FAKE_CU/tasks/tdec09.json"
 
 run "$HIVE" ct decision list
-eq "list shows the caller's front" 1 "$(grep -c '^t' <<<"$OUT")"
-has "with its task and its age" "$(printf '%-11s %-14s %-10s %-5s %-11s %s' "$DEC" waiting default 0h tdec01 "Which layout do we ship?")" "$OUT"
+eq "list shows the caller's front" 1 "$(grep -c '^D-' <<<"$OUT")"
+has "with its number, its task and its age" "$(printf '%-6s %-11s %-14s %-10s %-5s %-11s %s' D-1 "$DEC" waiting default 0h tdec01 "Which layout do we ship?")" "$OUT"
 run "$HIVE" ct decision list --front web
 has "--front another one" "$DECW" "$OUT"
 hasnt "only that one" "$DEC " "$OUT"
 run "$HIVE" ct decision list --all
-eq "--all every front" 2 "$(grep -c '^t' <<<"$OUT")"
+eq "--all every front" 2 "$(grep -c '^D-' <<<"$OUT")"
 
 run "$HIVE" ct sync
 eq "sync refreshes the cache" 0 "$RC"
@@ -1235,7 +1269,7 @@ run "$HIVE" ct decision answer "$DEC" --comment "  Layout B, the owner said. "
 eq "answer exits 0" 0 "$RC"
 eq "the decision is answered" answered "$(task_field "$DEC" .status.status)"
 has "with the answer as a comment" "🤖 answer: Layout B, the owner said." "$(comments_of "$DEC")"
-has "noted on the linked task" "🤖 decision $DEC answered: Which layout do we ship? — Layout B, the owner said." "$(comments_of tdec01)"
+has "noted on the linked task" "🤖 decision $DEC answered: D-1 Which layout do we ship? — Layout B, the owner said." "$(comments_of tdec01)"
 n=$(ncomments "$DEC")
 run "$HIVE" ct decision answer "$DEC" --comment "Layout B, the owner said."
 eq "the same answer again changes nothing" "0 $n 2" "$RC $(ncomments "$DEC") $(ncomments tdec01)"
@@ -1253,6 +1287,55 @@ eq "a task off the decision list is no decision" 1 "$RC"
 has "and says so" "not on the decision list" "$ERR"
 run "$HIVE" ct decision answer "$DECW"
 eq "an answer is required" 1 "$RC"
+w=$(writes)
+run "$HIVE" ct decision answer D-77 --comment "yes"
+eq "a number nobody has is refused" 1 "$RC"
+has "and says so" "no decision D-77 on the list" "$ERR"
+mkdec tdd1 waiting front-default "D-8 Twice?" 1700000000000
+mkdec tdd2 waiting front-web "D-8 Twice again?" 1700000000000
+run "$HIVE" ct decision answer D-8 --comment "yes"
+eq "a number on two decisions is refused" 1 "$RC"
+has "naming both" "D-8 is on more than one decision (tdd1,tdd2)" "$ERR"
+eq "and neither answers anything" "$w" "$(writes)"
+mkdec tdd3 waiting front-default "D-12x by hand?" 1700000000000
+run "$HIVE" ct decision answer D-12 --comment "yes"
+eq "a number glued to the question is no number" 1 "$RC"
+rm -f "$FAKE_CU/tasks/tdd1.json" "$FAKE_CU/tasks/tdd2.json" "$FAKE_CU/tasks/tdd3.json"
+run "$HIVE" ct decision answer d-2 --comment "No."
+eq "answer takes the number" "0 answered" "$RC $(task_field "$DECW" .status.status)"
+has "and answers that decision" "🤖 answer: No." "$(comments_of "$DECW")"
+
+mkdec tdn1 waiting front-default "[3b] First?" 1700000002000
+mkdec tdn2 waiting front-web "[QA] Second?" 1700000001000
+mkdec tdn3 answered front-default "Third?" 1700000003000
+mkdec tdn4 waiting front-default "[X]" 1700000004000
+w=$(writes)
+run "$HIVE" ct decision number
+eq "number is a dry run without --yes" "0 $w [3b] First?" "$RC $(writes) $(task_field tdn1 .name)"
+has "planning the oldest first, its bracket dropped" "$(printf '%-5s %-11s %s' PLAN tdn2 '[QA] Second? -> D-3 Second?')" "$OUT"
+has "then the next" "$(printf '%-5s %-11s %s' PLAN tdn1 '[3b] First? -> D-4 First?')" "$OUT"
+has "an answered one too" "$(printf '%-5s %-11s %s' PLAN tdn3 'Third? -> D-5 Third?')" "$OUT"
+has "a name that is only a bracket keeps it" "$(printf '%-5s %-11s %s' PLAN tdn4 '[X] -> D-6 [X]')" "$OUT"
+has "and says it is a dry run" "4 to number, 0 skipped — dry run" "$OUT"
+printf 'GET /task/tdn1 tdn1 .name = "Renamed?"\n' > "$FAKE_CU/edit"
+run "$HIVE" ct decision number --yes
+eq "--yes numbers them" "0|D-3 Second?|D-5 Third?|D-6 [X]" \
+  "$RC|$(task_field tdn2 .name)|$(task_field tdn3 .name)|$(task_field tdn4 .name)"
+eq "but not one renamed since it was read" "Renamed?" "$(task_field tdn1 .name)"
+has "which it skips" "3 to number, 1 skipped" "$OUT"
+printf '400 1 PUT /task/tdn1\n' > "$FAKE_CU/fail"
+run "$HIVE" ct decision number --yes
+eq "a rename ClickUp refuses is left as it was" "Renamed?" "$(task_field tdn1 .name)"
+has "and named" "$(printf '%-5s %-11s %s' FAIL tdn1 'Renamed? (not renamed)')" "$OUT"
+has "and not counted as numbered" "0 to number, 1 skipped" "$OUT"
+rm -f "$FAKE_CU/fail"
+run "$HIVE" ct decision number --yes
+eq "the next run numbers it after the highest" "D-7 Renamed?" "$(task_field tdn1 .name)"
+w=$(writes)
+run "$HIVE" ct decision number --yes
+eq "and a run after that changes nothing" "0 $w" "$RC $(writes)"
+has "saying so" "0 to number, 0 skipped" "$OUT"
+rm -f "$FAKE_CU"/tasks/tdn[1-4].json
 printf '[{"status":"waiting","type":"open"}]' > "$FAKE_CU/statuses-9012345600.json"
 run "$HIVE" ct decision new --name "Without a closed status?"
 eq "a decision list without a closed status is refused" 1 "$RC"

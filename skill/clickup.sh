@@ -1194,12 +1194,25 @@ ct_ack() {
 # to the task it is about. The list's first open status means waiting, its first closed one answered;
 # the answer lands as a comment on the decision and on that task. The list stays out of the cache, so
 # decisions never show up in 'ct find', duplicates or collisions.
+# A decision's number is hive's, never a person's: 'D-<n> ' in front of the question, one counter for
+# the whole list (every front, open and closed), the highest number plus one, so no number comes back.
+# The read of the highest number and the POST hold a lock in $CU_DIR: two fronts on this machine never
+# draw the same number (a coordinator on another machine is not covered).
 
 cu_decision_list() { cu_cfg decision_list; }
 cu_need_decisions() {
   [ -n "$(cu_decision_list)" ] || cu_die "no decision list — set 'decision_list' in $CU_CONF"
   cu_need
 }
+cu_decision_lock() {
+  mkdir -p "$CU_DIR"
+  exec 9>"$CU_DIR/decision.lock"; flock -w 60 9 || cu_die "another decision is being numbered, try again"
+}
+
+# jq definitions: a decision's number (null without one) and its question without the number.
+CU_DECISION_DEFS='
+def dnum: (.name | capture("^D-(?<n>[1-9][0-9]*) ")?.n | tonumber) // null;
+def dquestion: .name | sub("^D-[1-9][0-9]* "; "");'
 
 # cu_decision_statuses — two lines: the decision list's waiting (first open) and answered (first closed) status.
 cu_decision_statuses() {
@@ -1221,17 +1234,19 @@ cu_decisions() {
   done | jq -sc 'sort_by(.date_created // "0" | tonumber)[]'
 }
 
-# cu_decision_match <name> <front-tag> — reads decisions, prints the id of a waiting one of that front
-# with that question; 1 when there is none.
+# cu_decision_match <question> <front-tag> — reads decisions, prints the id of a waiting one of that
+# front with that question, whatever its number; 1 when there is none.
 cu_decision_match() {
   cu_jq_lines --arg n "$1" --arg f "$2" \
-    'select((closed | not) and (.name | ascii_downcase) == ($n | ascii_downcase) and any(tagnames[]; . == $f)) | .id' | grep -m1 .
+    'select((closed | not) and (dquestion | ascii_downcase) == ($n | ascii_downcase) and any(tagnames[]; . == $f)) | .id' | grep -m1 .
 }
 cu_decision_waiting() { local all; all=$(cu_decisions) || return; cu_decision_match "$@" <<<"$all"; }
-cu_jq_lines() { local -a a=("$@"); local f=${a[-1]}; unset 'a[-1]'; jq -r "${CU_JQ_ARGS[@]}" "${a[@]}" "$CU_JQ_DEFS $f"; }
+cu_jq_lines() { local -a a=("$@"); local f=${a[-1]}; unset 'a[-1]'; jq -r "${CU_JQ_ARGS[@]}" "${a[@]}" "$CU_JQ_DEFS $CU_DECISION_DEFS $f"; }
+cu_decision_next() { cu_jq_lines -s 'map(dnum // 0) | max // 0 | . + 1'; }   # reads decisions: the next number
 
 ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front F]
-  local name="" task="" desc="" front="" st waiting tjson="" tname="" body json id
+  local name="" task="" desc="" front="" st waiting tjson="" tname="" body json id n
+  local re='^(\[[^]]*\]|[Dd]-[0-9]+([^0-9]|$))'
   local -a CU_RETRY_GUARD=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1244,6 +1259,7 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
   done
   [ -n "$name" ] || cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F]'
   [[ "$name" != *$'\n'* ]] || cu_die "the name is the question in one line; the rest goes to --desc"
+  [[ ! "$name" =~ $re ]] || cu_die "'${BASH_REMATCH[1]}' in front of the question: the number is hive's (D-<n>), give only the question"
   [ -z "$desc" ] || [ -r "$desc" ] || cu_die "cannot read $desc"
   [ -n "$front" ] || front=$(cu_front_tag "$(front_label "${HIVE_FRONT:-}")") || exit 1
   cu_need_decisions
@@ -1252,10 +1268,12 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
     tjson=$(cu_task "$task") || cu_die "no task $task"
     tname=$(jq -r .name <<<"$tjson")
   fi
+  cu_ensure_tag "$front" || cu_die "cannot create the tag '$front' in the space"
+  cu_decision_lock
   json=$(cu_decisions) || cu_die "cannot read the decision list — not creating"
   id=$(cu_decision_match "$name" "$front" <<<"$json") && cu_die "decision $id already waits with this question — hive ct show $id"
-  cu_ensure_tag "$front" || cu_die "cannot create the tag '$front' in the space"
-  body=$(jq -nc --arg n "$name" --arg f "$front" --arg s "$waiting" --rawfile d "${desc:-/dev/null}" \
+  n=$(cu_decision_next <<<"$json") || cu_die "cannot number the decision — not creating"
+  body=$(jq -nc --arg n "D-$n $name" --arg f "$front" --arg s "$waiting" --rawfile d "${desc:-/dev/null}" \
            '{name: $n, tags: [$f], status: $s} + (if $d != "" then {markdown_content: $d} else {} end)')
   # A POST that timed out may have landed: before a retry the guard looks for the decision.
   CU_RETRY_GUARD=(cu_decision_waiting "$name" "$front")
@@ -1266,15 +1284,16 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
   else
     id=$(jq -r .id <<<"$json")
   fi
-  echo "decision: $id https://app.clickup.com/t/$id"
+  exec 9>&-
+  echo "decision: D-$n $id https://app.clickup.com/t/$id"
   [ -n "$task" ] || return 0
-  cu_api POST "/task/$id/link/$task" >/dev/null || cu_die "decision $id not linked to $task — link it by hand"
-  cu_comment_once "$task" "🤖 decision waiting: $id $name" || cu_die "the note on $task not added"
-  echo "decision: $id linked to $task ($tname)"
+  cu_api POST "/task/$id/link/$task" >/dev/null || cu_die "decision D-$n not linked to $task — link it by hand"
+  cu_comment_once "$task" "🤖 decision waiting: D-$n $name ($id)" || cu_die "the note on $task not added"
+  echo "decision: D-$n linked to $task ($tname)"
 }
 
-ct_decision_answer() {  # decision answer <id> --comment TEXT|@FILE
-  local id="" comment="" st answered json task
+ct_decision_answer() {  # decision answer <D-n|id> --comment TEXT|@FILE
+  local id="" comment="" st answered json task ids
   while [ $# -gt 0 ]; do
     case "$1" in
       --comment) comment=${2:?--comment needs a text}; shift 2 ;;
@@ -1283,8 +1302,17 @@ ct_decision_answer() {  # decision answer <id> --comment TEXT|@FILE
   done
   if [ "${comment:0:1}" = @ ]; then comment=$(cat -- "${comment:1}") || cu_die "cannot read ${comment:1}"; fi
   comment=$(cu_trim "$comment")
-  [ -n "$id" ] && [ -n "$comment" ] || cu_die 'usage: hive ct decision answer <id> --comment "<the answer>"|@FILE'
+  [ -n "$id" ] && [ -n "$comment" ] || cu_die 'usage: hive ct decision answer <D-n|id> --comment "<the answer>"|@FILE'
   cu_need_decisions
+  if [[ "$id" =~ ^[Dd]-([1-9][0-9]*)$ ]]; then
+    json=$(cu_decisions) || cu_die "cannot read the decision list"
+    ids=$(cu_jq_lines --argjson k "${BASH_REMATCH[1]}" 'select(dnum == $k) | .id' <<<"$json")
+    case "$(grep -c . <<<"$ids")" in
+      0) cu_die "no decision ${id^^} on the list" ;;
+      1) id=$ids ;;
+      *) cu_die "${id^^} is on more than one decision ($(paste -sd, - <<<"$ids")) — renumber all but one by hand" ;;
+    esac
+  fi
   json=$(cu_task "$id") || exit 1
   [ "$(jq -r '.list.id // ""' <<<"$json")" = "$(cu_decision_list)" ] || cu_die "$id is not on the decision list"
   st=$(cu_decision_statuses) || exit 1; answered=$(tail -1 <<<"$st")
@@ -1315,13 +1343,42 @@ ct_decision_list() {  # decision list [--front F|--all] [--open]
     select(($f == "all" or any(tagnames[]; . == $f)) and ($open == false or (closed | not)))
     | ((($now | tonumber) - ((.date_created // "0") | tonumber / 1000)) / 3600 | floor) as $h
     | .id as $me | def dash: if . == "" then "-" else . end;
-    [.id, (.status.status // "" | ascii_downcase), (short("front") | join(",") | dash),
+    [(dnum | if . then "D-\(.)" else "-" end), .id, (.status.status // "" | ascii_downcase), (short("front") | join(",") | dash),
      (if $h < 48 then "\($h)h" else "\($h / 24 | floor)d" end),
      ([.linked_tasks[]? | .task_id, .link_id] | map(select(. != null and . != $me)) | unique | join(",") | dash),
-     (.name | gsub("[\t\n\r]"; " "))] | @tsv' <<<"$rows")
+     (dquestion | gsub("[\t\n\r]"; " "))] | @tsv' <<<"$rows")
   [ -n "$rows" ] || { echo "no decisions"; return 0; }
-  { echo "id status front age task question" | tr ' ' '\t'; printf '%s\n' "$rows"; } \
-    | awk -F'\t' '{ printf "%-11s %-14s %-10s %-5s %-11s %s\n", $1, $2, $3, $4, $5, $6 }'
+  { echo "number id status front age task question" | tr ' ' '\t'; printf '%s\n' "$rows"; } \
+    | awk -F'\t' '{ printf "%-6s %-11s %-14s %-10s %-5s %-11s %s\n", $1, $2, $3, $4, $5, $6, $7 }'
+}
+
+# decision number [--yes] — numbers the decisions without a number, oldest first, after the highest
+# number on the list, and drops a hand-made '[...] ' from the front of the name. A dry run unless --yes;
+# a decision renamed in ClickUp since it was read is skipped. A second run changes nothing.
+ct_decision_number() {
+  local yes=0 json plan row id old new n_plan=0 n_skip=0
+  case "${1:-}" in --yes) yes=1 ;; '') ;; *) cu_die "usage: hive ct decision number [--yes]" ;; esac
+  cu_need_decisions
+  cu_decision_lock
+  json=$(cu_decisions) || cu_die "cannot read the decision list"
+  plan=$(cu_jq_lines -s -c '(map(dnum // 0) | max // 0) as $m | [.[] | select(dnum == null)] | to_entries[]
+    | (.value.name | sub("^\\[[^\\]]*\\]\\s*"; "")) as $q
+    | {id: .value.id, old: .value.name, new: "D-\($m + .key + 1) \(if $q == "" then .value.name else $q end)"}' <<<"$json") \
+    || cu_die "cannot read the decision list"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    id=$(jq -r .id <<<"$row"); old=$(jq -r .old <<<"$row"); new=$(jq -r .new <<<"$row")
+    if [ "$yes" = 1 ]; then
+      if ! json=$(cu_task "$id" 2>/dev/null) || [ "$(jq -r .name <<<"$json")" != "$old" ]; then
+        printf '%-5s %-11s %s (renamed or gone since it was read)\n' SKIP "$id" "$old"; n_skip=$((n_skip + 1)); continue
+      fi
+      cu_api PUT "/task/$id" "$(jq -nc --arg n "$new" '{name: $n}')" >/dev/null \
+        || { printf '%-5s %-11s %s (not renamed)\n' FAIL "$id" "$old"; n_skip=$((n_skip + 1)); continue; }
+    fi
+    printf '%-5s %-11s %s -> %s\n' "$([ "$yes" = 1 ] && echo DONE || echo PLAN)" "$id" "$old" "$new"
+    n_plan=$((n_plan + 1))
+  done <<<"$plan"
+  echo "number: $n_plan to number, $n_skip skipped$([ "$yes" = 1 ] || echo ' — dry run, rerun with --yes to write')"
 }
 
 ct_decision() {
@@ -1330,7 +1387,8 @@ ct_decision() {
     new) ct_decision_new "$@" ;;
     answer) ct_decision_answer "$@" ;;
     list) ct_decision_list "$@" ;;
-    *) cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F] | answer <id> --comment TEXT|@FILE | list [--front F|--all] [--open]' ;;
+    number) ct_decision_number "$@" ;;
+    *) cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F] | answer <D-n|id> --comment TEXT|@FILE | list [--front F|--all] [--open] | number [--yes]' ;;
   esac
 }
 
@@ -1370,9 +1428,11 @@ Every task has one front, one area and at least one module.
   hive ct sync                       refresh the cache, create the taxonomy's missing tags
   hive ct ack <drone> --manual "<reason>"   a report clickup-sync could not apply, settled by hand
   hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]
-                                      a decision the owner is asked for, on the decision list
-  hive ct decision answer <id> --comment TEXT|@FILE   the answer, noted on the linked task too
+                                      a decision the owner is asked for, on the decision list,
+                                      numbered D-<n> by hive
+  hive ct decision answer <D-n|id> --comment TEXT|@FILE   the answer, noted on the linked task too
   hive ct decision list [--front F|--all] [--open]   the caller's front's decisions, oldest first
+  hive ct decision number [--yes]     numbers the decisions without a number; a dry run unless --yes
 EOF
        [ -z "$sub" ] || [ "$sub" = help ] || [ "$sub" = -h ] || [ "$sub" = --help ] || exit 1 ;;
   esac
