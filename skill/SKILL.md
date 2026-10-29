@@ -662,9 +662,13 @@ line per colliding task, with a reason:
 ```
 Collision checked: abc124xyz — other files and tables, the PR does not touch the planner
 ```
-A line without a reason, or for a task that does not collide, is refused. Each accepted line becomes a
-comment on both tasks, so the other front sees who entered its module and why. A drone that finds it
-must touch a module outside its brief runs `hive ct check --module X --task <its task>` and stops at a
+A line without a reason, or for a task that does not collide, is refused. The accepted lines are listed
+in the drone's start comment, and each task collided with gets a comment of its own (once per drone,
+even with hundreds of comments after it), so the other front sees who entered its module and why;
+`hive ct show` counts those notes on one line instead of listing them and reads older pages of comments
+until it has eight others, so they do not push a task's history out. When the budget runs out before
+all the comments are made, `hive task` says so in one line and `clickup-sync.sh` makes the rest. A
+drone that finds it must touch a module outside its brief runs `hive ct check --module X --task <its task>` and stops at a
 collision, writing to the coordinator before it commits there.
 
 **Read-only briefs skip the collisions.** A drone that only analyses or reviews changes no code, so it

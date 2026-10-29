@@ -169,6 +169,7 @@ cu_time() {
   left=$(( CU_DEADLINE - $(date +%s) )); [ "$left" -gt 0 ] || left=0
   echo $(( left < $1 ? left : $1 ))
 }
+cu_spent() { [ -n "$CU_DEADLINE" ] && [ "$(cu_time 1)" = 0 ]; }   # the deadline came: no call is made
 
 # cu_api <METHOD> <path> [json-body] — prints the response body. Returns 0 on success, 3 when the
 # object does not exist (ClickUp answers 401 OAUTH_027 for a task id nobody has, not 404), 1 when
@@ -441,20 +442,49 @@ cu_comment() {
   cu_api POST "/task/$1/comment" "$(jq -nc --arg t "$2" '{comment_text: $t, notify_all: false}')" >/dev/null
 }
 
-# cu_has_comment <id> <text> [--contains] — among the 25 latest comments: one equal to the text
-# (whitespace-insensitive), or with --contains one holding it. 2 when ClickUp is down.
+# cu_comments <id> [enough] — the task's comments, newest first, as {comments, more}. ClickUp gives
+# 25 a page; the next page starts from the oldest comment of the one before (start, start_id). Pages
+# are read until one comes short, the comments so far meet the jq filter enough, or 20 pages (500
+# comments, well past what a task gathers, so a runaway task costs at most 20 calls); more is true
+# when older comments were left unread. 2 when ClickUp fails on a page or the budget runs out:
+# the comments read so far are printed all the same.
+cu_comments() {
+  local id=$1 enough=${2:-false} q="" json all='[]' state="more" page rc=0
+  for (( page = 0; page < 20; page++ )); do
+    [ "$page" = 0 ] || ! cu_spent || { rc=2; break; }
+    json=$(cu_api GET "/task/$id/comment$q") || { rc=2; break; }
+    # A page may begin with the comment it starts from: one seen already is not taken twice. The
+    # comments so far go on stdin, not argv: a page of long comments outgrows the 128 KB of one argument.
+    json=$(printf '%s\n%s' "$all" "$json" | jq -sc '.[0] as $all | .[1] | ($all | map(.id // empty)) as $seen
+        | [.comments[]? | select(.id == null or (.id | IN($seen[])) == false)] as $new | ($all + $new) as $a
+        | {a: $a, state: (if (.comments // [] | length) < 25 or ($new | length) == 0 then "end"
+                          elif ($a | '"$enough"') then "enough" else "more" end),
+           q: ($a[-1] | "?start=\(.date // "")&start_id=\(.id // "" | @uri)")}') || { rc=2; break; }
+    all=$(jq -c .a <<<"$json"); state=$(jq -r .state <<<"$json"); q=$(jq -r .q <<<"$json")
+    [ "$state" = more ] || break
+  done
+  jq -c --argjson more "$([ "$state" = end ] && echo false || echo true)" '{comments: ., more: $more}' <<<"$all"
+  return "$rc"
+}
+
+# cu_has_comment <id> <text> [--contains] — among the task's comments (cu_comments): one equal to the
+# text (whitespace-insensitive), or with --contains one holding it. 2 when ClickUp is down.
 cu_has_comment() {
-  local json
-  json=$(cu_api GET "/task/$1/comment") || return 2
-  jq -e --arg t "$2" --arg how "${3:-}" 'def n: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
-      ($t | n) as $want | any(.comments[]?; (.comment_text // "" | n) as $c | if $how == "" then $c == $want else ($c | contains($want)) end)' \
-    <<<"$json" >/dev/null
+  local json rc f
+  f='def n: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
+     ('"$(jq -rn --arg t "$2" '$t | @json')"' | n) as $want
+     | any(.[]; (.comment_text // "" | n) as $c | if '"$([ -n "${3:-}" ] && echo true || echo false)"' then $c | contains($want) else $c == $want end)'
+  json=$(cu_comments "$1" "$f"); rc=$?
+  jq -e ".comments | $f" <<<"$json" >/dev/null && return 0
+  [ "$rc" = 2 ] && return 2
+  return 1
 }
 
 cu_comment_once() {  # cu_comment_once <id> <text> [marker] — never twice the same comment (or marker)
   local rc; cu_has_comment "$1" "${3:-$2}" ${3:+--contains}; rc=$?
   [ "$rc" = 0 ] && return 0
   [ "$rc" = 2 ] && return 2
+  cu_spent && return 2   # the look took what was left of the budget: the comment waits for clickup-sync
   cu_comment "$@"
 }
 
@@ -719,7 +749,7 @@ cu_gate() {
 # (cu_cleanup); one killed outright leaves the dot name, which clickup-sync takes up once it is old.
 # Warns, never fails.
 cu_started() {
-  local at tmp rc=2
+  local at tmp rc=2 why="ClickUp failed"
   at=$(date +%s)
   mkdir -p "$CU_STARTS" && tmp=$(mktemp "$CU_STARTS/.start.XXXXXX") \
     || { CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
@@ -730,10 +760,11 @@ cu_started() {
         '{drone: $drone, front: $front, task: $task, title: $title, modules: $mods, impact: $impact, settled: $settled, at: $at}' > "$tmp" \
     || { CU_START_PENDING=""; rm -f "$tmp"; CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
   [ "$CU_UP" = 1 ] && { cu_start_apply "$tmp" "$CU_GATE_TASK"; rc=$?; }
+  cu_spent && why="the ${CU_GATE_BUDGET}s budget ran out"
   CU_DEADLINE=""
   [ "$rc" = 2 ] || { CU_START_PENDING=""; rm -f "$tmp"; return 0; }
   cu_start_publish || { rm -f "$tmp"; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
-  [ "$CU_UP" = 1 ] && cu_say "ClickUp failed — clickup-sync retries the start writes of $CU_GATE_ID"
+  [ "$CU_UP" = 1 ] && cu_say "$why — clickup-sync retries the start writes of $CU_GATE_ID"
   return 0
 }
 
@@ -746,11 +777,12 @@ cu_start_publish() {
 
 # cu_start_apply <file> [task-json] — the start writes of a queued brief: the brief's modules the task
 # lacks are added to it, an early status moves to status_start, the task gets a start comment (marked
-# hive-start:<drone>:<time>: a replay never doubles it) and every settled collision a comment on both
-# tasks. The task is read from ClickUp unless given. 0 done, 2 when ClickUp failed on a write (worth a
-# retry), 1 when the task cannot be read and 4 when the record is unreadable (nothing to retry).
+# hive-start:<drone>:<time>: a replay never doubles it) naming every settled collision, and each task
+# collided with a comment of its own (marked hive-collision:<drone>:<task>). The task is read from
+# ClickUp unless given. 0 done, 2 when ClickUp failed on a write (worth a retry), 1 when the task
+# cannot be read and 4 when the record is unreadable (nothing to retry).
 cu_start_apply() {
-  local drone front id title mods impact at settled json=${2:-} st m add="" cid reason shared marker rc=0
+  local drone front id title mods impact at settled json=${2:-} st m add="" cid reason shared marker notes rc=0
   IFS=$'\037' read -r drone front id title mods impact at \
     < <(jq -r '[.drone, .front, .task, .title, .modules, .impact, .at] | join("\u001f")' "$1" 2>/dev/null)
   [ -n "$id" ] && [ -n "$at" ] || { cu_say "unreadable start record $1"; return 4; }
@@ -771,14 +803,16 @@ cu_start_apply() {
       || { [ "$?" = 2 ] && rc=2; cu_say "could not move $id to '$(cu_statuses start | head -1)'"; }
   fi
   marker="hive-start:$drone:$at"
-  cu_comment_once "$id" "🤖 drone $drone (front $front) start: $title; modules: ${mods//,/, }; impact: ${impact:-none}"$'\n'"$marker" "$marker" \
-    || { [ "$?" = 2 ] && rc=2; cu_say "could not comment on $id"; }
+  notes=$(awk -F'\t' '$1 != "" { gsub(",", ", ", $3); printf "\ncollision checked with %s (modules %s): %s", $1, $3, $2 }' <<<"$settled")
+  cu_spent && return 2   # the budget is gone: clickup-sync makes the rest, a replay doubles nothing
+  cu_comment_once "$id" "🤖 drone $drone (front $front) start: $title; modules: ${mods//,/, }; impact: ${impact:-none}$notes"$'\n'"$marker" "$marker" \
+    || { [ "$?" = 2 ] && rc=2; cu_spent || cu_say "could not comment on $id"; }
+  # The other task gets one note per drone: a brief given again to the same drone adds none.
   while IFS=$'\t' read -r cid reason shared; do
     [ -n "$cid" ] || continue
-    for m in "$id" "$cid"; do
-      cu_comment_once "$m" "🤖 collision checked: drone $drone (front $front) on $id works in modules ${shared//,/, } of $cid as well: $reason" \
-        || { [ "$?" = 2 ] && rc=2; cu_say "could not comment on $m"; }
-    done
+    cu_spent && return 2   # the budget is gone: clickup-sync makes the rest, a replay doubles nothing
+    cu_comment_once "$cid" "🤖 collision checked: drone $drone (front $front) on $id works in modules ${shared//,/, } of $cid as well: $reason"$'\n'"hive-collision:$drone:$id" "hive-collision:$drone:$id" \
+      || { [ "$?" = 2 ] && rc=2; cu_spent || cu_say "could not comment on $cid"; }
   done <<<"$settled"
   return "$rc"
 }
@@ -857,7 +891,7 @@ ct_show() {  # show <id>
   local id=${1:?usage: hive ct show <id>} json comments pname="" parent prs k
   cu_need
   json=$(cu_task "$id") || exit 1
-  comments=$(cu_api GET "/task/$id/comment") || comments='{"comments":[]}'
+  comments=$(cu_comments "$id" '[.[] | select(.comment_text // "" | startswith("🤖 collision checked:") | not)] | length >= 8')
   parent=$(jq -r '.parent // ""' <<<"$json")
   [ -n "$parent" ] && pname=$(cu_api GET "/task/$parent" 2>/dev/null | jq -r .name)
   cu_jq "$json" '"\(.id)  \(.name)\n\(.url)\nstatus:  \(.status.status)\(if closed then " (closed)" else "" end)"'
@@ -871,9 +905,13 @@ ct_show() {  # show <id>
   [ -z "$prs" ] || { echo "PRs:"; sed 's/^/  /' <<<"$prs"; }
   echo; echo "--- description"
   jq -r '.text_content // .description // "" | if . == "" then "(empty)" else . end' <<<"$json"
+  # Notes left by other tasks' collisions are counted on one line: listed, they push the history out.
   echo; echo "--- latest comments (oldest first)"
-  jq -r '.comments[:8] | reverse | if length == 0 then "(none)" else .[] |
-         "[\((.date | tonumber / 1000 | strflocaltime("%Y-%m-%d %H:%M"))) \(.user.username // "?")] \(.comment_text)" end' <<<"$comments"
+  jq -r 'def when: .date | tonumber / 1000 | strflocaltime("%Y-%m-%d %H:%M");
+         (.comments // []) as $all | [$all[] | select(.comment_text // "" | startswith("🤖 collision checked:"))] as $notes
+         | ([$all[] | select(.comment_text // "" | startswith("🤖 collision checked:") | not)][:8] | reverse
+            | if length == 0 then "(none)" else .[] | "[\(when) \(.user.username // "?")] \(.comment_text)" end),
+           (if ($notes | length) > 0 then "(\($notes | length) collision notes not shown\(if .more then " among the \($all | length) latest comments" else "" end), the latest \($notes[0] | when))" else empty end)' <<<"$comments"
 }
 
 # cu_module_changes <+M,-M,M> — two lists of full tags: what to add, then (after a line '--') what to remove.
