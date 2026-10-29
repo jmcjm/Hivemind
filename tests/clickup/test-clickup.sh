@@ -243,6 +243,13 @@ has "status" "status:  in review" "$OUT"
 has "tags by kind" "module:  api" "$OUT"
 has "tags outside the taxonomy apart" "other:   urgent" "$OUT"
 has "the PRs from the report comments" "https://example.com/pr/7" "$OUT"
+jq -n '[range(12) | {comment_text: "🤖 collision checked: drone c\(.) (front default) on tx works in modules api of tshow01 as well: no clash\nhive-collision:c\(.):tx",
+         date: "1700000600000", user: {username: "tester"}}] + [{comment_text: "the decision that matters", date: "1700000300000", user: {username: "tester"}}]' \
+  > "$FAKE_CU/comments/tshow01.json"
+run "$HIVE" ct show tshow01
+has "collision notes do not push the history out" "the decision that matters" "$OUT"
+hasnt "they are not listed" "drone c0 (front default)" "$OUT"
+has "they are counted, with the latest" "(12 collision notes not shown, the latest 2023-11-14 22:23)" "$OUT"
 run "$HIVE" ct show tnone01
 eq "an unknown task fails" 1 "$RC"
 rm -f "$FAKE_CU/tasks/tshow01.json"
@@ -385,8 +392,13 @@ run "$HIVE" task d1 "$T/b1"
 eq "settled collisions pass (aliases from the config work)" 0 "$RC"
 eq "the task goes from an early status to status_start" "in progress" "$(task_field tref001 .status.status)"
 has "with a start comment" "drone d1 (front default) start: Fix refunds; modules: api; impact: none" "$(comments_of tref001)"
-has "each settled collision is a comment on the task" "on tref001 works in modules api of tinv001 as well: other files, no shared table" "$(comments_of tref001)"
-has "and on the other task" "on tref001 works in modules api of tsrch01 as well: ranking code only" "$(comments_of tsrch01)"
+has "the start comment names each settled collision" "collision checked with tinv001 (modules api): other files, no shared table" "$(comments_of tref001)"
+eq "and the task gets no comment per collision" "1 0" "$(ncomments tref001) $(comments_of tref001 | grep -c '^🤖 collision checked')"
+has "the other task gets one" "on tref001 works in modules api of tsrch01 as well: ranking code only" "$(comments_of tsrch01)"
+n=$(ncomments tsrch01); brief "$T/b1x" "# Fix refunds again" "ClickUp: tref001" "Modules: api" "Impact: none" \
+  "Collision checked: tinv001 — other files" "Collision checked: tsrch01 — ranking code, reworded"
+run "$HIVE" task d1 "$T/b1x"
+eq "the same drone briefed again adds no note to the other task" "0 $n" "$RC $(ncomments tsrch01)"
 eq "meta.json holds the task, modules and impact" "tref001 api -" "$(meta_of d1 clickup_task) $(meta_of d1 modules) $(meta_of d1 impact || true)-"
 B=$(cat "$HIVE_DIR/drones/d1/brief.md")
 has "the protocol asks for the ClickUp section" "task: tref001" "$B"
@@ -541,6 +553,28 @@ eq "one start comment, however the syncs fall" 1 "$(comments_of tana001 | grep -
 eq "one collision comment" 1 "$(comments_of trev001 | grep -c 'drone q2 (front default) on tana001')"
 eq "and nothing left in the queue" "0 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
 rm -f "$FAKE_PANES/pq2.status"
+section "hive task: more collisions than the budget has room for"
+lines=("Collision checked: trev001 — other pages")
+for i in 1 2 3 4 5 6; do
+  mktask "tmany0$i" "in progress" "front-default,area-other,mod-docs" "Docs: page $i"
+  lines+=("Collision checked: tmany0$i — other pages")
+done
+"$HIVE" ct sync >/dev/null 2>&1
+mkdrone q4 pq4 working
+brief "$T/bq4" "# Many collisions" "ClickUp: tana001" "Modules: docs" "Impact: none" "${lines[@]}"
+echo 1 > "$FAKE_CU/slow"
+s=$SECONDS; run timeout 200 "$HIVE" task q4 "$T/bq4"; took=$((SECONDS - s))
+rm -f "$FAKE_CU/slow"
+eq "the brief passes" 0 "$RC"
+eq "within the budget" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
+has "one line says why the rest waits" "budget ran out — clickup-sync retries the start writes of tana001" "$ERR"
+hasnt "not a line per comment it had no time for" "could not comment" "$ERR"
+sync_now
+eq "clickup-sync makes the rest: a note on every task collided with" "1 1 1 1 1 1 1" \
+  "$(for t in trev001 tmany01 tmany02 tmany03 tmany04 tmany05 tmany06; do comments_of "$t" | grep -c 'hive-collision:q4:tana001'; done | paste -sd' ')"
+eq "and one start comment" 1 "$(comments_of tana001 | grep -c 'hive-start:q4:')"
+rm -f "$FAKE_PANES/pq4.status" "$FAKE_CU"/tasks/tmany0?.json
+"$HIVE" ct sync >/dev/null 2>&1
 section "hive task: a token_cmd that hangs"
 cp "$CU/config" "$T/config.ok"
 sed -i "s|^token_cmd = .*|token_cmd = sleep 30; cat $T/token|" "$CU/config"
@@ -693,7 +727,7 @@ touch -d '-2 minutes' "$CU"/starts/.start.*
 sync_now
 eq "an old one clickup-sync takes up and makes" "0 0" "$(nstarts) $(find "$CU/starts" -name '.*' | wc -l)"
 eq "without doubling the start comment made before the kill" 1 "$(comments_of tcu000 | grep -c 'hive-start:kk:')"
-eq "and with the collision comments" "1 1" "$(comments_of tcu000 | grep -c 'drone kk (front default) on tcu000') $(comments_of tcu008 | grep -c 'drone kk (front default) on tcu000')"
+eq "and with the collision, in the start comment and on the other task" "1 1" "$(comments_of tcu000 | grep -c 'collision checked with tcu008') $(comments_of tcu008 | grep -c 'drone kk (front default) on tcu000')"
 has "saying so" "taken up: its 'hive task' died" "$(cat "$CU/sync.log")"
 rm -f "$FAKE_PANES/pkk.status"
 mkdir -p "$T/badjq"

@@ -169,6 +169,7 @@ cu_time() {
   left=$(( CU_DEADLINE - $(date +%s) )); [ "$left" -gt 0 ] || left=0
   echo $(( left < $1 ? left : $1 ))
 }
+cu_spent() { [ -n "$CU_DEADLINE" ] && [ "$(cu_time 1)" = 0 ]; }   # the deadline came: no call is made
 
 # cu_api <METHOD> <path> [json-body] — prints the response body. Returns 0 on success, 3 when the
 # object does not exist (ClickUp answers 401 OAUTH_027 for a task id nobody has, not 404), 1 when
@@ -719,7 +720,7 @@ cu_gate() {
 # (cu_cleanup); one killed outright leaves the dot name, which clickup-sync takes up once it is old.
 # Warns, never fails.
 cu_started() {
-  local at tmp rc=2
+  local at tmp rc=2 why="ClickUp failed"
   at=$(date +%s)
   mkdir -p "$CU_STARTS" && tmp=$(mktemp "$CU_STARTS/.start.XXXXXX") \
     || { CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
@@ -730,10 +731,11 @@ cu_started() {
         '{drone: $drone, front: $front, task: $task, title: $title, modules: $mods, impact: $impact, settled: $settled, at: $at}' > "$tmp" \
     || { CU_START_PENDING=""; rm -f "$tmp"; CU_DEADLINE=""; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
   [ "$CU_UP" = 1 ] && { cu_start_apply "$tmp" "$CU_GATE_TASK"; rc=$?; }
+  cu_spent && why="the ${CU_GATE_BUDGET}s budget ran out"
   CU_DEADLINE=""
   [ "$rc" = 2 ] || { CU_START_PENDING=""; rm -f "$tmp"; return 0; }
   cu_start_publish || { rm -f "$tmp"; cu_say "could not queue the start writes of $CU_GATE_ID"; return 0; }
-  [ "$CU_UP" = 1 ] && cu_say "ClickUp failed — clickup-sync retries the start writes of $CU_GATE_ID"
+  [ "$CU_UP" = 1 ] && cu_say "$why — clickup-sync retries the start writes of $CU_GATE_ID"
   return 0
 }
 
@@ -746,11 +748,12 @@ cu_start_publish() {
 
 # cu_start_apply <file> [task-json] — the start writes of a queued brief: the brief's modules the task
 # lacks are added to it, an early status moves to status_start, the task gets a start comment (marked
-# hive-start:<drone>:<time>: a replay never doubles it) and every settled collision a comment on both
-# tasks. The task is read from ClickUp unless given. 0 done, 2 when ClickUp failed on a write (worth a
-# retry), 1 when the task cannot be read and 4 when the record is unreadable (nothing to retry).
+# hive-start:<drone>:<time>: a replay never doubles it) naming every settled collision, and each task
+# collided with a comment of its own (marked hive-collision:<drone>:<task>). The task is read from
+# ClickUp unless given. 0 done, 2 when ClickUp failed on a write (worth a retry), 1 when the task
+# cannot be read and 4 when the record is unreadable (nothing to retry).
 cu_start_apply() {
-  local drone front id title mods impact at settled json=${2:-} st m add="" cid reason shared marker rc=0
+  local drone front id title mods impact at settled json=${2:-} st m add="" cid reason shared marker notes rc=0
   IFS=$'\037' read -r drone front id title mods impact at \
     < <(jq -r '[.drone, .front, .task, .title, .modules, .impact, .at] | join("\u001f")' "$1" 2>/dev/null)
   [ -n "$id" ] && [ -n "$at" ] || { cu_say "unreadable start record $1"; return 4; }
@@ -771,14 +774,15 @@ cu_start_apply() {
       || { [ "$?" = 2 ] && rc=2; cu_say "could not move $id to '$(cu_statuses start | head -1)'"; }
   fi
   marker="hive-start:$drone:$at"
-  cu_comment_once "$id" "🤖 drone $drone (front $front) start: $title; modules: ${mods//,/, }; impact: ${impact:-none}"$'\n'"$marker" "$marker" \
-    || { [ "$?" = 2 ] && rc=2; cu_say "could not comment on $id"; }
+  notes=$(awk -F'\t' '$1 != "" { gsub(",", ", ", $3); printf "\ncollision checked with %s (modules %s): %s", $1, $3, $2 }' <<<"$settled")
+  cu_comment_once "$id" "🤖 drone $drone (front $front) start: $title; modules: ${mods//,/, }; impact: ${impact:-none}$notes"$'\n'"$marker" "$marker" \
+    || { [ "$?" = 2 ] && rc=2; cu_spent || cu_say "could not comment on $id"; }
+  # The other task gets one note per drone: a brief given again to the same drone adds none.
   while IFS=$'\t' read -r cid reason shared; do
     [ -n "$cid" ] || continue
-    for m in "$id" "$cid"; do
-      cu_comment_once "$m" "🤖 collision checked: drone $drone (front $front) on $id works in modules ${shared//,/, } of $cid as well: $reason" \
-        || { [ "$?" = 2 ] && rc=2; cu_say "could not comment on $m"; }
-    done
+    cu_spent && return 2   # the budget is gone: clickup-sync makes the rest, a replay doubles nothing
+    cu_comment_once "$cid" "🤖 collision checked: drone $drone (front $front) on $id works in modules ${shared//,/, } of $cid as well: $reason"$'\n'"hive-collision:$drone:$id" "hive-collision:$drone:$id" \
+      || { [ "$?" = 2 ] && rc=2; cu_spent || cu_say "could not comment on $cid"; }
   done <<<"$settled"
   return "$rc"
 }
@@ -871,9 +875,13 @@ ct_show() {  # show <id>
   [ -z "$prs" ] || { echo "PRs:"; sed 's/^/  /' <<<"$prs"; }
   echo; echo "--- description"
   jq -r '.text_content // .description // "" | if . == "" then "(empty)" else . end' <<<"$json"
+  # Notes left by other tasks' collisions are counted on one line: listed, they push the history out.
   echo; echo "--- latest comments (oldest first)"
-  jq -r '.comments[:8] | reverse | if length == 0 then "(none)" else .[] |
-         "[\((.date | tonumber / 1000 | strflocaltime("%Y-%m-%d %H:%M"))) \(.user.username // "?")] \(.comment_text)" end' <<<"$comments"
+  jq -r 'def when: .date | tonumber / 1000 | strflocaltime("%Y-%m-%d %H:%M");
+         (.comments // []) as $all | [$all[] | select(.comment_text // "" | startswith("🤖 collision checked:"))] as $notes
+         | ([$all[] | select(.comment_text // "" | startswith("🤖 collision checked:") | not)][:8] | reverse
+            | if length == 0 then "(none)" else .[] | "[\(when) \(.user.username // "?")] \(.comment_text)" end),
+           (if ($notes | length) > 0 then "(\($notes | length) collision notes not shown, the latest \($notes[0] | when))" else empty end)' <<<"$comments"
 }
 
 # cu_module_changes <+M,-M,M> — two lists of full tags: what to add, then (after a line '--') what to remove.
