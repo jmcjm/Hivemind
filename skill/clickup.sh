@@ -80,7 +80,7 @@ cu_init() {
 
 # cu_list <key> — a '|'-separated config value, lower case, one a line.
 cu_list() { cu_cfg "$1" | tr '|' '\n' | while IFS= read -r s; do s=$(cu_trim "${s,,}"); [ -z "$s" ] || echo "$s"; done; }
-# cu_statuses <early|active|closed|start|done|unverified> — the configured statuses, lower case, one a line.
+# cu_statuses <early|active|info|closed|start|done|unverified> — the configured statuses, lower case, one a line.
 cu_statuses() { cu_list "status_$1"; }
 # cu_status_is <status> <group>. A here-string, not a pipe: under pipefail grep -q leaving early
 # would fail the pipe on a match.
@@ -611,11 +611,13 @@ cu_drone_refs() {
 # a task in an active status sharing a module, other than the task itself, its ancestors and its
 # subtasks, and not an epic (a task with subtasks); plus the tasks living drones hold in a shared
 # module, whatever their status, unless the cache has the task closed. One line each: id, status,
-# front, shared modules, name, drones.
+# front, shared modules, name, drones. With 'info': instead the tasks in an info status (status_info)
+# that would collide the same way, but that no living drone holds — listed, never collisions. An
+# info task a living drone holds collides, whatever modules the drone's brief names.
 cu_collisions() {
   local reg=$CU_REGISTRY; [ -f "$reg" ] || reg=/dev/null
   awk -F'\t' -v self="$1" -v want="$2" -v active="|$(cu_statuses active | paste -sd'|')|" -v claims="$CU_CLAIMS" \
-      -v closed="|$(cu_statuses closed | paste -sd'|')|" '
+      -v closed="|$(cu_statuses closed | paste -sd'|')|" -v info="|$(cu_statuses info | paste -sd'|')|" -v mode="${3:-}" '
     function shared(mods,   n, a, i, out) { n = split(mods, a, ","); out = ""
       for (i = 1; i <= n; i++) if (a[i] != "" && index("," want ",", "," a[i] ",") && !index("," out ",", "," a[i] ",")) out = out (out == "" ? "" : ",") a[i]
       return out }
@@ -632,13 +634,17 @@ cu_collisions() {
                  if ($6 != "") haschild[$6] = 1 }
     END {
       for (i = 1; i <= n; i++) { id = ids[i]
-        if (related(id) || (id in haschild) || !index(active, "|" status[id] "|")) continue
-        s = shared(mods[id]); if (s != "") hit[id] = s }
+        if (related(id) || (id in haschild)) continue
+        s = shared(mods[id]); if (s == "") continue
+        if (index(active, "|" status[id] "|")) hit[id] = s
+        else if (index(info, "|" status[id] "|")) seen[id] = s }
       for (j = 1; j <= nc; j++) { id = ctask[j]
         if (id == "" || related(id) || ((id in status) && index(closed, "|" status[id] "|"))) continue
-        s = shared(cmods[j]); if (s == "") continue
+        s = shared(cmods[j]); if (s == "" && (id in seen)) s = seen[id]
+        if (s == "") continue
         hit[id] = (id in hit) ? union(hit[id], s) : s
         drones[id] = drones[id] (drones[id] == "" ? "" : ",") cdrone[j] " (front " cfront[j] ")" }
+      if (mode == "info") { for (id in seen) if (!(id in hit)) printf "%s\t%s\t%s\t%s\t%s\t\n", id, status[id], front[id], seen[id], name[id]; exit }
       for (id in hit) printf "%s\t%s\t%s\t%s\t%s\t%s\n", id, (id in status) ? status[id] : "?", front[id], hit[id], name[id], drones[id]
     }' "$CU_CLAIMS" "$reg" | sort
 }
@@ -664,6 +670,7 @@ cu_settle() {
     reason=$(sed -E 's/^[^[:space:]—–:-]+//; s/^[[:space:]]*(—|–|-|:)*[[:space:]]*//' <<<"$line")
     if ! grep -qxF -- "$cid" <<<"$(cut -f1 <<<"$col")"; then
       grep -qxF -- "$cid" <<<"$CU_GONE" && continue      # the task is gone from ClickUp since the brief was written
+      grep -qxF -- "$cid" <<<"$(cut -f1 <<<"$CU_INFO")" && continue   # listed for information only: no note either
       CU_GATE_MSG="'Collision checked: $cid' — $cid is not one of the collisions$([ -n "$col" ] && printf ' (%s)' "$(cut -f1 <<<"$col" | paste -sd' ')")"
       return 1
     fi
@@ -683,7 +690,7 @@ Wait for them, or once you checked the work does not clash add one line per task
 
 # --- the 'hive task' gate -----------------------------------------------------
 
-CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_CHECKED="" CU_SETTLED="" CU_CLAIMS="" CU_GONE=""
+CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_CHECKED="" CU_SETTLED="" CU_CLAIMS="" CU_GONE="" CU_INFO=""
 # cu_gate <drone> <task> <brief> <front> — may <drone> of <front> start on <task>? 0 yes, 1 no with
 # CU_GATE_MSG saying what to fix. ClickUp being down lets the brief through with CU_GATE_MSG as a
 # warning (an outage must not stop the swarm); collisions are then counted on the cache as it is and
@@ -695,7 +702,7 @@ CU_GATE_MSG="" CU_GATE_TASK="" CU_GATE_ID="" CU_UP=0 CU_MODS="" CU_IMPACT="" CU_
 # Leaves the task id in CU_GATE_ID, the task in CU_GATE_TASK and CU_UP=1 when ClickUp answered.
 cu_gate() {
   local drone=$1 id=$2 brief=$3 front=$4 rc mine fronts areas col err warn=""
-  CU_UP=0 CU_GATE_TASK="" CU_GATE_ID=$id CU_GATE_MSG="" CU_GONE=""
+  CU_UP=0 CU_GATE_TASK="" CU_GATE_ID=$id CU_GATE_MSG="" CU_GONE="" CU_INFO=""
   cu_init 2>/dev/null || { CU_GATE_MSG=$(cu_init 2>&1); return 1; }
   cu_brief_header "$brief" || return 1
   mine=$(cu_front_tag "$front" 2>&1) || { CU_GATE_MSG="front $front has no tag in $CU_TAXONOMY: $mine"; return 1; }
@@ -737,6 +744,8 @@ cu_gate() {
     CU_GONE=$(cu_vanished "$col")
     [ -z "$CU_GONE" ] || col=$(cu_collisions "$id" "$CU_MODS${CU_IMPACT:+,$CU_IMPACT}")
   fi
+  CU_INFO=$(cu_collisions "$id" "$CU_MODS${CU_IMPACT:+,$CU_IMPACT}" info)
+  [ -z "$CU_INFO" ] || cu_say "for information, no drone at work on them (no 'Collision checked' needed):"$'\n'"$(CU_UP=0 cu_print_collisions "$CU_INFO")"
   cu_settle "$col" || { [ -z "$warn" ] || CU_GATE_MSG+=$'\n'"warning: $warn"; return 1; }
   CU_GATE_MSG=$warn
 }
@@ -957,7 +966,7 @@ ct_set() {  # set <id> [--status S] [--comment TEXT|@FILE] [--area A] [--module 
 }
 
 ct_check() {  # check --module M[,M] [--impact M[,M]] [--task ID]
-  local mods="" impact="" task="-" col
+  local mods="" impact="" task="-" col info
   while [ $# -gt 0 ]; do
     case "$1" in
       --module) mods=$(cu_modules "${2:?--module needs a value}") || exit 1; shift 2 ;;
@@ -972,6 +981,8 @@ ct_check() {  # check --module M[,M] [--impact M[,M]] [--task ID]
   cu_ready 2>/dev/null && CU_UP=1
   cu_claims "$(front_label "${HIVE_FRONT:-}")" "${HIVE_DRONE:-}"
   col=$(cu_collisions "$task" "$mods${impact:+,$impact}")
+  info=$(cu_collisions "$task" "$mods${impact:+,$impact}" info)
+  if [ -n "$info" ]; then echo "check: for information, no drone at work on them:"; cu_print_collisions "$info"; fi
   if [ -z "$col" ]; then echo "check: no collisions in ${mods//,/, }${impact:+ (impact ${impact//,/, })}"; return 0; fi
   echo "check: collisions in ${mods//,/, }${impact:+ (impact ${impact//,/, })}:"
   cu_print_collisions "$col"

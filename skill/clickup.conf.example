@@ -17,7 +17,10 @@ token_cmd = pass show clickup/api-token
 # early: a drone starting on such a task moves it to status_start.
 status_early = backlog | to do | ready
 # active: a task in one of these collides on its modules.
-status_active = ready | in progress | in review | testing
+status_active = ready | in progress | in review
+# info: a task in one of these (its code merged, e.g. testing) is listed by the gate and 'hive ct check'
+# but needs no 'Collision checked' line; a living drone on it still collides, as every drone at work does.
+status_info = testing
 # closed: the sync never reopens one.
 status_closed = done | cancelled
 # start: where 'hive task' moves an early task.

@@ -653,8 +653,10 @@ names for these lines, e.g. in your own language.
 
 **Collisions.** The modules checked are those of `Modules:` and `Impact:`. Another task collides when it
 is in an active status (`status_active`), shares a module, is not the task itself, an ancestor or a
-subtask, and is not an epic (a task with subtasks; epics gather work and would always collide). Every
-drone at work, in every front, counts too, with the modules of its brief, whatever its task's open
+subtask, and is not an epic (a task with subtasks; epics gather work and would always collide). A task
+in an info status (`status_info`, e.g. `testing`: its code is merged) is only listed, by the gate and
+`hive ct check`, and needs no line below; a `Collision checked` line for it is accepted and leaves no
+note on it. Every drone at work, in every front, counts too, with the modules of its brief, whatever its task's open
 status. A drone is not at work when its pane is dead, when the cache has its task closed, or when
 its report, newer than its brief, says `DONE` or `FAILED`; a `BLOCKED` drone still holds its modules. Each
 collision is listed with its status, front, shared modules, drone and PRs. The only way through is one
