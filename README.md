@@ -315,7 +315,8 @@ list of their own (`hive ct decision`). hive numbers each one `D-<n>`: one count
 reused, not even after the answer, so the owner answers "D-7 ok". A question numbered by hand is
 refused, and decisions from before the numbering get theirs with `hive ct decision number --yes`. The
 next number is the highest on the list or the highest kept in `~/.herdr-hive/clickup/decision.last`,
-so a deleted or archived decision does not give its number back. The counter and that file are per
+so a deleted or archived decision does not give its number back. A number goes to that file before
+ClickUp is asked, so a create that fails leaves a gap, never a number given twice. The counter and that file are per
 machine; coordinators on two machines are not covered.
 
 ## Watching outside sources
