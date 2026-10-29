@@ -1375,6 +1375,13 @@ echo "7x" > "$CU/decision.last"
 run "$HIVE" ct decision new --name "With a mark gone bad?"
 eq "a decision.last that is no number counts as none" "0 D-3 With a mark gone bad?" "$RC $(task_field "$(decid)" .name)"
 rm -f "$FAKE_CU/tasks/$(decid).json"
+mkdir "$CU/decision.last.tmp"; w=$(writes)
+run "$HIVE" ct decision new --name "With the mark unwritable?"
+eq "a decision.last it cannot write creates nothing" "1 $w" "$RC $(writes)"
+mkdec tpr1 waiting front-default "Probe unnumbered?" 1700000009000
+run "$HIVE" ct decision number --yes
+eq "a decision.last it cannot write renames nothing" "1 Probe unnumbered?" "$RC $(task_field tpr1 .name)"
+rmdir "$CU/decision.last.tmp"; rm -f "$FAKE_CU/tasks/tpr1.json"
 printf -- '- 1 GET /list/*/task\n- 1 POST /list/*/task\n500 1 GET /list/*/task\n400 1 POST /list/*/task\n' > "$FAKE_CU/fail"
 echo 1 > "$FAKE_CU/lost"
 run "$HIVE" ct decision new --name "Landed unseen?"
