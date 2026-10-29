@@ -117,7 +117,8 @@ space = 7654321
 list = 9012345678
 token_cmd = cat $T/token
 status_early = backlog | ready
-status_active = ready | in progress | in review | testing
+status_active = ready | in progress | in review
+status_info = testing
 status_closed = done | cancelled
 status_start = in progress
 status_done = done
@@ -358,6 +359,49 @@ run env HIVE_DRONE=twin HIVE_FRONT=web "$HIVE" ct check --module docs
 eq "the caller itself does not" 0 "$RC"
 rm -f "$FAKE_PANES/pc4.status"
 echo working > "$FAKE_PANES/pw1.status"
+
+# =============================================================================
+section "info statuses: listed, not collisions"
+mktask tinf001 testing "front-web,area-search,mod-cache" "Search: merged, in testing"
+run "$HIVE" ct check --module cache
+eq "a task in an info status alone exits 0" 0 "$RC"
+has "listed for information" "check: for information, no drone at work on them:" "$OUT"
+has "with its status" "tinf001  [testing]  front web  shared modules: cache" "$OUT"
+has "and no collisions" "check: no collisions in cache" "$OUT"
+claim c-inf pc5 web tinf001 cache
+run "$HIVE" ct check --module cache
+eq "a living drone on it collides" 1 "$RC"
+has "named" "tinf001  [testing]  front web  shared modules: cache  Search: merged, in testing  — drone c-inf (front web)" "$OUT"
+hasnt "and it is not listed for information as well" "for information" "$OUT"
+mkdrone di1 pdi1 working
+mktask tinf002 backlog "front-default,area-other,mod-cache" "Cache: new work"
+brief "$T/bi1" "# New cache work" "ClickUp: tinf002" "Modules: cache" "Impact: none"
+run "$HIVE" task di1 "$T/bi1"
+eq "the gate refuses while the drone lives" 1 "$RC"
+has "naming the drone" "drone c-inf (front web)" "$ERR"
+rm -f "$FAKE_PANES/pc5.status"
+run "$HIVE" task di1 "$T/bi1"
+eq "without a living drone the gate lets the brief through" 0 "$RC"
+has "listing the task for information" "for information, no drone at work on them (no 'Collision checked' needed):" "$ERR"
+has "by its line" "tinf001  [testing]  front web  shared modules: cache" "$ERR"
+restatus() {  # restatus <id> <status> — moves a task, as changed now
+  jq --argjson st "$(jq -c --arg s "$2" '.[] | select(.status == $s)' "$FAKE_CU/statuses.json")" \
+    '.status = $st | .date_updated = "\(now * 1000 | floor)"' "$FAKE_CU/tasks/$1.json" > "$T/m" && mv "$T/m" "$FAKE_CU/tasks/$1.json"
+}
+restatus tinf002 done; rm -f "$FAKE_PANES/pdi1.status"   # di1 is done with its own cache task
+mkdrone di2 pdi2 working
+mktask tinf003 backlog "front-default,area-other,mod-cache" "Cache: more work"
+brief "$T/bi2" "# More cache work" "ClickUp: tinf003" "Modules: cache" "Impact: none" "Collision checked: tinf001 — other keys"
+run "$HIVE" task di2 "$T/bi2"
+eq "a 'Collision checked' line for it does not get in the way" 0 "$RC"
+eq "and leaves no note on it" 0 "$(comments_of tinf001 | grep -c 'hive-collision:')"
+restatus tinf003 done; rm -f "$FAKE_PANES/pdi2.status"
+restatus tinf001 "in review"
+run "$HIVE" ct check --module cache
+eq "in review it collides as before" 1 "$RC"
+has "listed as a collision" "tinf001  [in review]  front web" "$OUT"
+hasnt "not for information" "for information" "$OUT"
+restatus tinf001 done
 
 # =============================================================================
 section "hive task: the gate"
