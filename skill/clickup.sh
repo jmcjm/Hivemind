@@ -612,7 +612,8 @@ cu_drone_refs() {
 # subtasks, and not an epic (a task with subtasks); plus the tasks living drones hold in a shared
 # module, whatever their status, unless the cache has the task closed. One line each: id, status,
 # front, shared modules, name, drones. With 'info': instead the tasks in an info status (status_info)
-# that would collide the same way, but that no living drone holds — listed, never collisions.
+# that would collide the same way, but that no living drone holds — listed, never collisions. An
+# info task a living drone holds collides, whatever modules the drone's brief names.
 cu_collisions() {
   local reg=$CU_REGISTRY; [ -f "$reg" ] || reg=/dev/null
   awk -F'\t' -v self="$1" -v want="$2" -v active="|$(cu_statuses active | paste -sd'|')|" -v claims="$CU_CLAIMS" \
@@ -639,7 +640,8 @@ cu_collisions() {
         else if (index(info, "|" status[id] "|")) seen[id] = s }
       for (j = 1; j <= nc; j++) { id = ctask[j]
         if (id == "" || related(id) || ((id in status) && index(closed, "|" status[id] "|"))) continue
-        s = shared(cmods[j]); if (s == "") continue
+        s = shared(cmods[j]); if (s == "" && (id in seen)) s = seen[id]
+        if (s == "") continue
         hit[id] = (id in hit) ? union(hit[id], s) : s
         drones[id] = drones[id] (drones[id] == "" ? "" : ",") cdrone[j] " (front " cfront[j] ")" }
       if (mode == "info") { for (id in seen) if (!(id in hit)) printf "%s\t%s\t%s\t%s\t%s\t\n", id, status[id], front[id], seen[id], name[id]; exit }

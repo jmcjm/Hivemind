@@ -373,6 +373,19 @@ run "$HIVE" ct check --module cache
 eq "a living drone on it collides" 1 "$RC"
 has "named" "tinf001  [testing]  front web  shared modules: cache  Search: merged, in testing  — drone c-inf (front web)" "$OUT"
 hasnt "and it is not listed for information as well" "for information" "$OUT"
+rm -f "$FAKE_PANES/pc5.status"
+claim c-oth pc6 default tinf001 cache
+run "$HIVE" ct check --module cache
+eq "a living drone of another front collides too" 1 "$RC"
+has "named with its front" "— drone c-oth (front default)" "$OUT"
+rm -f "$FAKE_PANES/pc6.status"
+claim c-mis pc7 web tinf001 search
+run "$HIVE" ct check --module cache
+eq "so does a living drone whose brief names other modules" 1 "$RC"
+has "named, the task's modules shared" "tinf001  [testing]  front web  shared modules: cache  Search: merged, in testing  — drone c-mis (front web)" "$OUT"
+hasnt "and not listed for information" "for information" "$OUT"
+rm -f "$FAKE_PANES/pc7.status"
+echo working > "$FAKE_PANES/pc5.status"
 mkdrone di1 pdi1 working
 mktask tinf002 backlog "front-default,area-other,mod-cache" "Cache: new work"
 brief "$T/bi1" "# New cache work" "ClickUp: tinf002" "Modules: cache" "Impact: none"
