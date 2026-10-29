@@ -250,6 +250,17 @@ run "$HIVE" ct show tshow01
 has "collision notes do not push the history out" "the decision that matters" "$OUT"
 hasnt "they are not listed" "drone c0 (front default)" "$OUT"
 has "they are counted, with the latest" "(12 collision notes not shown, the latest 2023-11-14 22:23)" "$OUT"
+notes='[range(30) | {id: "n\(.)", comment_text: "🤖 collision checked: drone c\(.) (front default) on tx works in modules api of tshow01 as well: no clash\nhive-collision:c\(.):tx",
+        date: "1700000600000", user: {username: "tester"}}]'
+jq -n "$notes + [range(9) | {id: \"h\(.)\", comment_text: \"history \(.)\", date: \"1700000300000\", user: {username: \"tester\"}}]" > "$FAKE_CU/comments/tshow01.json"
+run "$HIVE" ct show tshow01
+has "past a page of notes the history is on an older page" "history 7" "$OUT"
+hasnt "eight comments of it" "history 8" "$OUT"
+has "the notes of every page are counted" "(30 collision notes not shown, the latest 2023-11-14 22:23)" "$OUT"
+jq -n "$notes + [range(40) | {id: \"h\(.)\", comment_text: \"history \(.)\", date: \"1700000300000\", user: {username: \"tester\"}}]" > "$FAKE_CU/comments/tshow01.json"
+run "$HIVE" ct show tshow01
+has "pages stop once eight comments are in" "history 7" "$OUT"
+has "and the count says how far it looked" "(30 collision notes not shown among the 50 latest comments, the latest 2023-11-14 22:23)" "$OUT"
 run "$HIVE" ct show tnone01
 eq "an unknown task fails" 1 "$RC"
 rm -f "$FAKE_CU/tasks/tshow01.json"
@@ -399,6 +410,12 @@ n=$(ncomments tsrch01); brief "$T/b1x" "# Fix refunds again" "ClickUp: tref001" 
   "Collision checked: tinv001 — other files" "Collision checked: tsrch01 — ranking code, reworded"
 run "$HIVE" task d1 "$T/b1x"
 eq "the same drone briefed again adds no note to the other task" "0 $n" "$RC $(ncomments tsrch01)"
+jq --arg d "$(( $(date +%s) * 1000 + 1000 ))" '[range(30) | {id: "fill\(.)", comment_text: "filler \(.)", date: $d, user: {username: "tester"}}] + .' \
+  "$FAKE_CU/comments/tsrch01.json" > "$T/c" && mv "$T/c" "$FAKE_CU/comments/tsrch01.json"
+n=$(ncomments tsrch01); : > "$FAKE_CU/curl.argv"
+run "$HIVE" task d1 "$T/b1x"
+eq "30 newer comments later the note is still found, not doubled" "0 $n" "$RC $(ncomments tsrch01)"
+has "on an older page of comments" "/task/tsrch01/comment?start=" "$(cat "$FAKE_CU/curl.argv")"
 eq "meta.json holds the task, modules and impact" "tref001 api -" "$(meta_of d1 clickup_task) $(meta_of d1 modules) $(meta_of d1 impact || true)-"
 B=$(cat "$HIVE_DIR/drones/d1/brief.md")
 has "the protocol asks for the ClickUp section" "task: tref001" "$B"
@@ -560,20 +577,26 @@ for i in 1 2 3 4 5 6; do
   lines+=("Collision checked: tmany0$i — other pages")
 done
 "$HIVE" ct sync >/dev/null 2>&1
-mkdrone q4 pq4 working
-brief "$T/bq4" "# Many collisions" "ClickUp: tana001" "Modules: docs" "Impact: none" "${lines[@]}"
-echo 1 > "$FAKE_CU/slow"
-s=$SECONDS; run timeout 200 "$HIVE" task q4 "$T/bq4"; took=$((SECONDS - s))
-rm -f "$FAKE_CU/slow"
-eq "the brief passes" 0 "$RC"
-eq "within the budget" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
-has "one line says why the rest waits" "budget ran out — clickup-sync retries the start writes of tana001" "$ERR"
-hasnt "not a line per comment it had no time for" "could not comment" "$ERR"
-sync_now
-eq "clickup-sync makes the rest: a note on every task collided with" "1 1 1 1 1 1 1" \
-  "$(for t in trev001 tmany01 tmany02 tmany03 tmany04 tmany05 tmany06; do comments_of "$t" | grep -c 'hive-collision:q4:tana001'; done | paste -sd' ')"
-eq "and one start comment" 1 "$(comments_of tana001 | grep -c 'hive-start:q4:')"
-rm -f "$FAKE_PANES/pq4.status" "$FAKE_CU"/tasks/tmany0?.json
+# Each request a second: the budget runs out by the start comment. 0.6 s: it runs out among the notes.
+for slow in 1 0.6; do
+  q=q4${slow/./}
+  mkdrone "$q" "p$q" working
+  brief "$T/b$q" "# Many collisions" "ClickUp: tana001" "Modules: docs" "Impact: none" "${lines[@]}"
+  echo "$slow" > "$FAKE_CU/slow"
+  s=$SECONDS; run timeout 200 "$HIVE" task "$q" "$T/b$q"; took=$((SECONDS - s))
+  rm -f "$FAKE_CU/slow"
+  eq "the brief passes (${slow}s a request)" 0 "$RC"
+  eq "within the budget" yes "$([ "$took" -le 15 ] && echo yes || echo "no (${took}s)")"
+  has "one line says why the rest waits" "budget ran out — clickup-sync retries the start writes of tana001" "$ERR"
+  hasnt "not a line per comment it had no time for" "could not comment" "$ERR"
+  hasnt "nor a call it had no time for" "ClickUp unavailable" "$ERR"
+  sync_now
+  eq "clickup-sync makes the rest: a note on every task collided with" "1 1 1 1 1 1 1" \
+    "$(for t in trev001 tmany01 tmany02 tmany03 tmany04 tmany05 tmany06; do comments_of "$t" | grep -c "hive-collision:$q:tana001"; done | paste -sd' ')"
+  eq "and one start comment" 1 "$(comments_of tana001 | grep -c "hive-start:$q:")"
+  rm -f "$FAKE_PANES/p$q.status"
+done
+rm -f "$FAKE_CU"/tasks/tmany0?.json
 "$HIVE" ct sync >/dev/null 2>&1
 section "hive task: a token_cmd that hangs"
 cp "$CU/config" "$T/config.ok"

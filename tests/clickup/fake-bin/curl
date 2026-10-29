@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Stand-in for curl in tests/clickup: a small ClickUp API v2 over files in $FAKE_CU.
 #   tasks/<id>.json      a task (id, name, status{status,type}, tags[{name}], parent, list{id}, date_updated, ...)
-#   comments/<id>.json   its comments, newest first
+#   comments/<id>.json   its comments, newest first; a GET gives 25 of them, older ones after the
+#                        comment named by start_id (start and start_id of a page's last comment)
 #   space-tags.json      the space's tags;  statuses.json  the list's statuses
 # Like the live API: an unknown task id is 401 OAUTH_027, a bad token 401 OAUTH_025, a comment over
 # 40000 characters 413 COMM_160.
@@ -84,7 +85,9 @@ touch_task() { jq --arg n "$now" '.date_updated = $n' "$T/$1.json" > "$T/$1.tmp"
 case "$method $path" in
   "GET /task/"*/comment)
     id=${path#/task/}; id=${id%/comment}; [ -f "$T/$id.json" ] || missing
-    reply 200 "$(jq -c '{comments: .[:25]}' "$C/$id.json" 2>/dev/null || echo '{"comments":[]}')" ;;
+    sid=$(printf '%s' "$query" | tr '&' '\n' | sed -n 's/^start_id=//p')
+    reply 200 "$(jq -c --arg s "$sid" '{comments: (if $s == "" then . else .[(map(.id) | index($s) // length) + 1:] end)[:25]}' \
+      "$C/$id.json" 2>/dev/null || echo '{"comments":[]}')" ;;
   "POST /task/"*/comment)
     id=${path#/task/}; id=${id%/comment}; [ -f "$T/$id.json" ] || missing
     [ "$(jq '.comment_text | length' <<<"$data")" -le 40000 ] \
