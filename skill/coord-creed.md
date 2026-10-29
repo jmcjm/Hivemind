@@ -28,11 +28,12 @@ The thirteen rules that must survive a compacted context. This file is the singl
    the moment its expiry notice arrives. Nothing is typed into your prompt any more — without the
    watcher you hear no drone. A turn a drone ended without a report wakes nobody (it is still in
    `hive inbox`); the sweep reports a drone that stays stuck, once per state.
-10. **Decision points are numbered incrementally across the whole conversation, never restarted.** When
-    you put questions to the user, continue the numbering from the last list (a list ended at 8 → the
-    next question is 9). Users answer "1 ok, 3 no" by number; reusing 1..N for a new list makes an
-    answer to the old list look like an answer to the new one. Restate the number of every still-open
-    point when you repeat it.
+10. **A point that goes to the user is a decision, and its number is hive's (`D-<n>`).** Never number
+    points by hand and never split one into a/b: two questions are two decisions. With a decision list
+    (rule 13), `hive ct decision new` gives each one the next `D-<n>` — one counter for every front, never
+    reused, not even after the answer — and the user answers "D-7 ok, D-9 no". Restate the number of every
+    still-open point when you repeat it. Without a decision list, number the points incrementally across
+    the whole conversation, never restarted (a list ended at 8 → the next question is 9).
 11. **Save your state before the compaction comes.** The coordinator session runs with auto-compaction
     (`hive coord-start`, window 400k). When the Stop hook says the context is near it, write the
     coordinator state where you keep it (delete what is stale, add what is new) before ending the turn —
@@ -51,8 +52,9 @@ The thirteen rules that must survive a compacted context. This file is the singl
     not a new task, and tasks left lying are swept by hand with `hive ct stale`.
 13. **A decision you wait on from the user goes on the decision list.** (With `decision_list` in the
     ClickUp config.) The moment you put a question to the user, file it: `hive ct decision new --name
-    "<the question>" --task <id> --desc <file>` (context, numbered options with your recommendation,
-    what happens without a decision, the report). Once they answer, in ClickUp or in the conversation:
-    `hive ct decision answer <id> --comment "<the answer>"`. At session start and after a compaction,
+    "<the question>" --task <id> --desc <file>` (the question alone: hive puts its `D-<n>` in front and refuses
+    one you numbered; the file holds context, numbered options with your recommendation, what happens
+    without a decision, the report). Once they answer, in ClickUp or in the conversation:
+    `hive ct decision answer D-<n> --comment "<the answer>"`. At session start and after a compaction,
     read your front's open ones (`hive ct decision list --open`) before anything else: they are the
     questions you still owe the user an answer to, not the summary.

@@ -310,6 +310,14 @@ the status. Setup: copy `skill/clickup.conf.example` and `skill/taxonomy.tsv.exa
 `~/.herdr-hive/clickup/config` and `taxonomy.tsv`, fill them in, run `hive ct sync`. Details:
 "Task tracking in ClickUp" in `SKILL.md`. Tests: `tests/clickup/test-clickup.sh` (a fake ClickUp API).
 
+With `decision_list` in the config, the questions a coordinator waits on from the owner are tasks on a
+list of their own (`hive ct decision`). hive numbers each one `D-<n>`: one counter for every front, never
+reused, not even after the answer, so the owner answers "D-7 ok". A question numbered by hand is
+refused, and decisions from before the numbering get theirs with `hive ct decision number --yes`. The
+next number is the highest on the list or the highest kept in `~/.herdr-hive/clickup/decision.last`,
+so a deleted or archived decision does not give its number back. The counter and that file are per
+machine; coordinators on two machines are not covered.
+
 ## Watching outside sources
 
 A coordinator that polls something outside the swarm from a session cron — a chat, a ticket

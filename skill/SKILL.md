@@ -622,9 +622,10 @@ never becomes a tag. On the command line and in a brief a tag may be named witho
 | `hive ct todo <id> "<item>" [--checklist NAME]` | an item on the task's checklist (`checklist` in the config by default), the checklist created when the task has none; an item already there is not added twice |
 | `hive ct sync` | refreshes the cache, creates the taxonomy's missing tags |
 | `hive ct ack <drone> --manual "<reason>"` | a report the sync could not apply, settled by hand; the reason goes to `clickup/sync.log` |
-| `hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]` | a decision the coordinator waits on from the owner, on the decision list (below): waiting, with the caller's front (or `--front`), linked to the task it is about, whose history gets a line that it waits. The same question waiting in the front is refused |
-| `hive ct decision answer <id> --comment TEXT\|@FILE` | the owner's answer as a comment, the decision answered, the answer noted on the linked task; a second run changes nothing |
-| `hive ct decision list [--front F\|--all] [--open]` | the caller's front's decisions (or that front's, or every front's), oldest first: status, age, task, question |
+| `hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]` | a decision the coordinator waits on from the owner, on the decision list (below): named `D-<n> <question>` with the next number hive gives, waiting, with the caller's front (or `--front`), linked to the task it is about, whose history gets a line that it waits. A question numbered by hand (`[…]` or `D-<n>` in front) is refused, and so is the same question waiting in the front, whatever its number |
+| `hive ct decision answer <D-n\|id> --comment TEXT\|@FILE` | the owner's answer as a comment, the decision answered, the answer noted on the linked task; a number on no decision or on two is refused before anything is written; a second run changes nothing |
+| `hive ct decision list [--front F\|--all] [--open]` | the caller's front's decisions (or that front's, or every front's), oldest first: number, status, age, task, question |
+| `hive ct decision number [--yes]` | numbers the decisions that have no number yet, oldest first, after the highest number given (below), and drops a hand-made `[…] ` from the front of the name; a dry run unless `--yes`, a decision renamed since it was read is skipped, a rename ClickUp refuses is counted as failed and the run exits non-zero, a second run changes nothing |
 
 **The brief's header** — `hive task` refuses a brief without it:
 ```
@@ -732,6 +733,19 @@ one sentence, one front tag, a link to the task it is about, and a description i
 
 The answer is a comment written by `answer` (dated, with the front), whatever way the owner gave it.
 Decisions stay out of the cache: they never show up in `ct find`, duplicates, collisions or `ct stale`.
+
+**Decision numbers.** hive numbers every decision, never a person: `new` names it `D-<n> <question>`,
+where `n` is the highest number given so far plus one: the highest on the list (every front, open and
+closed) or the one kept in `~/.herdr-hive/clickup/decision.last`, whichever is higher. So a number is
+never given twice, not even after the answer, and not after the decision with the highest number is
+deleted or archived (archived tasks are not on the list): the file remembers it on this machine. Without
+the file the highest number on the list counts. A question with a number of its own in front (`[…]` or
+`D-<n>`) is refused; two questions are two decisions, never `5a` and `5b`. The owner answers by number
+("D-7 ok"), and `answer`, `list` and the duplicate check go by it or by the question without it.
+`new` reads the highest number, creates the decision and writes `decision.last` under a lock in
+`~/.herdr-hive/clickup/`, so two fronts on one machine never draw the same number; coordinators on two
+machines are not covered, neither by the lock nor by the file.
+Decisions made before the numbering get theirs with `hive ct decision number` (a dry run, then `--yes`).
 
 **Tasks left lying** (`hive ct stale`). A task moved when it was updated, commented on, or reported on
 by a drone whose `meta.json` or brief names it. Rule 1: a task in `stale_testing` (default
