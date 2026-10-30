@@ -385,6 +385,12 @@ eq "so does a living drone whose brief names other modules" 1 "$RC"
 has "named, the task's modules shared" "tinf001  [testing]  front web  shared modules: cache  Search: merged, in testing  — drone c-mis (front web)" "$OUT"
 hasnt "and not listed for information" "for information" "$OUT"
 rm -f "$FAKE_PANES/pc7.status"
+mktask tinf004 backlog "front-default,area-other,mod-cache" "Cache: not started"
+claim c-bak pc8 default tinf004 search
+run "$HIVE" ct check --module cache
+eq "a living drone on a task in no info status, brief naming other modules, does not collide" 0 "$RC"
+hasnt "and the task is not listed at all" "tinf004" "$OUT"
+rm -f "$FAKE_PANES/pc8.status"
 echo working > "$FAKE_PANES/pc5.status"
 mkdrone di1 pdi1 working
 mktask tinf002 backlog "front-default,area-other,mod-cache" "Cache: new work"
