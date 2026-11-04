@@ -225,7 +225,7 @@ if [ -n "$(cu_decision_list)" ] && [ -n "$info_st" ]; then
       if letter "DECISION ${num:-$id} needs more info: $question" "${num:+$num }https://app.clickup.com/t/$id
 Question: $question
 The owner set it to '$info_st': describe it better (what is asked, the options, what each one costs), then:
-hive ct decision info ${num:-$id} --comment \"what you add\" (--desc FILE to rewrite the description)
+hive ct decision info ${num:-$id} --add @FILE (appended to the description as a section; --desc FILE rewrites it whole)
 The owner may answer it right away all the same: hive ct decision answer ${num:-$id} --comment \"the answer\""; then
         echo "$id" >> "$CU_DECISION_INFO.new"; log "decision $front ${num:-$id} needs more info: coordinator told"
       else

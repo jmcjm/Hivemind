@@ -1372,36 +1372,47 @@ ct_decision_answer() {  # decision answer <D-n|id> --comment TEXT|@FILE
   done < <(jq -r --arg me "$id" '.linked_tasks[]? | [.task_id, .link_id] | map(select(. != $me))[]' <<<"$json" | awk '!seen[$0]++')
 }
 
-# decision info <D-n|id> --comment TEXT|@FILE [--desc FILE] — the coordinator's addition to a decision
-# the owner set to info (wants it described better): a comment marked as the coordinator's, with --desc
-# the description replaced, and the decision back to waiting. Only on a decision in info; a decision
-# already back to waiting with that very addition is left as it is, so a second run changes nothing.
+# decision info <D-n|id> [--add TEXT|@FILE] [--desc FILE] — the coordinator's addition to a decision
+# the owner set to info (wants it described better). The owner reads a decision in its description:
+# a ClickUp comment is narrow and shows no markdown, so the addition never goes to a comment. --add
+# appends it to the end of the description as a section of its own, '## Coordinator's addition
+# (<date>)'; --desc replaces the whole description first (both: the file, then the section). --comment
+# is the old name of --add. The decision gets one line of a comment, so its history shows when the
+# description changed — 'description updated: <the section's heading>' and a marker hive-info:<digest
+# of what was given> — and goes back to waiting. The description is read as markdown
+# (include_markdown_description) and written back as markdown_content: a decision whose description
+# ClickUp gives only as plain text is refused rather than written back without its formatting.
+# Only on a decision in info. An addition the description has already, under a heading of hive's, is
+# not appended twice; a decision back to waiting with the marker of the same input is left as it is,
+# so a second run changes nothing.
+CU_INFO_HEADING="Coordinator's addition"
 ct_decision_info() {
-  local id="" comment="" desc="" st waiting info json role text
+  local id="" add="" desc="" st waiting info json role md new heading mark text
   while [ $# -gt 0 ]; do
     case "$1" in
-      --comment) comment=${2:?--comment needs a text}; shift 2 ;;
+      --add|--comment) add=${2:?$1 needs a text}; shift 2 ;;
       --desc) desc=${2:?--desc needs a file}; shift 2 ;;
       *) [ -z "$id" ] || cu_die "ct decision info: unexpected argument '$1'"; id=$1; shift ;;
     esac
   done
-  if [ "${comment:0:1}" = @ ]; then comment=$(cat -- "${comment:1}") || cu_die "cannot read ${comment:1}"; fi
-  comment=$(cu_trim "$comment")
-  [ -n "$id" ] && [ -n "$comment" ] || cu_die 'usage: hive ct decision info <D-n|id> --comment "<what is added>"|@FILE [--desc FILE]'
+  if [ "${add:0:1}" = @ ]; then add=$(cat -- "${add:1}") || cu_die "cannot read ${add:1}"; fi
+  add=$(cu_trim "$add")
+  [ -n "$id" ] && { [ -n "$add" ] || [ -n "$desc" ]; } \
+    || cu_die 'usage: hive ct decision info <D-n|id> --add "<what is added>"|@FILE [--desc FILE]'
   [ -z "$desc" ] || [ -r "$desc" ] || cu_die "cannot read $desc"
   cu_need_decisions
   st=$(cu_decision_statuses) || exit 1; waiting=$(sed -n 1p <<<"$st"); info=$(sed -n 2p <<<"$st")
   [ -n "$info" ] || cu_die "the decision list has no info status — set 'decision_status_info' in $CU_CONF"
   id=$(cu_decision_id "$id") || exit 1
-  json=$(cu_task "$id") || exit 1
+  json=$(cu_api GET "/task/$id?include_markdown_description=true") || exit 1
   [ "$(jq -r '.list.id // ""' <<<"$json")" = "$(cu_decision_list)" ] || cu_die "$id is not on the decision list"
-  text="🤖 coordinator's addition: $comment"
-  [ -z "$desc" ] || text+=$'\n'"(the description is rewritten)"
+  # The marker: a digest of what was given, the same whatever day the run is.
+  mark="hive-info:$({ [ -z "$desc" ] || cat -- "$desc"; printf '\0%s' "$add"; } | sha256sum | cut -c1-12)"
   role=$(cu_decision_role "$(cu_status_of "$json")" "$st")
   case "$role" in
     info) ;;
     waiting)
-      cu_has_comment "$id" "$text"; case $? in
+      cu_has_comment "$id" "$mark" --contains; case $? in
         0) echo "decision: $id waits already with this addition — nothing to do"; return 0 ;;
         2) cu_die "cannot read the comments of $id" ;;
       esac
@@ -1410,9 +1421,32 @@ ct_decision_info() {
     *) cu_die "$id is in '$role', not in '$info' — hive ct show $id" ;;
   esac
   if [ -n "$desc" ]; then
-    cu_api PUT "/task/$id" "$(jq -nc --rawfile d "$desc" '{markdown_content: $d}')" >/dev/null || cu_die "the description of $id not replaced"
+    md=$(cat -- "$desc") || cu_die "cannot read $desc"
+  elif jq -e 'has("markdown_description") and .markdown_description != null' <<<"$json" >/dev/null; then
+    md=$(jq -r .markdown_description <<<"$json")
+  elif [ -z "$(jq -r '(.text_content // "") + (.description // "") | gsub("\\s"; "")' <<<"$json")" ]; then
+    md=""
+  else
+    cu_die "ClickUp gave the description of $id without its markdown — not rewriting it; add to it by hand"
   fi
-  cu_comment_once "$id" "$text" || cu_die "the addition not added to $id"
+  heading="$CU_INFO_HEADING ($(date +%F))"
+  new=$md
+  # Present already: a section of hive's heading (any date) that holds just this text, up to the end
+  # of the description or the next heading of the same or a higher level.
+  if [ -n "$add" ] && ! jq -Rse --arg h "$CU_INFO_HEADING" --arg t "$add" '
+      . as $d | [match("(^|\n)## \($h) \\([0-9-]+\\)[ \t]*\n"; "g") | $d[(.offset + .length):] | sub("^\\s+"; "")]
+      | any(.[]; startswith($t) and (.[($t | length):] | test("^\\s*(\\z|\n#{1,2} )")))' <<<"$md" >/dev/null; then
+    new=$(cu_trim "$md")
+    new+="${new:+$'\n\n'}## $heading"$'\n\n'"$add"
+  fi
+  if [ -n "$desc" ] || [ "$new" != "$md" ]; then
+    cu_api PUT "/task/$id" "$(jq -nc --arg d "$new" '{markdown_content: $d}')" >/dev/null || cu_die "the description of $id not updated"
+    echo "decision: $id description updated"
+  else
+    echo "decision: $id has this addition in its description already"
+  fi
+  if [ -n "$add" ]; then text="🤖 description updated: $heading"; else text="🤖 description updated: rewritten"; fi
+  cu_comment_once "$id" "$text · $mark" "$mark" || cu_die "the note on $id not added"
   cu_set_status "$json" "$waiting" || cu_die "status of $id not set back to '$waiting'"
   echo "decision: $id $waiting"
 }
@@ -1536,8 +1570,10 @@ Every task has one front, one area and at least one module.
                                       numbered D-<n> by hive
   hive ct decision answer <D-n|id> --comment TEXT|@FILE   the answer, noted on the linked task too
                                       (from waiting or info)
-  hive ct decision info <D-n|id> --comment TEXT|@FILE [--desc FILE]   what the owner asked to add to a
-                                      decision in info; --desc replaces its description; back to waiting
+  hive ct decision info <D-n|id> [--add TEXT|@FILE] [--desc FILE]   what the owner asked to add to a
+                                      decision in info, appended to its description as a section
+                                      (--comment: the old name of --add); --desc replaces the
+                                      description; one line of a comment; back to waiting
   hive ct decision list [--front F|--all] [--open|--info]   the caller's front's decisions, oldest first;
                                       --open waiting and info, --info only those the owner wants more on
   hive ct decision number [--yes]     numbers the decisions without a number; a dry run unless --yes
