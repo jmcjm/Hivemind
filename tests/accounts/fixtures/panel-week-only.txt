@@ -1,0 +1,35 @@
+
+  ⎿  SessionStart:startup says: example hook output
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◉ xhigh · /effort ▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0000
+   Total duration (API):  0s
+   Total duration (wall): 4s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+
+   Plugin skill-listing footprint
+   What each plugin's skill descriptions add to the system prompt (cached input after the first turn). Agents and MCP tools not yet counted.
+
+   example-plugin-a            5 skills · ~140 tok/turn
+   example-plugin-b            2 skills · ~53 tok/turn
+   example-plugin-c            1 skill · ~30 tok/turn
+
+   Total                       ~223 tok/turn
+
+   Current week (all models)
+   ██████████████████████████████                     60% used
+   Resets Nov 5, 1pm (Europe/Warsaw)
+
+   What's contributing to your usage?
+   Approximate · sessions on this machine only
+
+   Scanning local sessions…
+
+   Per-model breakdown unavailable (rate limited until 4:48pm)
+
+   r to retry · Esc to cancel

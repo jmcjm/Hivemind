@@ -371,7 +371,7 @@ instructions, hooks, skills and plugins and sees the same session transcripts:
 mkdir -m 700 ~/.claude-alt
 for f in CLAUDE.md settings.json skills plugins projects; do ln -s ~/.claude/$f ~/.claude-alt/$f; done
 CLAUDE_CONFIG_DIR=~/.claude-alt claude      # once, interactively: onboarding + /login
-hive usage --account alt                    # the account answers: its session and weekly limits
+hive usage --account alt                    # the account answers: its weekly limit
 ```
 
 **2. Use it by hand** — no config needed: `hive spawn <name> --account alt`, or `HIVE_ACCOUNT=alt`
@@ -393,7 +393,7 @@ account default  prio=2  week_threshold=60  hard    # ~/.claude: never past 60%
 ```
 
 From then on `hive spawn <name>` without `--account` lands on the lowest `prio` that is under its
-threshold and says why (`spawn: account alt — prio 1, session 24%, week 60%, under its threshold
+threshold and says why (`spawn: account alt — prio 1, week 60%, under its threshold
 (week 80%)`), and `hive revive` moves a drone off an account that ran out of room — only to one that
 shares `projects/`, so the history comes along. When no account has room, spawn starts nothing and
 names the account that gets room first. Precedence: `--account` > `HIVE_ACCOUNT` > the pick.

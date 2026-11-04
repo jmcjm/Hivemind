@@ -365,28 +365,35 @@ account spare    prio=3  disabled                      # disabled: never taken, 
 ```
 
 **The threshold is on the weekly limit.** `week_threshold=80` reads "use this account up to 80% of
-its week" (default 90; 100 = until it is full). The session limit is a 5-hour window that comes back
-by itself, so it blocks an account only at 100%; `session_threshold=<percent>` makes it count earlier.
+its week" (default 90; 100 = until it is full); a week at 100% is `UNAVAILABLE`. Claude Code no longer
+has a 5-hour session limit: its `/usage` panel shows the week alone, and that is the only limit hive
+weighs. A panel from an older Claude Code that still prints `Current session` is read as before: the
+session blocks only at 100%, and `session_threshold=<percent>` makes it count earlier. Without a
+session section `session_threshold` has nothing to act on and does nothing.
 
 ```
 $ hive accounts
 usage from 4 min ago
-ACCOUNT  ENGINE  PRIO  THRESHOLD      EMAIL            SESSION  SESSION RESET            WEEK  WEEK RESET    STATUS
-alt      claude  1     week 80%       alt@example.com  57%      Oct 08 20:00 (in 3h42m)  98%   Oct 14 14:00  over threshold: week
-default  claude  2     week 60% hard  me@example.com   2%       Oct 08 21:10 (in 4h52m)  11%   Oct 15 09:00  available <- SELECTED
-spare    claude  3     week 90%       s@example.com    -        -                        -     -             disabled
+ACCOUNT  ENGINE  PRIO  THRESHOLD      EMAIL            WEEK  WEEK RESET    STATUS
+alt      claude  1     week 80%       alt@example.com  98%   Oct 14 14:00  over threshold: week
+default  claude  2     week 60% hard  me@example.com   11%   Oct 15 09:00  available <- SELECTED
+spare    claude  3     week 90%       s@example.com    -     -             disabled
 ```
+
+The `SESSION` and `SESSION RESET` columns appear only while some account's last measurement still has a
+session limit; an account without one shows `-` there.
 
 EMAIL is the login each account's own `.claude.json` records — it tells two config dirs apart.
 ENGINE is the agent an account runs; hive drives only Claude Code, so every row says `claude`.
 
 - **The pick**: the lowest `prio` among the accounts under their threshold. When none is, the first
   over-threshold account not marked `hard` — a LAST RESORT, and the output says so. Never: `disabled`,
-  `UNAVAILABLE` (session or week at 100%, or an account that is logged out) and an account over a
+  `UNAVAILABLE` (week at 100% — or a session at 100% on a panel that still has one — or an account
+  that is logged out) and an account over a
   `hard` threshold. When nothing is left, spawn refuses and starts nothing — the message lists every
   account with what blocks it and when it gets room again, and names the one that is first
   (`First to get room: alt, Oct 08 18:40 (in 1h02m).`); `--account NAME` still forces one. STATUS
-  names the limit that decides: `over threshold: week`, `UNAVAILABLE: session 100%`.
+  names the limit that decides: `over threshold: week`, `UNAVAILABLE: week 100%`.
 - **Precedence**: `--account` > `HIVE_ACCOUNT` > the pick. `HIVE_ACCOUNT=<name>` (including `default`)
   switches the selection off — spawn uses that account, revive brings a drone back where it ran.
   `--account` bypasses the selection whole, `disabled` and `hard` included: thresholds are enforced
@@ -423,9 +430,10 @@ Traps:
 - **A window whose reset time has passed counts as 0%** — the table shows the account as it stands
   now, not as it was measured. Inside a window usage only grows, so an old `UNAVAILABLE` stays
   `UNAVAILABLE` until its reset, while an old `available` is not trusted (re-measured, or blind).
-- **The parser reads two sections of the `/usage` panel: `Current session` and `Current week (all
-  models)`** (written against Claude Code 2.1.294). Per-model sections are ignored. A panel missing
-  either one is refused, not guessed, and saved to `~/.herdr-hive/usage-panel-<account>.txt` — that
+- **The parser reads the `Current week (all models)` section of the `/usage` panel, and
+  `Current session` when the panel still has one.** Per-model sections are ignored, including a
+  per-model breakdown that is `rate limited until …`. No session section means no session limit. A
+  panel without the weekly section, or a section without its percentage, is refused, not guessed, and saved to `~/.herdr-hive/usage-panel-<account>.txt` — that
   is what a Claude Code update that renames them looks like, and the saved panel is the fixture for
   teaching the parser. Tests with captured panels live in the repository:
   `tests/accounts/test-accounts.sh` (no real sessions).

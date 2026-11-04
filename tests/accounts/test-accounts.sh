@@ -2,9 +2,10 @@
 # tests/accounts/test-accounts.sh [path-to-hive]
 # Tests of 'hive accounts' and of the account a spawn or revive lands on.
 # Nothing real runs: tmux is the stand-in in fake-bin/, herdr the one in ../fake-herdr/, HOME and
-# HIVE_DIR are throwaway directories, and the /usage panels are fixtures — two captured from a
-# Claude Code 2.1.294 session with the machine's own lines replaced (fixtures/panel-*.txt), the rest
-# built in the same layout by panel() below.
+# HIVE_DIR are throwaway directories, and the /usage panels are fixtures — captured with the machine's
+# own lines replaced (fixtures/panel-*.txt): two from Claude Code 2.1.294, which still had a session
+# limit, and panel-week-only.txt from a later one, which shows the week alone; the rest built in the
+# same layout by panel() below.
 # Without an argument it tests skill/hive of this checkout.
 set -uo pipefail
 
@@ -66,7 +67,8 @@ world() {  # a clean HOME, HIVE_DIR and stand-in state: accounts default, alpha,
   local a; for a in alpha beta gamma delta; do account_home "$a" "$a@example.com"; done
 }
 conf() { cat > "$HIVE_DIR/accounts.conf"; }
-# cache <name>:<age s>:<session %>:<session reset in s|->:<week %>:<week reset in s|-> ...
+# cache <name>:<age s>:<session %|->:<session reset in s|->:<week %>:<week reset in s|-> ...
+# A session '-' is a measurement of a panel without a session limit (session fields null).
 cache() {
   python3 - "$HIVE_DIR/usage-cache.json" "$@" <<'PY'
 import json, sys, time
@@ -74,18 +76,21 @@ now, acc = int(time.time()), {}
 for spec in sys.argv[2:]:
     name, age, sp, sr, wp, wr = spec.split(':')
     acc[name] = {'measured_at': now - int(age),
-                 'session_pct': int(sp), 'session_reset': None if sr == '-' else now + int(sr), 'session_reset_text': None,
+                 'session_pct': None if sp == '-' else int(sp), 'session_reset': None if sr == '-' else now + int(sr), 'session_reset_text': None,
                  'week_pct': int(wp), 'week_reset': None if wr == '-' else now + int(wr), 'week_reset_text': None}
 json.dump({'accounts': acc}, open(sys.argv[1], 'w'))
 PY
 }
-# panel <session %> <session reset line|-> <week %> <week reset line|-> — a /usage panel in the real layout.
+# panel <session %|-> <session reset line|-> <week %> <week reset line|-> — a /usage panel in the real layout.
+# A session '-' leaves the "Current session" section out, as Claude Code does since it has no session limit.
 # The per-model section and the "contributing" lines carry numbers of their own on purpose: a parser
 # that reads the wrong line shows up as 77% or 93%.
 panel() {
   printf '   Settings  Status   Config   Usage   Stats\n\n   Session\n\n   Total cost:            $0.0000\n\n'
-  printf '   Current session\n   ███▌                                               %s%% used\n' "$1"
-  [ "$2" = - ] || printf '   %s\n' "$2"
+  if [ "$1" != - ]; then
+    printf '   Current session\n   ███▌                                               %s%% used\n' "$1"
+    [ "$2" = - ] || printf '   %s\n' "$2"
+  fi
   printf '\n   Current week (all models)\n   █████                                              %s%% used\n' "$3"
   [ "$4" = - ] || printf '   %s\n' "$4"
   printf '\n   Current week (Fable)\n   ██████████████                                     77%% used\n   Resets Nov 1, 1am (Europe/Berlin)\n\n'
@@ -161,7 +166,7 @@ eq "a decimal comma is a fraction too"           95 "$(jget week_pct <<<"$OUT")"
 printf ' Welcome to Claude Code\n\n ❯ 1. Claude account with subscription\n   2. Anthropic Console account\n' > "$T/p.txt"
 parse "$T/p.txt" "$(at '2026-10-08 10:00')"
 eq "a login screen is refused"                   1 "$RC"
-has "a login screen: says what is missing"       'no "Current session" section' "$ERR"
+has "a login screen: says what is missing"       'no "Current week (all models)" section' "$ERR"
 
 printf '   Current session\n   ██   12%% used\n   Resets 6pm\n\n   93%% of your usage was at >150k context\n' > "$T/p.txt"
 parse "$T/p.txt" "$(at '2026-10-08 10:00')"
@@ -910,6 +915,98 @@ run "$HIVE" spawn d9
 eq "accounts.conf is a directory: spawn is refused" 1 "$RC"
 has "accounts.conf is a directory: spawn says why" "$HIVE_DIR/accounts.conf cannot be read" "$ERR"
 eq "accounts.conf is a directory: no workspace is created" "$n" "$(spawned)"
+
+# =============================================================================
+section "week only — a /usage panel without a session limit"
+world
+# Claude Code dropped the 5-hour session limit: the panel has "Current week (all models)" and no
+# "Current session". That is no session limit, not a failed measurement.
+parse "$HERE/fixtures/panel-week-only.txt" "$(at '2026-11-04 15:40')"
+eq "week-only panel: read"                       0 "$RC"
+eq "week-only panel: week percent"               60 "$(jget week_pct <<<"$OUT")"
+eq "week-only panel: week reset Nov 5, 1pm (Europe/Warsaw)" "$(TZ=Europe/Warsaw date -d '2026-11-05 13:00' +%s)" "$(jget week_reset <<<"$OUT")"
+eq "week-only panel: no session percent"         null "$(jget session_pct <<<"$OUT")"
+eq "week-only panel: no session reset"           null "$(jget session_reset <<<"$OUT")"
+has "week-only panel: its per-model part is rate limited" "rate limited until" "$(cat "$HERE/fixtures/panel-week-only.txt")"
+parse "$HERE/fixtures/panel-settled.txt" "$(at '2026-10-08 15:49:53')"
+eq "a panel with the old session section still reads its session" 35 "$(jget session_pct <<<"$OUT")"
+eq "a panel with the old session section still reads its week"    10 "$(jget week_pct <<<"$OUT")"
+
+# "rate limited" in the per-model part, also where a model's own week would be: the week of all models decides
+printf '   Current week (all models)\n   ██████   97%% used\n   Resets Nov 5, 1pm (Europe/Berlin)\n\n   Current week (Fable)\n   Rate limited until 4:48pm\n\n   Per-model breakdown unavailable (rate limited until 4:48pm)\n   r to retry · Esc to cancel\n' > "$T/p.txt"
+parse "$T/p.txt" "$(at '2026-11-04 15:40')"
+eq "rate limited per model: the measurement is not failed" 0 "$RC"
+eq "rate limited per model: the week is read"    97 "$(jget week_pct <<<"$OUT")"
+eq "rate limited per model: the week reset is read" "$(at '2026-11-05 13:00')" "$(jget week_reset <<<"$OUT")"
+printf '   Current session\n   Rate limited until 4:48pm\n\n   Current week (all models)\n   █   34%% used\n' > "$T/p.txt"
+parse "$T/p.txt" "$(at '2026-11-04 15:40')"
+eq "a session section that is there must still carry its percentage" 1 "$RC"
+
+# The rule: the first account runs to 100% of its week; then the second, to 80% of its week, hard.
+weekly() { conf <<'EOF'
+account alpha    prio=1  week_threshold=100
+account default  prio=2  week_threshold=80  hard
+EOF
+}
+weekly; cache alpha:60:-:-:99:172800 default:60:-:-:10:86400
+run "$HIVE" accounts --pick
+eq "week only: the first account is taken up to its 100%" \
+   "alpha — prio 1, week 99%, under its threshold (week 100%)" "$(head -1 <<<"$OUT")"
+run "$HIVE" accounts
+like "week only: no session columns"             '^ACCOUNT +ENGINE +PRIO +THRESHOLD +EMAIL +WEEK +WEEK RESET +STATUS$' "$(sed -n 2p <<<"$OUT")"
+like "week only: alpha available and SELECTED"   '^alpha +claude +1 +week 100% +alpha@example.com +99% +[A-Z][a-z]{2} [0-9]{2} [0-9]{2}:[0-9]{2} +available <- SELECTED$' "$(row alpha)"
+like "week only: default with its hard 80%"      '^default +claude +2 +week 80% hard +owner@example.com +10% .* available$' "$(row default)"
+
+weekly; cache alpha:60:-:-:100:172800 default:60:-:-:79:86400
+run "$HIVE" accounts --pick
+eq "week only: the first account full, the second taken under its 80%" \
+   "default — prio 2, week 79%, under its threshold (week 80%); passed over: alpha (UNAVAILABLE: week 100%)" "$OUT"
+run "$HIVE" accounts
+like "week only: a full week is UNAVAILABLE"     '^alpha .* 100% .* UNAVAILABLE: week 100%$' "$(row alpha)"
+
+weekly; cache alpha:60:-:-:100:172830 default:60:-:-:80:86430
+run "$HIVE" accounts --pick
+eq "week only, both at their limit: nothing is taken" 1 "$RC"
+like "week only refusal: the full account and when its week resets" 'alpha: UNAVAILABLE: week 100% — room again [A-Z][a-z]{2} [0-9]{2} [0-9]{2}:[0-9]{2} \(in 2d0h\)' "$ERR"
+like "week only refusal: the second at its hard 80%" 'default: over threshold: week \(hard\) — room again [A-Z][a-z]{2} [0-9]{2} [0-9]{2}:[0-9]{2} \(in 1d0h\)' "$ERR"
+like "week only refusal: names the account that gets room first" 'First to get room: default, [A-Z][a-z]{2} [0-9]{2} [0-9]{2}:[0-9]{2} \(in 1d0h\)\.' "$ERR"
+
+# session_threshold has nothing to act on without a session limit
+conf <<'EOF'
+account alpha    prio=1  week_threshold=90  session_threshold=50
+account default  prio=2  week_threshold=90
+EOF
+cache alpha:60:-:-:20:172800 default:60:-:-:10:86400
+run "$HIVE" accounts --pick
+eq "week only: a session_threshold does not block the account" \
+   "alpha — prio 1, week 20%, under its threshold (week 90%, session 50%)" "$(head -1 <<<"$OUT")"
+
+# one account still on an older Claude Code with a session limit, one without: the columns stay, '-' where there is none
+conf <<'EOF'
+account alpha    prio=1  week_threshold=90
+account default  prio=2  week_threshold=90
+EOF
+cache alpha:60:24:7200:30:172800 default:60:-:-:10:86400
+run "$HIVE" accounts
+like "mixed: session columns kept"               '^ACCOUNT +ENGINE +PRIO +THRESHOLD +EMAIL +SESSION +SESSION RESET +WEEK +WEEK RESET +STATUS$' "$(sed -n 2p <<<"$OUT")"
+like "mixed: no session limit is '-'"            '^default +claude +2 +week 90% +owner@example.com +- +- +10% ' "$(row default)"
+like "mixed: the account with a session shows it" '^alpha .* 24% .*\(in 2h00m\) +30% ' "$(row alpha)"
+
+# measured through the stand-in tmux: a week-only panel is a good measurement, not a failure
+weekly
+panel - - 60 "$WEEK_IN_3D" > "$FAKE_PANELS/alpha.txt"
+panel - - 85 "$WEEK_IN_3D" > "$FAKE_PANELS/default.txt"
+run "$HIVE" accounts --refresh
+eq "week-only refresh: exit 0"                   0 "$RC"
+hasnt "week-only refresh: nothing failed"        "not understood" "$ERR$OUT"
+like "week-only refresh: alpha read"             "^alpha .* 60% +$WEEK_IN_3D_SHOWN +available <- SELECTED\$" "$(row alpha)"
+like "week-only refresh: default over its hard 80%" '^default .* 85% .* over threshold: week \(hard\)$' "$(row default)"
+spawned() { grep -cE '^(workspace|tab) create' "$FAKE_HERDR_LOG" || true; }
+run "$HIVE" spawn w1
+eq "week-only: spawn lands on the first account" alpha "$(meta_account w1)"
+run "$HIVE" spawn w2 --account default
+eq "week-only: a named account over its hard 80% is refused" 1 "$RC"
+has "week-only: and says why"                    "spawn: account default has no room (over threshold: week (hard))" "$ERR"
 
 # =============================================================================
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
