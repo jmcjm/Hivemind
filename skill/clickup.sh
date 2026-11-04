@@ -28,6 +28,9 @@ CU_LOG="$CU_DIR/sync.log"
 CU_SYNC_STATE="$CU_DIR/sync.state"
 CU_SYNC_FAILED="$CU_DIR/sync.failed"
 CU_SYNC_RETRY="$CU_DIR/sync.retry"
+# The decisions in decision_status_info whose coordinator clickup-sync has told, one id a line; one that
+# leaves that status drops out, so landing there again is told again.
+CU_DECISION_INFO="$CU_DIR/decision-info.state"
 # The start writes of a brief let through while ClickUp was down, one file each; clickup-sync replays them.
 CU_STARTS="$CU_DIR/starts"
 CU_COMMENT_MAX=8000                  # ClickUp takes 40000 characters; a report comment stays readable
@@ -1191,8 +1194,11 @@ ct_ack() {
 # --- decisions ----------------------------------------------------------------
 # A decision a coordinator waits on from the owner is a task on its own list (decision_list in the
 # config): its name the question, its description the context and the options, one front tag, a link
-# to the task it is about. The list's first open status means waiting, its first closed one answered;
-# the answer lands as a comment on the decision and on that task. The list stays out of the cache, so
+# to the task it is about. The list's first open status means waiting, its first closed one answered,
+# unless decision_status_waiting / decision_status_answered name others; decision_status_info names the
+# status the owner sets to have a decision described better ('info' adds to it and sets it back to
+# waiting; clickup-sync tells the front's coordinator once it lands there). The answer lands as a
+# comment on the decision and on that task. The list stays out of the cache, so
 # decisions never show up in 'ct find', duplicates or collisions.
 # A decision's number is hive's, never a person's: 'D-<n> ' in front of the question, one counter for
 # the whole list (every front, open and closed) and $CU_DIR/decision.last, the highest number this
@@ -1217,12 +1223,37 @@ CU_DECISION_DEFS='
 def dnum: (.name | capture("^D-(?<n>[1-9][0-9]*) ")?.n | tonumber) // null;
 def dquestion: .name | sub("^D-[1-9][0-9]* "; "");'
 
-# cu_decision_statuses — two lines: the decision list's waiting (first open) and answered (first closed) status.
+# cu_decision_statuses — three lines: the decision list's waiting, info and answered status. Each one
+# is decision_status_<role> from the config when set, else waiting is the list's first open status,
+# answered its first closed one, and info none (an empty line): no decision asks for more then. A
+# configured status the list does not have, or one status in two roles, is an error.
 cu_decision_statuses() {
-  local json; json=$(cu_api GET "/list/$(cu_decision_list)") || return
-  jq -re '[.statuses[]? | {s: (.status | ascii_downcase), t: .type}] as $st
-          | [first($st[] | select(.t == "open") | .s), first($st[] | select(.t == "closed") | .s)] | select(length == 2) | .[]' <<<"$json" \
-    || { cu_say "the decision list $(cu_decision_list) needs an open and a closed status"; return 1; }
+  local json out; json=$(cu_api GET "/list/$(cu_decision_list)") || return
+  out=$(jq -r --arg w "$(cu_cfg decision_status_waiting)" --arg i "$(cu_cfg decision_status_info)" \
+         --arg a "$(cu_cfg decision_status_answered)" --arg l "$(cu_decision_list)" '
+    def low: ascii_downcase | gsub("^\\s+|\\s+$"; "");
+    [.statuses[]? | {s: (.status | ascii_downcase), t: .type}] as $st
+    | ($st | map(.s)) as $names
+    | [$w, $i, $a | low] as $cfg
+    | ([$cfg[] | select(. != "" and (IN($names[]) | not))]) as $bad
+    | if ($bad | length) > 0 then
+        error("decision_status_* names a status the decision list \($l) does not have: \($bad | join(", ")) — its statuses: \($names | join(", "))")
+      else
+        [(if $cfg[0] != "" then $cfg[0] else first($st[] | select(.t == "open") | .s) // "" end), $cfg[1],
+         (if $cfg[2] != "" then $cfg[2] else first($st[] | select(.t == "closed") | .s) // "" end)]
+        | if .[0] == "" or .[2] == "" then error("the decision list \($l) needs an open and a closed status")
+          elif ([.[] | select(. != "")] | unique | length) < ([.[] | select(. != "")] | length) then
+            error("the decision statuses waiting, info and answered must differ (\(map(select(. != "")) | join(", ")))")
+          else .[] end
+      end' <<<"$json" 2>&1) && { printf '%s\n' "$out"; return 0; }
+  cu_say "$(sed -E 's/^jq: error \(at [^)]*\): //' <<<"$out")"
+  return 1
+}
+# cu_decision_role <status> <statuses> — waiting, info, answered or the status itself.
+cu_decision_role() {
+  local s=${1,,} w i a
+  { IFS= read -r w; IFS= read -r i; IFS= read -r a; } <<<"$2"
+  case "$s" in "$w") echo waiting ;; "$a") echo answered ;; *) [ -n "$i" ] && [ "$s" = "$i" ] && echo info || echo "$s" ;; esac
 }
 
 # cu_decisions — every decision of the list, closed ones included, one JSON a line, oldest first.
@@ -1301,8 +1332,22 @@ ct_decision_new() {  # decision new --name Q [--task ID] [--desc FILE] [--front 
   echo "decision: D-$n linked to $task ($tname)"
 }
 
+# cu_decision_id <D-n|id> — the id of the decision with that number (an id is printed as it is); a
+# number on no decision or on two is refused, before anything is written.
+cu_decision_id() {
+  local json ids
+  [[ "$1" =~ ^[Dd]-([1-9][0-9]*)$ ]] || { printf '%s\n' "$1"; return 0; }
+  json=$(cu_decisions) || { cu_say "cannot read the decision list"; return 1; }
+  ids=$(cu_jq_lines --argjson k "${BASH_REMATCH[1]}" 'select(dnum == $k) | .id' <<<"$json")
+  case "$(grep -c . <<<"$ids")" in
+    0) cu_say "no decision ${1^^} on the list"; return 1 ;;
+    1) printf '%s\n' "$ids" ;;
+    *) cu_say "${1^^} is on more than one decision ($(paste -sd, - <<<"$ids")) — renumber all but one by hand"; return 1 ;;
+  esac
+}
+
 ct_decision_answer() {  # decision answer <D-n|id> --comment TEXT|@FILE
-  local id="" comment="" st answered json task ids
+  local id="" comment="" st answered json task
   while [ $# -gt 0 ]; do
     case "$1" in
       --comment) comment=${2:?--comment needs a text}; shift 2 ;;
@@ -1313,18 +1358,10 @@ ct_decision_answer() {  # decision answer <D-n|id> --comment TEXT|@FILE
   comment=$(cu_trim "$comment")
   [ -n "$id" ] && [ -n "$comment" ] || cu_die 'usage: hive ct decision answer <D-n|id> --comment "<the answer>"|@FILE'
   cu_need_decisions
-  if [[ "$id" =~ ^[Dd]-([1-9][0-9]*)$ ]]; then
-    json=$(cu_decisions) || cu_die "cannot read the decision list"
-    ids=$(cu_jq_lines --argjson k "${BASH_REMATCH[1]}" 'select(dnum == $k) | .id' <<<"$json")
-    case "$(grep -c . <<<"$ids")" in
-      0) cu_die "no decision ${id^^} on the list" ;;
-      1) id=$ids ;;
-      *) cu_die "${id^^} is on more than one decision ($(paste -sd, - <<<"$ids")) — renumber all but one by hand" ;;
-    esac
-  fi
+  id=$(cu_decision_id "$id") || exit 1
   json=$(cu_task "$id") || exit 1
   [ "$(jq -r '.list.id // ""' <<<"$json")" = "$(cu_decision_list)" ] || cu_die "$id is not on the decision list"
-  st=$(cu_decision_statuses) || exit 1; answered=$(tail -1 <<<"$st")
+  st=$(cu_decision_statuses) || exit 1; answered=$(sed -n 3p <<<"$st")
   cu_comment_once "$id" "🤖 answer: $comment" || cu_die "answer not added to $id"
   cu_set_status "$json" "$answered" || cu_die "status of $id not set"
   echo "decision: $id $answered"
@@ -1335,24 +1372,77 @@ ct_decision_answer() {  # decision answer <D-n|id> --comment TEXT|@FILE
   done < <(jq -r --arg me "$id" '.linked_tasks[]? | [.task_id, .link_id] | map(select(. != $me))[]' <<<"$json" | awk '!seen[$0]++')
 }
 
-ct_decision_list() {  # decision list [--front F|--all] [--open]
-  local front="" open=false
+# decision info <D-n|id> --comment TEXT|@FILE [--desc FILE] — the coordinator's addition to a decision
+# the owner set to info (wants it described better): a comment marked as the coordinator's, with --desc
+# the description replaced, and the decision back to waiting. Only on a decision in info; a decision
+# already back to waiting with that very addition is left as it is, so a second run changes nothing.
+ct_decision_info() {
+  local id="" comment="" desc="" st waiting info json role text
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --comment) comment=${2:?--comment needs a text}; shift 2 ;;
+      --desc) desc=${2:?--desc needs a file}; shift 2 ;;
+      *) [ -z "$id" ] || cu_die "ct decision info: unexpected argument '$1'"; id=$1; shift ;;
+    esac
+  done
+  if [ "${comment:0:1}" = @ ]; then comment=$(cat -- "${comment:1}") || cu_die "cannot read ${comment:1}"; fi
+  comment=$(cu_trim "$comment")
+  [ -n "$id" ] && [ -n "$comment" ] || cu_die 'usage: hive ct decision info <D-n|id> --comment "<what is added>"|@FILE [--desc FILE]'
+  [ -z "$desc" ] || [ -r "$desc" ] || cu_die "cannot read $desc"
+  cu_need_decisions
+  st=$(cu_decision_statuses) || exit 1; waiting=$(sed -n 1p <<<"$st"); info=$(sed -n 2p <<<"$st")
+  [ -n "$info" ] || cu_die "the decision list has no info status — set 'decision_status_info' in $CU_CONF"
+  id=$(cu_decision_id "$id") || exit 1
+  json=$(cu_task "$id") || exit 1
+  [ "$(jq -r '.list.id // ""' <<<"$json")" = "$(cu_decision_list)" ] || cu_die "$id is not on the decision list"
+  text="🤖 coordinator's addition: $comment"
+  [ -z "$desc" ] || text+=$'\n'"(the description is rewritten)"
+  role=$(cu_decision_role "$(cu_status_of "$json")" "$st")
+  case "$role" in
+    info) ;;
+    waiting)
+      cu_has_comment "$id" "$text"; case $? in
+        0) echo "decision: $id waits already with this addition — nothing to do"; return 0 ;;
+        2) cu_die "cannot read the comments of $id" ;;
+      esac
+      cu_die "$id waits ('$waiting'): the owner asked for nothing more. 'info' is for a decision in '$info' — hive ct decision list --info" ;;
+    answered) cu_die "$id is answered already — hive ct show $id" ;;
+    *) cu_die "$id is in '$role', not in '$info' — hive ct show $id" ;;
+  esac
+  if [ -n "$desc" ]; then
+    cu_api PUT "/task/$id" "$(jq -nc --rawfile d "$desc" '{markdown_content: $d}')" >/dev/null || cu_die "the description of $id not replaced"
+  fi
+  cu_comment_once "$id" "$text" || cu_die "the addition not added to $id"
+  cu_set_status "$json" "$waiting" || cu_die "status of $id not set back to '$waiting'"
+  echo "decision: $id $waiting"
+}
+
+ct_decision_list() {  # decision list [--front F|--all] [--open|--info]
+  local front="" open=false info=false st
   while [ $# -gt 0 ]; do
     case "$1" in
       --front) front=$(cu_front_tag "${2:?--front needs a value}") || exit 1; shift 2 ;;
       --all) front=all; shift ;;
       --open) open=true; shift ;;
+      --info) info=true; shift ;;
       *) cu_die "ct decision list: unknown argument '$1'" ;;
     esac
   done
   [ -n "$front" ] || front=$(cu_front_tag "$(front_label "${HIVE_FRONT:-}")") || exit 1
   cu_need_decisions
+  st=$(cu_decision_statuses) || exit 1
+  [ "$info" = false ] || [ -n "$(sed -n 2p <<<"$st")" ] \
+    || cu_die "the decision list has no info status — set 'decision_status_info' in $CU_CONF"
   local rows; rows=$(cu_decisions) || exit 1
-  rows=$(cu_jq_lines --arg f "$front" --argjson open "$open" --arg now "$(date +%s)" '
-    select(($f == "all" or any(tagnames[]; . == $f)) and ($open == false or (closed | not)))
+  # The status column names the role: waiting, info (the owner wants more), answered; another status as it is.
+  rows=$(cu_jq_lines --arg f "$front" --argjson open "$open" --argjson info "$info" --arg now "$(date +%s)" \
+           --arg w "$(sed -n 1p <<<"$st")" --arg i "$(sed -n 2p <<<"$st")" --arg a "$(sed -n 3p <<<"$st")" '
+    (.status.status // "" | ascii_downcase) as $s
+    | (if $s == $w then "waiting" elif $i != "" and $s == $i then "info" elif $s == $a then "answered" else $s end) as $role
+    | select(($f == "all" or any(tagnames[]; . == $f)) and ($open == false or (closed | not)) and ($info == false or $role == "info"))
     | ((($now | tonumber) - ((.date_created // "0") | tonumber / 1000)) / 3600 | floor) as $h
     | .id as $me | def dash: if . == "" then "-" else . end;
-    [(dnum | if . then "D-\(.)" else "-" end), .id, (.status.status // "" | ascii_downcase), (short("front") | join(",") | dash),
+    [(dnum | if . then "D-\(.)" else "-" end), .id, $role, (short("front") | join(",") | dash),
      (if $h < 48 then "\($h)h" else "\($h / 24 | floor)d" end),
      ([.linked_tasks[]? | .task_id, .link_id] | map(select(. != null and . != $me)) | unique | join(",") | dash),
      (dquestion | gsub("[\t\n\r]"; " "))] | @tsv' <<<"$rows")
@@ -1399,9 +1489,10 @@ ct_decision() {
   case "$sub" in
     new) ct_decision_new "$@" ;;
     answer) ct_decision_answer "$@" ;;
+    info) ct_decision_info "$@" ;;
     list) ct_decision_list "$@" ;;
     number) ct_decision_number "$@" ;;
-    *) cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F] | answer <D-n|id> --comment TEXT|@FILE | list [--front F|--all] [--open] | number [--yes]' ;;
+    *) cu_die 'usage: hive ct decision new --name "<the question>" [--task ID] [--desc FILE] [--front F] | answer <D-n|id> --comment TEXT|@FILE | info <D-n|id> --comment TEXT|@FILE [--desc FILE] | list [--front F|--all] [--open|--info] | number [--yes]' ;;
   esac
 }
 
@@ -1444,7 +1535,11 @@ Every task has one front, one area and at least one module.
                                       a decision the owner is asked for, on the decision list,
                                       numbered D-<n> by hive
   hive ct decision answer <D-n|id> --comment TEXT|@FILE   the answer, noted on the linked task too
-  hive ct decision list [--front F|--all] [--open]   the caller's front's decisions, oldest first
+                                      (from waiting or info)
+  hive ct decision info <D-n|id> --comment TEXT|@FILE [--desc FILE]   what the owner asked to add to a
+                                      decision in info; --desc replaces its description; back to waiting
+  hive ct decision list [--front F|--all] [--open|--info]   the caller's front's decisions, oldest first;
+                                      --open waiting and info, --info only those the owner wants more on
   hive ct decision number [--yes]     numbers the decisions without a number; a dry run unless --yes
 EOF
        [ -z "$sub" ] || [ "$sub" = help ] || [ "$sub" = -h ] || [ "$sub" = --help ] || exit 1 ;;

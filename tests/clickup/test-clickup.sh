@@ -1405,6 +1405,115 @@ run "$HIVE" ct decision number --yes
 eq "number without decision.last goes after a closed decision above the open ones" "0 D-21 Open unnumbered?" \
   "$RC $(task_field tdk3 .name)"
 rm -f "$FAKE_CU"/tasks/tdk[1-3].json
+
+section "ct decision: needs more info"
+cat > "$FAKE_CU/statuses-9012345600.json" <<'EOF'
+[{"status":"waiting","type":"open"},{"status":"needs more info","type":"custom"},{"status":"answered","type":"closed"}]
+EOF
+decrow() { printf '%-6s %-11s %-14s' "$1" "$2" "$3"; }
+mkdec tni1 waiting front-default "D-30 Which cache?" 1700000010000
+mkdec tni2 "needs more info" front-default "D-31 Which queue?" 1700000011000
+run "$HIVE" ct decision list --open
+has "without the keys the first open status is waiting" "$(decrow D-30 tni1 waiting)" "$OUT"
+has "and the list has no info status: its name as it is" "$(decrow D-31 tni2 'needs more info')" "$OUT"
+run "$HIVE" ct decision list --info
+eq "--info without an info status is refused" 1 "$RC"
+has "saying which key" "set 'decision_status_info'" "$ERR"
+w=$(writes)
+run "$HIVE" ct decision info D-31 --comment "More."
+eq "and so is info" "1 $w" "$RC $(writes)"
+has "the same way" "set 'decision_status_info'" "$ERR"
+echo "decision_status_info = Needs More Info" >> "$CU/config"
+run "$HIVE" ct decision list --open
+has "with the key, --open shows a waiting one" "$(decrow D-30 tni1 waiting)" "$OUT"
+has "and one in info, told apart" "$(decrow D-31 tni2 info)" "$OUT"
+run "$HIVE" ct decision list --info
+eq "--info lists only those in info" "1 1" "$(grep -c '^D-' <<<"$OUT") $(grep -c '^D-31 ' <<<"$OUT")"
+echo "decision_status_answered = closed-ish" >> "$CU/config"
+run "$HIVE" ct decision list
+eq "a configured status the list does not have is an error" 1 "$RC"
+has "naming it and the list's statuses" "does not have: closed-ish — its statuses: waiting, needs more info, answered" "$ERR"
+sed -i '/^decision_status_answered = /d' "$CU/config"
+echo "decision_status_waiting = needs more info" >> "$CU/config"
+run "$HIVE" ct decision list
+eq "one status in two roles is an error" 1 "$RC"
+has "saying so" "must differ" "$ERR"
+sed -i '/^decision_status_waiting = /d' "$CU/config"
+printf 'decision_status_waiting = Waiting\ndecision_status_answered = answered\n' >> "$CU/config"
+run "$HIVE" ct decision list --open
+eq "every key set, each on the list" "0 2" "$RC $(grep -c '^D-3[01] ' <<<"$OUT")"
+
+w=$(writes)
+run "$HIVE" ct decision info D-30 --comment "More."
+eq "info on a waiting decision is refused" "1 $w" "$RC $(writes)"
+has "with a hint" "the owner asked for nothing more. 'info' is for a decision in 'needs more info' — hive ct decision list --info" "$ERR"
+printf '## Context\nQueue A or queue B, with the costs.\n' > "$T/dq2"
+run "$HIVE" ct decision info D-31 --comment "  A is cheaper, B scales. " --desc "$T/dq2"
+eq "info exits 0" 0 "$RC"
+eq "and sets the decision back to waiting" waiting "$(task_field tni2 .status.status)"
+has "saying so" "decision: tni2 waiting" "$OUT"
+eq "the addition is a comment marked as the coordinator's" "🤖 coordinator's addition: A is cheaper, B scales.|(the description is rewritten)" \
+  "$(comments_of tni2 | paste -sd'|')"
+eq "--desc replaces the description" "## Context|Queue A or queue B, with the costs." "$(jq -j .text_content "$FAKE_CU/tasks/tni2.json" | paste -sd'|')"
+w=$(writes)
+run "$HIVE" ct decision info D-31 --comment "A is cheaper, B scales." --desc "$T/dq2"
+eq "a second run changes nothing" "0 $w 1" "$RC $(writes) $(ncomments tni2)"
+has "and says so" "nothing to do" "$OUT"
+run "$HIVE" ct decision info D-31 --comment "Something else."
+eq "another addition to a waiting decision is refused" "1 $w" "$RC $(writes)"
+run "$HIVE" ct decision info tni1
+eq "an addition is required" 1 "$RC"
+run "$HIVE" ct decision info D-31 --comment "x" --desc "$T/nosuch"
+eq "an unreadable --desc is refused" "1 $w" "$RC $(writes)"
+mkdec tni3 "needs more info" front-default "D-34 Twice?" 1700000012000
+mkdec tni4 "needs more info" front-web "D-34 Twice again?" 1700000013000
+run "$HIVE" ct decision info D-34 --comment "More."
+eq "a number on two decisions is refused before any write" "1 $w" "$RC $(writes)"
+has "naming both" "D-34 is on more than one decision (tni3,tni4)" "$ERR"
+run "$HIVE" ct decision info D-99 --comment "More."
+eq "and a number on none" "1 $w" "$RC $(writes)"
+has "saying so" "no decision D-99 on the list" "$ERR"
+rm -f "$FAKE_CU/tasks/tni3.json" "$FAKE_CU/tasks/tni4.json"
+mkdec tni5 answered front-default "D-35 Done?" 1700000014000
+run "$HIVE" ct decision info D-35 --comment "More."
+eq "info on an answered decision is refused" "1 $w" "$RC $(writes)"
+has "saying so" "tni5 is answered already" "$ERR"
+mkdec tni6 "needs more info" front-default "D-36 Answer straight?" 1700000015000
+run "$HIVE" ct decision answer D-36 --comment "Yes."
+eq "answer works on a decision in info too" "0 answered" "$RC $(task_field tni6 .status.status)"
+rm -f "$FAKE_CU/tasks/tni5.json" "$FAKE_CU/tasks/tni6.json"
+
+ninfo() { subjects "${1:-}" | grep -c "^DECISION $2 needs more info"; }
+listreads() { grep -c '^GET /list/9012345600/task ' "$FAKE_CU/requests.log"; }
+mkdec tni7 "needs more info" front-web "D-37 Which host?" 1700000016000
+r=$(listreads); s=$(grep -c '^GET /list/9012345600 ' "$FAKE_CU/requests.log")
+sync_now
+eq "sync tells the coordinator of the decision's front once" 1 "$(ninfo web D-37)"
+eq "and nobody else" 0 "$(ninfo "" D-37)"
+body=$(cat "$HIVE_DIR"/fronts/web/mail/coord/*.json | jq -r 'select(.subject | contains("D-37")) | .body')
+has "the letter names the question" "Question: Which host?" "$body"
+has "the link" "https://app.clickup.com/t/tni7" "$body"
+has "and what to run" "hive ct decision info D-37 --comment" "$body"
+eq "with one read of the decision list a run" "$((r + 1)) $s" "$(listreads) $(grep -c '^GET /list/9012345600 ' "$FAKE_CU/requests.log")"
+grep -qxF tni7 "$CU/decision-info.state"; eq "and remembers it in clickup/" 0 "$?"
+sync_now
+eq "the next run sends no second letter" 1 "$(ninfo web D-37)"
+eq "the waiting ones get none" 0 "$(ninfo "" D-30)"
+mkdec tni7 waiting front-web "D-37 Which host?" 1700000016000
+sync_now
+eq "back to waiting it drops out of the state" 0 "$(grep -cxF tni7 "$CU/decision-info.state")"
+mkdec tni7 "needs more info" front-web "D-37 Which host?" 1700000016000
+sync_now
+eq "in info again: a new letter" 2 "$(ninfo web D-37)"
+mkdec tni8 "needs more info" front-default "D-38 Which port?" 1700000017000
+echo 1 > "$FAKE_CU/down"; r=$(listreads)
+sync_now
+rm -f "$FAKE_CU/down"
+eq "ClickUp down: no letter" 0 "$(ninfo "" D-38)"
+sync_now
+eq "and the next run tells it" 1 "$(ninfo "" D-38)"
+rm -f "$FAKE_CU"/tasks/tni[1-8].json
+sed -i '/^decision_status_/d' "$CU/config"
 printf '[{"status":"waiting","type":"open"}]' > "$FAKE_CU/statuses-9012345600.json"
 run "$HIVE" ct decision new --name "Without a closed status?"
 eq "a decision list without a closed status is refused" 1 "$RC"

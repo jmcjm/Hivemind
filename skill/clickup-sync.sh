@@ -21,7 +21,8 @@
 # without a word, and so is every report in the format from before this sync (an 'applied:' line).
 # Reports of drones without a ClickUp task in their meta.json and of muted drones are skipped.
 # Before the reports it refreshes the whole task cache when that is CU_REGISTRY_TTL old and replays the
-# start writes 'hive task' could not make (clickup/starts).
+# start writes 'hive task' could not make (clickup/starts). After them, with decision_status_info set,
+# it tells a front's coordinator, once, of each of its decisions the owner set to that status.
 set -uo pipefail
 
 HIVE_DIR="${HIVE_DIR:-$HOME/.herdr-hive}"
@@ -206,4 +207,34 @@ hive ct set, then: hive ct ack $drone --manual \"<what you did>\"" && add "$CU_S
   esac
   printf '%s\t%s\n' "$mtime" "$outcome" > "$ddir/.clickup-sync"
 done
+
+# Decisions the owner set to decision_status_info (wants one described better) since the last run: one
+# letter each to the coordinator of the decision's front. One read of the decision list's open tasks a
+# run; a letter that fails is tried again on the next run. A decision that leaves the status drops out
+# of clickup/decision-info.state, so landing there again is a new letter (one that goes there and back
+# between two runs is not seen).
+info_st=$(cu_list decision_status_info | head -1)
+if [ -n "$(cu_decision_list)" ] && [ -n "$info_st" ]; then
+  if cu_ready 2>/dev/null && json=$(cu_api GET "/list/$(cu_decision_list)/task?subtasks=true" 2>/dev/null); then
+    rows=$(cu_jq_lines --arg i "$info_st" '.tasks[]? | select((.status.status // "" | ascii_downcase) == $i)
+      | [.id, ((short("front") | first) // "default"), (dnum | if . then "D-\(.)" else "" end), (dquestion | gsub("[\t\n\r]"; " "))] | @tsv' <<<"$json")
+    : > "$CU_DECISION_INFO.new"
+    while IFS=$'\t' read -r id front num question; do
+      [ -n "$id" ] || continue
+      if grep -qxF -- "$id" "$CU_DECISION_INFO" 2>/dev/null; then echo "$id" >> "$CU_DECISION_INFO.new"; continue; fi
+      if letter "DECISION ${num:-$id} needs more info: $question" "${num:+$num }https://app.clickup.com/t/$id
+Question: $question
+The owner set it to '$info_st': describe it better (what is asked, the options, what each one costs), then:
+hive ct decision info ${num:-$id} --comment \"what you add\" (--desc FILE to rewrite the description)
+The owner may answer it right away all the same: hive ct decision answer ${num:-$id} --comment \"the answer\""; then
+        echo "$id" >> "$CU_DECISION_INFO.new"; log "decision $front ${num:-$id} needs more info: coordinator told"
+      else
+        log "decision $front ${num:-$id} needs more info: the letter failed — will retry"
+      fi
+    done <<<"$rows"
+    mv -f "$CU_DECISION_INFO.new" "$CU_DECISION_INFO"
+  else
+    log "decisions not read — ClickUp unavailable"
+  fi
+fi
 exit 0

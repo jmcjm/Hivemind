@@ -317,7 +317,9 @@ refused, and decisions from before the numbering get theirs with `hive ct decisi
 next number is the highest on the list or the highest kept in `~/.herdr-hive/clickup/decision.last`,
 so a deleted or archived decision does not give its number back. A number goes to that file before
 ClickUp is asked, so a create that fails leaves a gap, never a number given twice. The counter and that file are per
-machine; coordinators on two machines are not covered.
+machine; coordinators on two machines are not covered. With `decision_status_info` the owner can send a
+decision back for more detail: `clickup-sync` mails the front's coordinator once, and
+`hive ct decision info D-<n> --comment ...` adds the detail and puts it back to waiting.
 
 ## Watching outside sources
 

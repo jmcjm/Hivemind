@@ -37,6 +37,14 @@ verify_exempt = type-analysis
 # tasks' list. Its first open status means waiting, its first closed one answered. Without it the
 # decision commands are off.
 # decision_list = 9012345679
+# The decision statuses by name, each optional (case does not matter; a status the list does not have
+# is an error naming the list's statuses). Without waiting / answered: the first open and the first
+# closed status. info: the open status the owner sets when a decision needs describing better —
+# clickup-sync tells the decision's coordinator once it lands there, and 'hive ct decision info' adds
+# the detail and sets it back to waiting. Without info no decision asks for more.
+# decision_status_waiting = czeka
+# decision_status_info = needs more info
+# decision_status_answered = odpowiedziana
 
 # 'hive ct todo': the checklist a small step goes to when no --checklist is named.
 # checklist = Small steps
