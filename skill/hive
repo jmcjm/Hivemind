@@ -842,8 +842,9 @@ FORMAT = '''one account per line, lower prio = preferred:
   account default  prio=2  week_threshold=60  hard       # hard: over the threshold = never used
   account spare    prio=3  disabled                      # disabled: never used, never measured
 
-The threshold is on the weekly limit (default 90). The session limit blocks an account only at 100%;
-session_threshold=<percent> makes it count as "over threshold" earlier.'''
+The threshold is on the weekly limit (default 90); a week at 100% makes an account UNAVAILABLE.
+session_threshold=<percent> applies only to a /usage panel that still has a "Current session"
+section (a 5-hour limit, which blocks at 100% by default); a panel without one has no session limit.'''
 
 def load_conf():
     try:
@@ -873,7 +874,8 @@ def load_conf():
             errs.append(f'line {no}: expected "account <name> ..." or "max_age = <minutes>"')
             continue
         # The threshold belongs to the weekly limit. A session is a 5-hour window that comes back by
-        # itself, so by default it only counts when it is full (100 = no session threshold).
+        # itself, so by default it only counts when it is full (100 = no session threshold). A panel
+        # without a "Current session" section has no session limit, and session_threshold no effect.
         acc = {'name': tok[1], 'prio': None, 'week_threshold': 90, 'session_threshold': 100,
                'hard': False, 'disabled': False, 'order': len(conf['accounts'])}
         if not NAME.match(acc['name']):
@@ -925,10 +927,12 @@ def clean(entry):
     num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
     text = lambda v: v if isinstance(v, str) else None
     out = {}
-    if None not in (num(entry.get('measured_at')), num(entry.get('session_pct')), num(entry.get('week_pct'))):
+    # The session fields are null when the panel had no session limit; the week is always there.
+    if None not in (num(entry.get('measured_at')), num(entry.get('week_pct'))) \
+            and (entry.get('session_pct') is None or num(entry.get('session_pct')) is not None):
         out['measured_at'] = entry['measured_at']
         for key in ('session', 'week'):
-            out[key + '_pct'] = entry[key + '_pct']
+            out[key + '_pct'] = entry.get(key + '_pct')
             out[key + '_reset'] = num(entry.get(key + '_reset'))
             out[key + '_reset_text'] = text(entry.get(key + '_reset_text'))
     if text(entry.get('error')):
@@ -956,9 +960,12 @@ def save_cache(cache):
 # --- the /usage panel ---
 # A limit section is three lines: its label, a bar ending in "N% used", and "Resets <when>".
 # Sections are found by label: the panel also prints lines like "93% of your usage was at >150k
-# context", which are not limits.
+# context", which are not limits. The weekly section is required. The session section is optional:
+# Claude Code dropped the 5-hour session limit, and a panel without the section has no such limit
+# (session fields null). Older panels that still print it are read as before.
 SECTIONS = (('session', ('Current session',)),
             ('week', ('Current week (all models)', 'Current week')))
+OPTIONAL = {'session'}
 PCT = re.compile(r'(?<![\d.,])(\d{1,3})(?:[.,]\d+)?%\s*used')    # "35.5% used" is 35, never 5
 RESET = re.compile(r'^Resets\s+(?:(?P<mon>[A-Za-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2})(?:\s*,|\s+at)?\s+)?'
                    r'(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap]m)?\s*(?:\((?P<tz>[^)]+)\))?\s*$', re.I)
@@ -998,14 +1005,18 @@ def reset_epoch(line, at):
     return int(when.timestamp())
 
 def parse_panel(text, at):
-    """-> (fields, None) or (None, why). Both sections are required: a panel that lost one is a
-    changed format, and guessing would report an exhausted account as free."""
+    """-> (fields, None) or (None, why). The weekly section is required: a panel without it is a
+    changed format (or no panel at all), and guessing would report an exhausted account as free.
+    A missing session section means no session limit; one that is there must carry its percentage."""
     lines = [l.strip() for l in text.splitlines()]
     out, missing = {}, []
     for key, labels in SECTIONS:
         idx = next((i for lab in labels for i, l in enumerate(lines) if l == lab), None)
         if idx is None:
-            missing.append(f'no "{labels[0]}" section')
+            if key in OPTIONAL:
+                out[key + '_pct'] = out[key + '_reset'] = out[key + '_reset_text'] = None
+            else:
+                missing.append(f'no "{labels[0]}" section')
             continue
         body = [l for l in lines[idx + 1:] if l][:2]
         m = PCT.search(body[0]) if body else None
@@ -1061,6 +1072,10 @@ def blocked_until(acc, entry):
               if (v[key] or 0) >= (acc[key + '_threshold'] if acc['hard'] else 100)]
     return max(resets) if resets and all(resets) else None
 
+def numbers(v):
+    """'session 24%, week 60%', or 'week 60%' when the panel had no session limit."""
+    return ('' if v['session'] is None else f'session {v["session"]}%, ') + f'week {v["week"]}%'
+
 def is_fresh(conf, entry):
     return entry.get('measured_at') is not None and now - entry['measured_at'] <= conf['max_age'] * 60
 
@@ -1078,20 +1093,20 @@ def rank(conf, cache):
         entry = cache['accounts'].get(acc['name'], {})
         kind, text = status(acc, entry)
         v = view(entry)
-        numbers = f'session {v["session"]}%, week {v["week"]}%'
+        nums = numbers(v)
         head = f'prio {acc["prio"]}'
         ahead = f'; passed over: {", ".join(passed)}' if passed else ''
         state = text.split(' — ')[0]
         if kind == 'nodata' or (kind in ('ok', 'over') and not is_fresh(conf, entry)):
-            why = text if kind == 'nodata' else f'last measured {age(now - v["measured_at"])} ago ({numbers})'
+            why = text if kind == 'nodata' else f'last measured {age(now - v["measured_at"])} ago ({nums})'
             (blind_over if kind == 'over' else blind).append(
                 (acc, f'BLIND — no fresh usage data: {why}; {head}{ahead}'))
             state = f'{state}, stale' if kind == 'over' else 'no fresh usage data'
         elif kind == 'ok':
-            below.append((acc, f'{head}, {numbers}, under its threshold ({limits(acc)}){ahead}'))
+            below.append((acc, f'{head}, {nums}, under its threshold ({limits(acc)}){ahead}'))
             continue        # taken in its turn, so never "passed over"
         elif kind == 'over':
-            last_resort.append((acc, f'LAST RESORT — no account is under its threshold; {head}, {numbers}, '
+            last_resort.append((acc, f'LAST RESORT — no account is under its threshold; {head}, {nums}, '
                                      f'its threshold ({limits(acc)}) is not hard{ahead}'))
         passed.append(f'{acc["name"]} ({state})')
     return below + last_resort + blind + blind_over
@@ -1110,7 +1125,7 @@ def room(conf, cache, name):
         return False, text.split(' — ')[0]
     v = view(entry)
     measured = '' if is_fresh(conf, entry) else f', measured {age(now - v["measured_at"])} ago'
-    return True, f'session {v["session"]}%, week {v["week"]}%, under its threshold ({limits(acc)}){measured}'
+    return True, f'{numbers(v)}, under its threshold ({limits(acc)}){measured}'
 
 # --- output ---
 def age(sec):
@@ -1135,6 +1150,10 @@ def table(conf, cache):
     ranked = rank(conf, cache)
     selected = pinned if pinned else (ranked[0][0]['name'] if ranked else None)
     rows, measured = [], []
+    # The session columns stay only while some measurement still has a session limit (an older
+    # Claude Code); with the week alone they would be two columns of '-' on every row.
+    with_session = any(not acc['disabled'] and view(cache['accounts'].get(acc['name'], {}))['session'] is not None
+                       for acc in conf['accounts'])
     for acc in conf['accounts']:
         entry = cache['accounts'].get(acc['name'], {})
         kind, text = status(acc, entry)
@@ -1160,8 +1179,8 @@ def table(conf, cache):
             kind_color = KIND_COLOR[kind]
         rows.append([(kind_color, acc['name']), ('', 'claude'), ('', str(acc['prio'])),
                      ('', limits(acc) + (' hard' if acc['hard'] else '')), ('', email(acc['name'])),
-                     pct('session'), ('', reset('session', True)), pct('week'), ('', reset('week', False)),
-                     (kind_color, text)])
+                     *([pct('session'), ('', reset('session', True))] if with_session else []),
+                     pct('week'), ('', reset('week', False)), (kind_color, text)])
     if not measured:
         print('usage: never measured — run: hive accounts --refresh')
     else:
@@ -1170,7 +1189,8 @@ def table(conf, cache):
         print(f'usage from {age(oldest)} ago' + (
             f' — STALE (max_age {conf["max_age"]} min): a spawn re-measures before it picks; '
             f'refresh now: hive accounts --refresh' if stale else ''))
-    head = ['ACCOUNT', 'ENGINE', 'PRIO', 'THRESHOLD', 'EMAIL', 'SESSION', 'SESSION RESET', 'WEEK', 'WEEK RESET', 'STATUS']
+    head = ['ACCOUNT', 'ENGINE', 'PRIO', 'THRESHOLD', 'EMAIL',
+            *(['SESSION', 'SESSION RESET'] if with_session else []), 'WEEK', 'WEEK RESET', 'STATUS']
     widths = [max(len(head[i]), *(len(r[i][1]) for r in rows)) for i in range(len(head))]
     print('  '.join(h.ljust(w) for h, w in zip(head, widths)).rstrip())
     for r in rows:

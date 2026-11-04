@@ -10,7 +10,9 @@
 #                      onboarded ("Several Claude Code accounts" in SKILL.md shows how to make one)
 #   prio               lower = preferred; left out, it is the line's position among the accounts
 #   week_threshold     percent of the WEEKLY limit up to which the account is used (default 90)
-#   session_threshold  the same for the 5-hour session limit (default 100: only a full session blocks)
+#   session_threshold  the same for the 5-hour session limit (default 100: only a full session blocks).
+#                      Current Claude Code has no session limit (its /usage panel shows only the week),
+#                      so this applies only to a panel that still has a "Current session" section.
 #   hard               over its threshold the account is never taken, not even as a last resort
 #   disabled           never taken, never measured
 #
