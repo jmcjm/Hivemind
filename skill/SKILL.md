@@ -623,8 +623,9 @@ never becomes a tag. On the command line and in a brief a tag may be named witho
 | `hive ct sync` | refreshes the cache, creates the taxonomy's missing tags |
 | `hive ct ack <drone> --manual "<reason>"` | a report the sync could not apply, settled by hand; the reason goes to `clickup/sync.log` |
 | `hive ct decision new --name "<question>" [--task ID] [--desc FILE] [--front F]` | a decision the coordinator waits on from the owner, on the decision list (below): named `D-<n> <question>` with the next number hive gives, waiting, with the caller's front (or `--front`), linked to the task it is about, whose history gets a line that it waits. A question numbered by hand (`[…]` or `D-<n>` in front) is refused, and so is the same question waiting in the front, whatever its number |
-| `hive ct decision answer <D-n\|id> --comment TEXT\|@FILE` | the owner's answer as a comment, the decision answered, the answer noted on the linked task; a number on no decision or on two is refused before anything is written; a second run changes nothing |
-| `hive ct decision list [--front F\|--all] [--open]` | the caller's front's decisions (or that front's, or every front's), oldest first: number, status, age, task, question |
+| `hive ct decision answer <D-n\|id> --comment TEXT\|@FILE` | the owner's answer as a comment, the decision answered, the answer noted on the linked task; works from waiting and from info; a number on no decision or on two is refused before anything is written; a second run changes nothing |
+| `hive ct decision info <D-n\|id> --comment TEXT\|@FILE [--desc FILE]` | what the coordinator adds to a decision the owner set to info (below): a comment marked `coordinator's addition`, with `--desc` the description replaced, and the decision back to waiting. Only on a decision in info — a waiting or answered one is refused with a hint; a number on no decision or on two is refused before anything is written; a second run changes nothing |
+| `hive ct decision list [--front F\|--all] [--open\|--info]` | the caller's front's decisions (or that front's, or every front's), oldest first: number, status (`waiting`, `info`, `answered`, another status by its name), age, task, question. `--open` shows waiting and info, `--info` only those the owner wants described better |
 | `hive ct decision number [--yes]` | numbers the decisions that have no number yet, oldest first, after the highest number given (below), and drops a hand-made `[…] ` from the front of the name; a dry run unless `--yes`, a decision renamed since it was read is skipped, a rename ClickUp refuses is counted as failed, leaves its number unused (a gap) and the run exits non-zero, a second run changes nothing |
 
 **The brief's header** — `hive task` refuses a brief without it:
@@ -724,7 +725,15 @@ coordinator adds it to the epic's checklist (`hive ct todo <epic> "<step>"`).
 **Decisions** (`hive ct decision`, on with `decision_list` in the config). A question only the owner can
 answer lives on a list of its own, not in the conversation, where it is lost with the next compaction.
 The list's first open status means waiting, its first closed one answered; name them as you like (e.g.
-a red *waiting* and a green *answered*). A decision is a task of that list: its name the question in
+a red *waiting* and a green *answered*), or pick them with `decision_status_waiting` and
+`decision_status_answered`. `decision_status_info` names a third, open status (e.g. *needs more info*)
+the owner sets when a decision needs describing better: `clickup-sync` (on its timer) sends the
+coordinator of the decision's front one letter each time a decision lands there — number, question,
+link — and the coordinator answers with `hive ct decision info D-<n> --comment ... [--desc FILE]`, which
+puts the decision back to waiting. The sync reads the decision list once a run and remembers what it told
+in `~/.herdr-hive/clickup/decision-info.state`; a decision that goes to info and back between two runs is
+not seen. Without the keys there is no info status, and a configured status the list does not have is an
+error naming the list's statuses. A decision is a task of that list: its name the question in
 one sentence, one front tag, a link to the task it is about, and a description in four parts:
 - **Context**: what is being decided and why now, with a link to the report;
 - **Options**: numbered, each with its cost, and the coordinator's **recommendation**;
