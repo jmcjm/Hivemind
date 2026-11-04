@@ -38,6 +38,7 @@ bad()   { FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; shift; printf '        %
 eq()    { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected: $2" "actual:   $3"; fi; }
 has()   { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1" "missing:  $2" "in:       $3" ;; esac; }
 hasnt() { case "$3" in *"$2"*) bad "$1" "unwanted: $2" "in:       $3" ;; *) ok "$1" ;; esac; }
+like()  { if [[ "$3" =~ $2 ]]; then ok "$1"; else bad "$1" "pattern:  $2" "actual:   $3"; fi; }
 section() { printf '\n%s\n' "$1"; }
 run() { OUT=$("$@" 2>"$ERRF"); RC=$?; ERR=$(cat "$ERRF"); }
 
@@ -1204,7 +1205,7 @@ has "with its number and id" "decision: D-1 $DEC https://app.clickup.com/t/$DEC"
 eq "the first decision is D-1, in front of the question" "D-1 Which layout do we ship?" "$(task_field "$DEC" .name)"
 eq "on the decision list, waiting, with the caller's front" "9012345600 waiting front-default" \
   "$(task_field "$DEC" .list.id) $(task_field "$DEC" .status.status) $(tags_of "$DEC")"
-eq "the description from --desc" "## Context|Two layouts." "$(jq -j .text_content "$FAKE_CU/tasks/$DEC.json" | paste -sd'|')"
+eq "the description from --desc, as markdown" "## Context|Two layouts." "$(jq -j .markdown_description "$FAKE_CU/tasks/$DEC.json" | paste -sd'|')"
 eq "linked to its task" "$DEC" "$(task_field tdec01 '.linked_tasks[0].link_id')"
 has "and the task's history says it waits" "🤖 decision waiting: D-1 Which layout do we ship? ($DEC)" "$(comments_of tdec01)"
 run "$HIVE" ct decision new --name "which layout do we ship?" --task tdec01
@@ -1447,22 +1448,62 @@ w=$(writes)
 run "$HIVE" ct decision info D-30 --comment "More."
 eq "info on a waiting decision is refused" "1 $w" "$RC $(writes)"
 has "with a hint" "the owner asked for nothing more. 'info' is for a decision in 'needs more info' — hive ct decision list --info" "$ERR"
-printf '## Context\nQueue A or queue B, with the costs.\n' > "$T/dq2"
-run "$HIVE" ct decision info D-31 --comment "  A is cheaper, B scales. " --desc "$T/dq2"
+today=$(date +%F)
+mdesc() { jq -j .markdown_description "$FAKE_CU/tasks/$1.json" | paste -sd'|'; }
+# The owner's description, in markdown; the fake keeps a plain-text copy without the marks.
+jq '.markdown_description = "## Context\nQueue A or queue B.\n\n**Options**: 1. A, 2. B" | .text_content = "Context\nQueue A or queue B.\n\nOptions: 1. A, 2. B"' \
+  "$FAKE_CU/tasks/tni2.json" > "$T/tni2" && mv "$T/tni2" "$FAKE_CU/tasks/tni2.json"
+printf 'A is cheaper, B scales.\n\n- A: one box\n- B: three boxes\n' > "$T/add1"
+run "$HIVE" ct decision info D-31 --add "@$T/add1"
 eq "info exits 0" 0 "$RC"
 eq "and sets the decision back to waiting" waiting "$(task_field tni2 .status.status)"
 has "saying so" "decision: tni2 waiting" "$OUT"
-eq "the addition is a comment marked as the coordinator's" "🤖 coordinator's addition: A is cheaper, B scales.|(the description is rewritten)" \
-  "$(comments_of tni2 | paste -sd'|')"
-eq "--desc replaces the description" "## Context|Queue A or queue B, with the costs." "$(jq -j .text_content "$FAKE_CU/tasks/tni2.json" | paste -sd'|')"
+eq "the addition is appended to the description as a section, the owner's markdown kept" \
+  "## Context|Queue A or queue B.||**Options**: 1. A, 2. B||## Coordinator's addition ($today)||A is cheaper, B scales.||- A: one box|- B: three boxes" \
+  "$(mdesc tni2)"
+grep -q '^PUT /task/tni2 {"markdown_content":' "$FAKE_CU/requests.log"; eq "written as markdown_content" 0 "$?"
+eq "the comment is one line, without the addition" 1 "$(comments_of tni2 | wc -l)"
+like "naming the section, with a marker" "^🤖 description updated: Coordinator's addition \($today\) · hive-info:[0-9a-f]{12}$" "$(comments_of tni2)"
 w=$(writes)
-run "$HIVE" ct decision info D-31 --comment "A is cheaper, B scales." --desc "$T/dq2"
+run "$HIVE" ct decision info D-31 --add "@$T/add1"
 eq "a second run changes nothing" "0 $w 1" "$RC $(writes) $(ncomments tni2)"
 has "and says so" "nothing to do" "$OUT"
-run "$HIVE" ct decision info D-31 --comment "Something else."
+run "$HIVE" ct decision info D-31 --add "Something else."
 eq "another addition to a waiting decision is refused" "1 $w" "$RC $(writes)"
+task_set_status() { jq --arg s "$2" --slurpfile st "$FAKE_CU/statuses-9012345600.json" '.status = ($st[0][] | select(.status == $s))' \
+  "$FAKE_CU/tasks/$1.json" > "$T/ts" && mv "$T/ts" "$FAKE_CU/tasks/$1.json"; }
+task_set_status tni2 "needs more info"
+d=$(mdesc tni2)
+run "$HIVE" ct decision info D-31 --comment "@$T/add1"
+eq "the same addition in info again (--comment, the old name): no second section" "0 $d" "$RC $(mdesc tni2)"
+has "saying so" "has this addition in its description already" "$OUT"
+eq "nor a second comment, and back to waiting" "1 waiting" "$(ncomments tni2) $(task_field tni2 .status.status)"
+task_set_status tni2 "needs more info"
+run "$HIVE" ct decision info D-31 --add "  B needs a second region. "
+eq "another addition is a second section after the first" "0 $d||## Coordinator's addition ($today)||B needs a second region." "$RC $(mdesc tni2)"
+eq "with a line of its own" 2 "$(ncomments tni2)"
+task_set_status tni2 "needs more info"
+printf '## Context\nQueue A or queue B, with the costs.\n' > "$T/dq2"
+run "$HIVE" ct decision info D-31 --desc "$T/dq2"
+eq "--desc replaces the description" "0 ## Context|Queue A or queue B, with the costs." "$RC $(mdesc tni2)"
+eq "with a line saying so" "🤖 description updated: rewritten" "$(comments_of tni2 | head -1 | sed 's/ · hive-info:.*//')"
+task_set_status tni2 "needs more info"
+run "$HIVE" ct decision info D-31 --desc "$T/dq2" --add "A wins."
+eq "--desc and --add: the file, then the section" "0 ## Context|Queue A or queue B, with the costs.||## Coordinator's addition ($today)||A wins." \
+  "$RC $(mdesc tni2)"
+mkdec tni8 "needs more info" front-default "D-38 Plain only?" 1700000017000
+jq '.text_content = "Context without marks"' "$FAKE_CU/tasks/tni8.json" > "$T/t8" && mv "$T/t8" "$FAKE_CU/tasks/tni8.json"
+w=$(writes)
+run "$HIVE" ct decision info D-38 --add "More."
+eq "a description ClickUp gives without markdown is not written back" "1 $w" "$RC $(writes)"
+has "saying so" "without its markdown" "$ERR"
+mkdec tni9 "needs more info" front-default "D-39 Empty?" 1700000018000
+run "$HIVE" ct decision info D-39 --add "More."
+eq "an empty description gets the section alone" "0 ## Coordinator's addition ($today)||More." "$RC $(mdesc tni9)"
+rm -f "$FAKE_CU/tasks/tni8.json" "$FAKE_CU/tasks/tni9.json"
+w=$(writes)
 run "$HIVE" ct decision info tni1
-eq "an addition is required" 1 "$RC"
+eq "an addition or --desc is required" "1 $w" "$RC $(writes)"
 run "$HIVE" ct decision info D-31 --comment "x" --desc "$T/nosuch"
 eq "an unreadable --desc is refused" "1 $w" "$RC $(writes)"
 mkdec tni3 "needs more info" front-default "D-34 Twice?" 1700000012000
@@ -1493,7 +1534,7 @@ eq "and nobody else" 0 "$(ninfo "" D-37)"
 body=$(cat "$HIVE_DIR"/fronts/web/mail/coord/*.json | jq -r 'select(.subject | contains("D-37")) | .body')
 has "the letter names the question" "Question: Which host?" "$body"
 has "the link" "https://app.clickup.com/t/tni7" "$body"
-has "and what to run" "hive ct decision info D-37 --comment" "$body"
+has "and what to run" "hive ct decision info D-37 --add @FILE" "$body"
 eq "with one read of the decision list a run" "$((r + 1)) $s" "$(listreads) $(grep -c '^GET /list/9012345600 ' "$FAKE_CU/requests.log")"
 grep -qxF tni7 "$CU/decision-info.state"; eq "and remembers it in clickup/" 0 "$?"
 sync_now

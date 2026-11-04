@@ -55,6 +55,8 @@ The thirteen rules that must survive a compacted context. This file is the singl
     "<the question>" --task <id> --desc <file>` (the question alone: hive puts its `D-<n>` in front and refuses
     one you numbered; the file holds context, numbered options with your recommendation, what happens
     without a decision, the report). Once they answer, in ClickUp or in the conversation:
-    `hive ct decision answer D-<n> --comment "<the answer>"`. At session start and after a compaction,
+    `hive ct decision answer D-<n> --comment "<the answer>"`. Whatever you explain to the user about a
+    decision goes in its description (`--desc`, or `hive ct decision info D-<n> --add @<file>` when they
+    ask for more), never in a comment: comments are narrow and show no markdown. At session start and after a compaction,
     read your front's open ones (`hive ct decision list --open`) before anything else: they are the
     questions you still owe the user an answer to, not the summary.

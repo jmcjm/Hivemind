@@ -319,7 +319,11 @@ so a deleted or archived decision does not give its number back. A number goes t
 ClickUp is asked, so a create that fails leaves a gap, never a number given twice. The counter and that file are per
 machine; coordinators on two machines are not covered. With `decision_status_info` the owner can send a
 decision back for more detail: `clickup-sync` mails the front's coordinator once, and
-`hive ct decision info D-<n> --comment ...` adds the detail and puts it back to waiting.
+`hive ct decision info D-<n> --add @FILE` appends the detail to the decision's description, as a
+markdown section `## Coordinator's addition (<date>)`, and puts it back to waiting (`--desc FILE` rewrites
+the description whole). Explanations for the owner go in the description, never in a comment: a ClickUp
+comment is narrow and renders no markdown, so the decision only gets a one-line note that its
+description changed.
 
 ## Watching outside sources
 
