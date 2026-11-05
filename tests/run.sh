@@ -733,6 +733,35 @@ t_revive_keeps_account() {
   [ "$(drone_meta_field kafka account)" = alt ] || fail "meta account: $(drone_meta_field kafka account)"
 }
 
+t_spawn_and_revive_put_temp_files_on_disk() {
+  local tmp="$HIVE_DIR/tmp/kafka"
+  spawn_home kafka > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CODE_TMPDIR=$tmp --env TMPDIR=$tmp"
+  [ "$(stat -c %a "$tmp" 2>/dev/null)" = 700 ] || fail "spawn: $tmp is not a 0700 directory"
+  rm -rf "$tmp"; : > "$FAKE_HERDR_LOG"
+  HOME="$T/home" "$HIVE" revive kafka > "$T/out2" 2>&1 || fail "revive failed: $(cat "$T/out2")"
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CODE_TMPDIR=$tmp --env TMPDIR=$tmp"
+  [ "$(stat -c %a "$tmp" 2>/dev/null)" = 700 ] || fail "revive: $tmp is not a 0700 directory"
+}
+
+t_kill_and_prune_remove_the_temp_dir() {
+  local n
+  for n in live gone dead; do
+    spawn_home "$n" > /dev/null 2>&1 || fail "spawn $n failed"
+    touch "$HIVE_DIR/tmp/$n/scratch"
+  done
+  "$HIVE" kill live > /dev/null 2>&1 || fail "kill failed"
+  [ ! -e "$HIVE_DIR/tmp/live" ] || fail "kill left the temp dir"
+  [ -d "$HIVE_DIR/drones/live" ] || fail "kill of a living drone removed its directory"
+  "$HIVE" kill gone --purge > /dev/null 2>&1 || fail "kill --purge failed"
+  [ ! -e "$HIVE_DIR/tmp/gone" ] || fail "kill --purge left the temp dir"
+  FAKE_DEAD_PANES="$(drone_meta_field dead pane_id)" "$HIVE" prune dead > "$T/out" 2>&1 \
+    || fail "prune failed: $(cat "$T/out")"
+  assert_contains "$T/out" "prune: removed 1 dead drone(s): dead"
+  [ ! -e "$HIVE_DIR/tmp/dead" ] || fail "prune left the temp dir"
+  tar -tzf "$HIVE_DIR"/archive/prune-*.tar.gz | grep -q scratch && fail "the archive holds temp files"
+}
+
 t_revive_move_needs_visible_session() {
   mkdir -p "$T/home/work" "$HIVE_DIR/drones/kafka"; make_account alt
   printf '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1","session_id":"s-1","cwd":"%s"}\n' \

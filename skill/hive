@@ -416,6 +416,8 @@ wake_recipient() {
 
 drone_dir()  { echo "$DRONES_DIR/$1"; }
 drone_meta() { echo "$DRONES_DIR/$1/meta.json"; }
+# The drone's temp directory, outside its front: names are unique across fronts, and a move keeps it.
+drone_tmp()  { echo "$HIVE_DIR/tmp/${1:?}"; }
 
 # Single field from a mail json file. jqf <file> <key>
 jqf() { python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get(sys.argv[2]) or ''))" "$1" "$2" 2>/dev/null; }
@@ -629,7 +631,7 @@ hive_archive() {
 # drone_remove <name> — the directory, the mailbox and the wake-up marker. No archiving here:
 # the caller decides that, and it must have happened BEFORE this runs.
 drone_remove() {
-  rm -rf "$(drone_dir "$1")" "$MAIL_DIR/$1"
+  rm -rf "$(drone_dir "$1")" "$MAIL_DIR/$1" "$(drone_tmp "$1")"
   rm -f "$FRONT_DIR/.wake-$1"
 }
 
@@ -1463,6 +1465,13 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # The default account gets no CLAUDE_CONFIG_DIR at all: an empty value is not "the default" to
   # Claude Code, it is a config dir named "" (logged out, measured on 2.1.283).
   [ -n "$acc_dir" ] && envs+=(--env "CLAUDE_CONFIG_DIR=$acc_dir")
+  # Temp files on disk, one directory per drone: /tmp is tmpfs, and the swarm's scratchpads, browsers
+  # and builds once filled RAM until systemd-oomd killed the terminal with every drone in it.
+  # CLAUDE_CODE_TMPDIR moves Claude Code's own temp files and scratchpad, TMPDIR those of every tool
+  # the drone runs (Bash commands inherit it).
+  local tmpdir; tmpdir=$(drone_tmp "$name")
+  mkdir -p "$tmpdir" && chmod 700 "$tmpdir" || die "spawn: cannot create the temp directory $tmpdir"
+  envs+=(--env "CLAUDE_CODE_TMPDIR=$tmpdir" --env "TMPDIR=$tmpdir")
   local ws_json ws pane tab="" home_ws
   home_ws=$(drone_home) || home_ws=""
   if [ -n "$home_ws" ]; then
@@ -2276,6 +2285,8 @@ cmd_kill() {  # kill <name> [--purge]
   # A directory without meta.json has nothing to close; that is not a reason to refuse.
   local closed; closed=$(drone_close "$name")
   rm -f "$FRONT_DIR/.wake-$name"
+  # Its temp files died with its session: nothing resumes them, and they run to gigabytes.
+  rm -rf "$(drone_tmp "$name")"
 
   if [ "$purge" = "--purge" ]; then
     drone_remove "$name"
