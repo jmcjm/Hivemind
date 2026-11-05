@@ -733,6 +733,82 @@ t_revive_keeps_account() {
   [ "$(drone_meta_field kafka account)" = alt ] || fail "meta account: $(drone_meta_field kafka account)"
 }
 
+t_spawn_and_revive_put_temp_files_on_disk() {
+  spawn_home kafka > "$T/out" 2>&1 || fail "spawn failed: $(cat "$T/out")"
+  local tmp; tmp=$(drone_meta_field kafka tmp)
+  case "$tmp" in "$HIVE_DIR/tmp/kafka."??????) ;; *) fail "spawn recorded no temp dir of its own: '$tmp'" ;; esac
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CODE_TMPDIR=$tmp --env TMPDIR=$tmp"
+  [ "$(stat -c %a "$tmp" 2>/dev/null)" = 700 ] || fail "spawn: $tmp is not a 0700 directory"
+  [ -n "$tmp" ] && rm -rf "${tmp:?}"; : > "$FAKE_HERDR_LOG"
+  HOME="$T/home" "$HIVE" revive kafka > "$T/out2" 2>&1 || fail "revive failed: $(cat "$T/out2")"
+  [ "$(drone_meta_field kafka tmp)" = "$tmp" ] || fail "revive changed the temp dir: $(drone_meta_field kafka tmp)"
+  assert_contains "$FAKE_HERDR_LOG" "--env CLAUDE_CODE_TMPDIR=$tmp --env TMPDIR=$tmp"
+  [ "$(stat -c %a "$tmp" 2>/dev/null)" = 700 ] || fail "revive: $tmp is not a 0700 directory"
+  # A drone spawned before meta.json carried the field gets its directory at the next revive.
+  jq 'del(.tmp)' "$HIVE_DIR/drones/kafka/meta.json" > "$T/m" && mv "$T/m" "$HIVE_DIR/drones/kafka/meta.json"
+  HOME="$T/home" "$HIVE" revive kafka > "$T/out3" 2>&1 || fail "legacy revive failed: $(cat "$T/out3")"
+  tmp=$(drone_meta_field kafka tmp)
+  [ -d "$tmp" ] && [ "${tmp#"$HIVE_DIR/tmp/kafka."}" != "$tmp" ] || fail "legacy revive recorded no temp dir: '$tmp'"
+}
+
+t_kill_and_prune_remove_the_temp_dir() {
+  local n
+  declare -A tmp
+  for n in live gone corpse dead; do
+    spawn_home "$n" > /dev/null 2>&1 || fail "spawn $n failed"
+    tmp[$n]=$(drone_meta_field "$n" tmp)
+    touch "${tmp[$n]}/scratch" || fail "spawn $n recorded no temp dir"
+  done
+  "$HIVE" kill live > /dev/null 2>&1 || fail "kill failed"
+  [ ! -e "${tmp[live]}" ] || fail "kill left the temp dir"
+  [ -d "$HIVE_DIR/drones/live" ] || fail "kill of a living drone removed its directory"
+  "$HIVE" kill gone --purge > /dev/null 2>&1 || fail "kill --purge failed"
+  [ ! -e "${tmp[gone]}" ] || fail "kill --purge left the temp dir"
+  FAKE_DEAD_PANES="$(drone_meta_field corpse pane_id)" "$HIVE" kill corpse > "$T/out" 2>&1 \
+    || fail "kill of a dead drone failed: $(cat "$T/out")"
+  assert_contains "$T/out" "kill: corpse was already dead — archived to"
+  [ ! -e "${tmp[corpse]}" ] || fail "kill of a dead drone left the temp dir"
+  FAKE_DEAD_PANES="$(drone_meta_field dead pane_id)" "$HIVE" prune dead > "$T/out" 2>&1 \
+    || fail "prune failed: $(cat "$T/out")"
+  assert_contains "$T/out" "prune: removed 1 dead drone(s): dead"
+  [ ! -e "${tmp[dead]}" ] || fail "prune left the temp dir"
+}
+
+t_kill_traversal_name_removes_nothing_of_another_drone() {
+  spawn_home victim > /dev/null 2>&1 || fail "spawn victim"
+  local tmp; tmp=$(drone_meta_field victim tmp)
+  "$HIVE" kill ../drones/victim > /dev/null 2>&1
+  [ -f "$HIVE_DIR/drones/victim/meta.json" ] || fail "kill ../drones/victim deleted drone victim's directory"
+  [ -d "$tmp" ] || fail "kill ../drones/victim deleted drone victim's temp dir"
+}
+
+t_kill_traversal_name_keeps_the_tmp_root() {
+  spawn_home aa > /dev/null 2>&1 || fail "spawn aa"
+  local tmp; tmp=$(drone_meta_field aa tmp)
+  "$HIVE" kill ../tmp > "$T/out" 2>&1 && fail "kill ../tmp succeeded"
+  [ -d "$tmp" ] || fail "kill ../tmp wiped the temp dir of living drone aa"
+  # A meta.json pointing outside one directory under tmp/ removes nothing either.
+  local bad
+  for bad in "$HIVE_DIR/tmp/" "$HIVE_DIR/tmp/../drones/aa" "$HIVE_DIR/drones/aa"; do
+    spawn_home bb > /dev/null 2>&1 || fail "spawn bb"
+    jq --arg t "$bad" '.tmp = $t' "$HIVE_DIR/drones/bb/meta.json" > "$T/m" && mv "$T/m" "$HIVE_DIR/drones/bb/meta.json"
+    "$HIVE" kill bb --purge > /dev/null 2>&1
+    [ -d "$tmp" ] && [ -f "$HIVE_DIR/drones/aa/meta.json" ] || fail "kill of a drone whose tmp is '$bad' removed drone aa's files"
+  done
+}
+
+t_rename_then_reused_name_gets_its_own_temp_dir() {
+  spawn_home old > /dev/null 2>&1 || fail "spawn old"
+  local tmp; tmp=$(drone_meta_field old tmp)
+  touch "$tmp/in-use" || fail "spawn old recorded no temp dir"
+  "$HIVE" rename old newer > /dev/null 2>&1 || fail "rename"
+  [ "$(drone_meta_field newer tmp)" = "$tmp" ] || fail "rename lost the temp dir: $(drone_meta_field newer tmp)"
+  spawn_home old > "$T/o2" 2>&1 || fail "spawn second old: $(cat "$T/o2")"
+  [ "$(drone_meta_field old tmp)" != "$tmp" ] || fail "the new 'old' shares the renamed drone's temp dir"
+  "$HIVE" kill old --purge > /dev/null 2>&1
+  [ -e "$tmp/in-use" ] || fail "killing the new 'old' wiped the temp dir the renamed live drone 'newer' still uses"
+}
+
 t_revive_move_needs_visible_session() {
   mkdir -p "$T/home/work" "$HIVE_DIR/drones/kafka"; make_account alt
   printf '{"name":"kafka","workspace_id":"w2","pane_id":"w2:p1","session_id":"s-1","cwd":"%s"}\n' \

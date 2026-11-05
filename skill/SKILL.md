@@ -46,6 +46,7 @@ hive move   <drone> <front> [--force]  hand a drone to another front (a living o
 ```
 
 Swarm data: `~/.herdr-hive/drones/<name>/` → `meta.json`, `brief.md`, `report.md`.
+Each drone's temp files and scratchpad live on disk in `~/.herdr-hive/tmp/<name>.XXXXXX/`, recorded as `tmp` in `meta.json` (spawn and revive set `CLAUDE_CODE_TMPDIR` and `TMPDIR` there, kill and prune delete it, archives leave it out).
 Archives of removed drones: `~/.herdr-hive/archive/<label>-<date>.tar.gz` (unpack with
 `tar xzf <archive> -C ~/.herdr-hive` to get a drone and its mailbox back).
 Model: `opus` (overridable via `HIVE_MODEL`).
