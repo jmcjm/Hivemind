@@ -416,8 +416,19 @@ wake_recipient() {
 
 drone_dir()  { echo "$DRONES_DIR/$1"; }
 drone_meta() { echo "$DRONES_DIR/$1/meta.json"; }
-# The drone's temp directory, outside its front: names are unique across fronts, and a move keeps it.
-drone_tmp()  { echo "$HIVE_DIR/tmp/${1:?}"; }
+# The drone's temp directory, outside its front: spawn creates it and records it in meta.json, so it
+# belongs to the drone, not to its name (rename and move carry it along). Prints nothing, and fails,
+# for a name hive would not spawn or a path that is not one directory under $HIVE_DIR/tmp/: whatever
+# a caller removes with it can never be another drone's directory or the whole tmp/.
+drone_tmp() {
+  [[ "${1:-}" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+  local t; t=$(meta_get "$1" tmp) || return 1
+  case "$t" in
+    *..*|"$HIVE_DIR/tmp/"*/*) return 1 ;;
+    "$HIVE_DIR/tmp/"?*) echo "$t" ;;
+    *) return 1 ;;
+  esac
+}
 
 # Single field from a mail json file. jqf <file> <key>
 jqf() { python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get(sys.argv[2]) or ''))" "$1" "$2" 2>/dev/null; }
@@ -631,7 +642,8 @@ hive_archive() {
 # drone_remove <name> — the directory, the mailbox and the wake-up marker. No archiving here:
 # the caller decides that, and it must have happened BEFORE this runs.
 drone_remove() {
-  rm -rf "$(drone_dir "$1")" "$MAIL_DIR/$1" "$(drone_tmp "$1")"
+  local t; t=$(drone_tmp "$1") && rm -rf "${t:?}"   # read from meta.json before the directory goes
+  rm -rf "$(drone_dir "$1")" "$MAIL_DIR/$1"
   rm -f "$FRONT_DIR/.wake-$1"
 }
 
@@ -1469,8 +1481,15 @@ cmd_spawn() {  # spawn <name> [--cwd PATH] [--account NAME] [--resume]
   # and builds once filled RAM until systemd-oomd killed the terminal with every drone in it.
   # CLAUDE_CODE_TMPDIR moves Claude Code's own temp files and scratchpad, TMPDIR those of every tool
   # the drone runs (Bash commands inherit it).
-  local tmpdir; tmpdir=$(drone_tmp "$name")
-  mkdir -p "$tmpdir" && chmod 700 "$tmpdir" || die "spawn: cannot create the temp directory $tmpdir"
+  # A drone that has one (resume, revive, move) keeps it; any other gets a fresh, unique one, so a
+  # name freed by rename can never share the directory of the drone that carried it.
+  local tmpdir
+  if tmpdir=$(drone_tmp "$name"); then
+    mkdir -p "$tmpdir" && chmod 700 "$tmpdir" || die "spawn: cannot create the temp directory $tmpdir"
+  else
+    mkdir -p "$HIVE_DIR/tmp" && tmpdir=$(mktemp -d "$HIVE_DIR/tmp/$name.XXXXXX") && [ -d "$tmpdir" ] \
+      || die "spawn: cannot create a temp directory in $HIVE_DIR/tmp"
+  fi
   envs+=(--env "CLAUDE_CODE_TMPDIR=$tmpdir" --env "TMPDIR=$tmpdir")
   local ws_json ws pane tab="" home_ws
   home_ws=$(drone_home) || home_ws=""
@@ -1547,10 +1566,10 @@ Report questions and blockers via 'hive send coord' — do not wait idly, nobody
   # the account's projects/ directory.
   # What the drone owns (see drone_close): a tab in a shared workspace, or a workspace of its own.
   # A drone in a tab never carries workspace_id — older versions of hive close that key outright.
-  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" "$tab" <<'PY'
+  python3 - "$dir" "$name" "$ws" "$pane" "$sid" "$cwd" "$account" "$tab" "$tmpdir" <<'PY'
 import json,sys
-d,name,ws,pane,sid,cwd,account,tab = sys.argv[1:9]
-meta={"name":name,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account}
+d,name,ws,pane,sid,cwd,account,tab,tmp = sys.argv[1:10]
+meta={"name":name,"pane_id":pane,"session_id":sid,"cwd":cwd,"account":account,"tmp":tmp}
 if tab: meta.update(tab_id=tab, home_workspace_id=ws)
 else: meta["workspace_id"]=ws
 json.dump(meta, open(f"{d}/meta.json","w"), indent=1)
@@ -2286,7 +2305,7 @@ cmd_kill() {  # kill <name> [--purge]
   local closed; closed=$(drone_close "$name")
   rm -f "$FRONT_DIR/.wake-$name"
   # Its temp files died with its session: nothing resumes them, and they run to gigabytes.
-  rm -rf "$(drone_tmp "$name")"
+  local t; t=$(drone_tmp "$name") && rm -rf "${t:?}"
 
   if [ "$purge" = "--purge" ]; then
     drone_remove "$name"
